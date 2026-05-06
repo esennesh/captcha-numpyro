@@ -1,0 +1,10 @@
+_target_: src.data.captcha.CaptchaDataModule
+image_dir: ${paths.data_dir}
+width: 160
+height: 60
+test_split: 0.2
+batch_size: 32
+indexed: false
+validation_split: 0.1
+num_workers: 0
+pin_memory: False
