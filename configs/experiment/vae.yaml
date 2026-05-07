@@ -1,7 +1,7 @@
 # @package _global_
 
 defaults:
-  - override /data: mnist
+  - override /data: captcha
   - override /guide: vae
   - override /model: vae
 
