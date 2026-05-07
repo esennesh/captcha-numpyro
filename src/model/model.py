@@ -29,10 +29,12 @@ def mnist_model(batch, hidden_dim=400, z_dim=100):
     batch_dim, out_dim = jnp.shape(batch)
     decode = numpyro.module("decoder", decoder(hidden_dim, out_dim),
                             (batch_dim, z_dim))
+    log_scale = numpyro.param("likelihood_log_scale", jnp.zeros(()))
+    scale = jnp.exp(log_scale)
     with numpyro.plate("batch", batch_dim):
         z = numpyro.sample("z", dist.Normal(0, 1).expand([z_dim]).to_event(1))
         img_loc = decode(z)
-        return numpyro.sample("obs", dist.Bernoulli(img_loc).to_event(1),
+        return numpyro.sample("obs", dist.Normal(img_loc, scale).to_event(1),
                               obs=batch)
 
 def mnist_guide(batch, hidden_dim=400, z_dim=100):
