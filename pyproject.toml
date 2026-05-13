@@ -5,16 +5,21 @@ description = "Template repository for deep probabilistic programming in Jax wit
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "bidict>=0.23.1",
+    "flax>=0.12.7",
     "graphviz>=0.21",
     "hydra-colorlog>=1.2.0",
     "hydra-core>=1.3.2",
     "iprogress>=0.4",
     "ipywidgets>=8.1.7",
+    "ivy>=1.0.0.5",
     "jax>=0.7.0; platform_system == 'Darwin'",
     "jax[cuda]>=0.7.0; platform_system != 'Darwin'",
     "jaxlib>=0.9.0",
+    "jaxtyping>=0.3.9",
     "jupyterlab>=4.4.5",
     "jupyterlab-tensorboard-pro>=4.0.0",
+    "kornia>=0.8.2",
     "matplotlib>=3.10.6",
     "numpyro",
     "optax>=0.2.6",
