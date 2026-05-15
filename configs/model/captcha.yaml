@@ -1,0 +1,10 @@
+defaults:
+  - placements: captcha_dictionary
+
+_target_: src.model.model.captcha_model
+_partial_: true
+backgrounder:
+  _target_: src.model.model.BackgroundDecoder
+  rngs:
+    _target_: flax.nnx.Rngs
+    default: 1234
