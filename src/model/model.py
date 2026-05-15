@@ -160,3 +160,12 @@ class BackgroundDecoder(nnx.Module):
         background = jnp.where(background > 0., background,
                                jnp.ones_like(background))
         return jnp.reshape(background, self.bg_shape + (1,))
+
+def captcha_model(backgrounder: BackgroundDecoder, placements: ShapePlacements):
+    rgb_prior = dist.Uniform(0., 1.).expand((3,))
+    color = numpyro.sample("color", rgb_prior.to_event(1))
+    color = color[jnp.newaxis, jnp.newaxis, :]
+
+    background = backgrounder()
+    foreground = placements().sum(axis=0)
+    return utils.soft_clamp((background + foreground) * color, 0., 1.)
