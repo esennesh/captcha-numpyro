@@ -22,6 +22,11 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 log = logging.LoggerAdapter(logger=logging.getLogger(__name__))
 
+def soft_clamp(x, a, b, beta=20.0):
+    # smooth max(x, a) - smooth max(x - (b - a), a) shifted
+    return a + jax.numpy.logaddexp(0, (x - a) * beta) / beta -\
+           jax.numpy.logaddexp(0, (x - b) * beta) / beta
+
 def load_dictionary(path: Path, mode="RGB", transform=None) -> dict[str, np.ndarray]:
     """Load a saved dictionary directory into a dict of numpy arrays.
 
