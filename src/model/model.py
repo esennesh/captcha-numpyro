@@ -141,3 +141,22 @@ class ShapePlacements(nnx.Module):
     def __call__(self, rngs=None):
         wheres = numpyro.sample("what_x_where", self.prior(rngs=rngs))
         return self.shaper(wheres)
+
+class BackgroundDecoder(nnx.Module):
+    def __init__(self, embedding_dim: int=50, height=60, hiddens=400, width=160,
+                 *, rngs: nnx.Rngs):
+        self.bg_shape = (height, width)
+        self.decoder = nnx.Sequential(
+            nnx.Linear(embedding_dim, hiddens, rngs=rngs), nnx.silu,
+            nnx.Linear(hiddens, height * width, rngs=rngs), nnx.sigmoid
+        )
+        self.embedding_dim = embedding_dim
+
+    def __call__(self, rngs=None):
+        loc = jnp.zeros((self.embedding_dim,))
+        scale = jnp.ones_like(loc)
+        z_bg = numpyro.sample("bg", dist.Normal(loc, scale).to_event(1))
+        background = self.decoder(z_bg)
+        background = jnp.where(background > 0., background,
+                               jnp.ones_like(background))
+        return jnp.reshape(background, self.bg_shape + (1,))
