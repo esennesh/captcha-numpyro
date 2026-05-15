@@ -26,7 +26,7 @@ class Rigid(nnx.Pytree):
     def __matmul__(a, b):
         algebra_element = (a.transform * b.transform).log()
         angle, translation = algebra_element[:, 2:], algebra_element[:, :2]
-        return Rigid(angle=angle, translation=translation, learnable=False)
+        return Rigid(angle=angle, translation=translation)
 
     @classmethod
     def random(rngs: nnx.Rngs):
@@ -52,8 +52,7 @@ class Rotation(nnx.Pytree):
         return kornia.geometry.transform.rotate(imgs, self.angle)
 
     def __matmul__(a, b):
-        return Rotation(angle=(a.transform * b.transform).log(),
-                        learnable=False)
+        return Rotation(angle=(a.transform * b.transform).log())
 
     @classmethod
     def random(rngs: nnx.Rngs):
