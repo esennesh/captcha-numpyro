@@ -1,3 +1,6 @@
+defaults:
+  - placements/shaper/shape_dict: sandbox
+
 _target_: src.model.model.captcha_model
 _partial_: true
 backgrounder:
@@ -21,8 +24,5 @@ placements:
     rngs:
       _target_: flax.nnx.Rngs
       default: 5678
-    shape_dict:
-      _target_: src.data.dictionary.ShapeDictionary.load
-      path: data/captcha_sandbox/dictionary
     strides: 1
     transpose_kernel: true

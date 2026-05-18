@@ -1,0 +1,2 @@
+_target_: src.data.dictionary.ShapeDictionary.load
+path: data/captcha_sandbox/dictionary
