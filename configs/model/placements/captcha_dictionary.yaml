@@ -15,6 +15,6 @@ shaper:
     default: 5678
   shape_dict:
     _target_: src.model.model.ShapeDictionary.load
-    path: data/dictionary
+    path: data/captcha_sandbox/dictionary
   strides: 1
   transpose_kernel: true
