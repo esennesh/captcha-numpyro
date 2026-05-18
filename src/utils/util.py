@@ -14,7 +14,6 @@ from numpyro.infer.util import (get_importance_trace, helpful_support_errors,
                                 transform_fn)
 from omegaconf import DictConfig, OmegaConf, open_dict
 from pathlib import Path
-from PIL import Image
 import rich
 import rich.syntax
 import rich.tree
@@ -26,22 +25,6 @@ def soft_clamp(x, a, b, beta=20.0):
     # smooth max(x, a) - smooth max(x - (b - a), a) shifted
     return a + jax.numpy.logaddexp(0, (x - a) * beta) / beta -\
            jax.numpy.logaddexp(0, (x - b) * beta) / beta
-
-def load_dictionary(path: Path, mode="RGB", transform=None) -> dict[str, np.ndarray]:
-    """Load a saved dictionary directory into a dict of numpy arrays.
-
-    Each value is a uint8 array of shape (H, W, 3) going into `transform`.
-    """
-    if transform is None:
-        transform = lambda x: x
-
-    dictionary = {}
-    for p in sorted(Path(path).glob("*.png")):
-        dictionary[p.stem] = np.array(Image.open(p).convert(mode))
-        if len(dictionary[p.stem].shape) == 2:
-            dictionary[p.stem] = dictionary[p.stem][..., np.newaxis]
-        dictionary[p.stem] = transform(dictionary[p.stem])
-    return dictionary
 
 def is_autoguide(g):
     import abc

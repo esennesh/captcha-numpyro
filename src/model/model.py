@@ -4,13 +4,11 @@ from flax.nnx.nn.linear import canonicalize_padding
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float
-import numpy as np
 import numpyro
 import numpyro.distributions as dist
-from typing import Dict, Tuple, Union
 
+from src.data.dictionary import ShapeDictionary
 from src import utils
-
 
 class PVaePrior(nnx.Module):
     def __init__(self, shape, *, rngs: nnx.Rngs):
@@ -28,26 +26,6 @@ class PlacementsPrior(nnx.Module):
 
     def __call__(self, rngs=None):
         return self.topography(rngs=rngs)
-
-@nnx.dataclass
-class ShapeDictionary(nnx.Pytree):
-    shapes: Float[Array, "K H W C"] = nnx.data()
-    targets: Dict[str, int] = nnx.data()
-
-    @classmethod
-    def load(cls, path: str):
-        def transform(img):
-            img = np.array(img, dtype=jnp.float32) / 255.
-            return 1. - img
-
-        shapes = utils.load_dictionary(path, mode="L", transform=transform)
-        return cls(shapes=jnp.stack(tuple(shapes.values()), axis=0),
-                   targets={i: k for i, k in enumerate(shapes)})
-
-    @classmethod
-    def randomize(cls, k: int, h: int, w: int, *, rngs: nnx.Rngs):
-        return cls(shapes=rngs.normal(shape=(k, h, w, 1)),
-                   targets={str(c): c for c in range(k)})
 
 class ExternalKernelConvTranspose(nnx.ConvTranspose):
     def __init__(self, *args, **kwargs):
