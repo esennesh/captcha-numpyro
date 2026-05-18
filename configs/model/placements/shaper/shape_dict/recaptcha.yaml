@@ -1,0 +1,2 @@
+_target_: src.data.dictionary.ShapeDictionary.load_nested
+path: data/recaptcha/training_characters

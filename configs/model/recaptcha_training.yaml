@@ -1,0 +1,35 @@
+defaults:
+  - placements/shaper/shape_dict: recaptcha
+
+_target_: src.model.model.captcha_model
+_partial_: true
+backgrounder:
+  _target_: src.model.model.BackgroundDecoder
+  height: 100
+  width: 200
+  rngs:
+    _target_: flax.nnx.Rngs
+    default: 1234
+placements:
+  _target_: src.model.model.ShapePlacements
+  prior:
+    _target_: src.model.model.PlacementsPrior
+    kh: 100
+    kw: 100
+    img_h: 100
+    img_w: 200
+    num_features: 244
+    rngs:
+      _target_: flax.nnx.Rngs
+      default: 1234
+  rngs:
+    _target_: flax.nnx.Rngs
+    default: 9101112
+  shaper:
+    _target_: src.model.model.ShapeConvTranspose
+    padding: "VALID"
+    rngs:
+      _target_: flax.nnx.Rngs
+      default: 5678
+    strides: 1
+    transpose_kernel: true
