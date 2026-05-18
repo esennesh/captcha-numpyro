@@ -1,0 +1,10 @@
+_target_: src.data.recaptcha.RecaptchaDataModule
+data_dir: ${paths.data_dir}/recaptcha
+width: 200
+height: 100
+test_split: 0.2
+batch_size: 32
+indexed: false
+validation_split: 0.1
+num_workers: 0
+pin_memory: False
