@@ -1,4 +1,3 @@
-from bidict import bidict
 from flax import nnx
 from flax.nnx.nn.linear import canonicalize_padding
 import jax
