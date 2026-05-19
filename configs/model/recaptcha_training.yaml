@@ -33,10 +33,3 @@ placements:
       default: 5678
     strides: 1
     transpose_kernel: true
-texturer:
-  _target_: src.model.model.Texturer
-  kernel_side: 5
-  log_width: 0
-  rngs:
-    _target_: flax.nnx.Rngs
-    default: 13141516
