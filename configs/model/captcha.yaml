@@ -26,3 +26,4 @@ placements:
       default: 5678
     strides: 1
     transpose_kernel: true
+  texture: false
