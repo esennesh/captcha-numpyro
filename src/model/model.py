@@ -110,15 +110,42 @@ class ShapeConvTranspose(nnx.Module):
                       self.shape_dict.shapes[..., jnp.newaxis])
 
 class ShapePlacements(nnx.Module):
-    def __init__(self, prior: PlacementsPrior, shaper: ShapeConvTranspose, *,
+    def __init__(self, prior: PlacementsPrior, shaper: ShapeConvTranspose,
+                 num_hiddens=64, texture=True, texture_kernel_wh=5, *,
                  rngs: nnx.Rngs):
+        self.k = texture_kernel_wh
+        num_shapes = len(prior.topography.u)
         self.prior = prior
         self.shaper = shaper
-        assert len(self.shaper.shape_dict.shapes) == len(self.prior.topography.u)
+        self.texture = texture
+        if texture:
+            self.texturer = nnx.Sequential(
+                nnx.Linear(3, num_hiddens, rngs=rngs), nnx.silu,
+                nnx.Linear(num_hiddens, texture_kernel_wh ** 2, rngs=rngs),
+            )
+        assert len(self.shaper.shape_dict.shapes) == num_shapes
 
     def __call__(self, rngs=None):
         wheres = numpyro.sample("what_x_where", self.prior(rngs=rngs))
-        return self.shaper(wheres)
+        canvases = self.shaper(wheres)
+
+        if self.texture:
+            styles_prior = dist.Normal(jnp.zeros((3,)), jnp.ones((3,)))
+            styles_prior = styles_prior.expand_by((canvases.shape[-4],))
+            styles = numpyro.sample("style", styles_prior.to_event(2))
+            texture_kernels = self.texturer(styles).reshape(-1, self.k, self.k,
+                                                            1, 1)
+
+            def apply_texture(img, kernel):
+                return jax.lax.conv_general_dilated(
+                    img[jnp.newaxis, ...], kernel, (1, 1), "SAME",
+                    dimension_numbers=('NHWC', 'HWIO', 'NHWC')
+                )[0]
+
+            canvases = jax.nn.relu(jax.vmap(apply_texture)(canvases,
+                                                           texture_kernels))
+
+        return canvases
 
 class BackgroundDecoder(nnx.Module):
     def __init__(self, embedding_dim: int=50, height=60, hiddens=400, width=160,
