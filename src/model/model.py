@@ -140,11 +140,37 @@ class BackgroundDecoder(nnx.Module):
                                jnp.ones_like(background))
         return jnp.reshape(background, self.bg_shape + (1,))
 
-def captcha_model(backgrounder: BackgroundDecoder, placements: ShapePlacements):
+class Texturer(nnx.Module):
+    def __init__(self, kernel_side: int=5, log_width: int=0, *, rngs: nnx.Rngs):
+        self.kernel_side = kernel_side
+        self.log_width = nnx.Param(jnp.zeros(()) * log_width)
+
+    def __call__(self, img):
+        k = self.kernel_side
+        kernel_loc = jnp.zeros((k, k)).at[k // 2, k // 2].set(1.0)
+        indices = jax.lax.collapse(jnp.indices((k, k)), -2).T
+        distances = jnp.linalg.norm(indices - jnp.array([[k // 2, k // 2]]),
+                                    axis=-1).reshape((k, k))
+        kernel_scale = jnp.ones((k, k)) * jnp.exp(
+            -distances ** 2 / (2 * jnp.exp(self.log_width))
+        )
+
+        texture_prior = dist.MatrixNormal(kernel_loc, kernel_scale,
+                                          jnp.eye(self.kernel_side))
+        kernel = numpyro.sample("texture_kernel", texture_prior)
+        kernel = jnp.broadcast_to(kernel[..., jnp.newaxis, jnp.newaxis],
+                                  kernel.shape + (img.shape[-1],) * 2)
+        return jax.lax.conv_general_dilated(
+            img[jnp.newaxis, ...], kernel, (1, 1), "SAME",
+            dimension_numbers=('NHWC', 'HWIO', 'NHWC')
+        )[0]
+
+def captcha_model(backgrounder: BackgroundDecoder, placements: ShapePlacements,
+                  texturer: Texturer):
     rgb_prior = dist.Uniform(0., 1.).expand((3,))
     color = numpyro.sample("color", rgb_prior.to_event(1))
     color = color[jnp.newaxis, jnp.newaxis, :]
 
     background = backgrounder()
-    foreground = placements().sum(axis=0)
-    return utils.soft_clamp((background + foreground) * color, 0., 1.)
+    foreground = placements()
+    return utils.soft_clamp((background + texturer(foreground)) * color, 0., 1.)
