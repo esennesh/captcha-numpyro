@@ -1,3 +1,4 @@
+import numpyro.distributions as dist
 import jax
 import jax.numpy as jnp
 import jax_dataclasses as jdc
@@ -7,6 +8,7 @@ from jaxlie.utils import register_lie_group
 from jaxtyping import Array, Float
 import flax.nnx as nnx
 import numpyro
+import numpyro.distributions as dist
 import dm_pix as pix
 from tensorflow_probability.substrates.jax import distributions as tfd
 from typing import Optional, Tuple
@@ -242,3 +244,44 @@ class SO2RPlus(MatrixLieGroup):
                                 scale: RPlus) -> "SO2RPlus":
         return cls(unit_complex=rotation.unit_complex,
                    log_scale=scale.log_scale)
+
+class SparseSO2RPlusPrior(nnx.Module):
+    def __init__(self, num_rotations=3, num_scales=3, shape=(), *,
+                 rngs: nnx.Rngs):
+        self.u_rotations = nnx.Param(
+            rngs.uniform(shape=shape + (num_rotations, 2), minval=-4.,
+                         maxval=-2.)
+        )
+        self.u_scalars   = nnx.Param(rngs.uniform(shape=shape + (num_scales,)),
+                                                  minval=-10., maxval=-6.)
+        # Rotation dictionary elements of 0<\theta<5 degrees
+        self.rotations = nnx.Param(
+            rngs.uniform(shape=(num_rotations,), minval=0.,
+                         maxval=jnp.pi / 6.)
+        )
+        # Log-scale dictionary elements in [-0.25, 0.25]
+        self.scalars = nnx.Param(rngs.uniform(shape=(num_scales,), minval=-0.1,
+                                              maxval=0.1))
+
+    def __call__(self, *, rngs=None):
+        from numpyro.contrib.tfp.distributions import TFPDistribution
+
+        # Skellam prior for rotation angles in radians
+        rotations = numpyro.sample(
+            "rotations",
+            TFPDistribution[tfd.Skellam](
+                log_rate1=self.u_rotations[..., 0],
+                log_rate2=self.u_rotations[..., 1]
+            ).to_event(len(self.u_rotations.shape) - 1)
+        ) * self.rotations
+        rotations = jaxlie.SO2.from_radians(rotations.sum(axis=-1))
+
+        scalars = numpyro.sample(
+            "scalars",
+            dist.Poisson(
+                jnp.exp(self.u_scalars)
+            ).to_event(len(self.u_scalars.shape) - 1)
+        ) * self.scalars
+        scalings = RPlus(log_scale=scalars.sum(axis=-1))
+
+        return SO2RPlus.from_rotation_and_scale(rotations, scalings)
