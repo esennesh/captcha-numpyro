@@ -5,6 +5,7 @@ import jax.numpy as jnp
 from jaxtyping import Array, Float
 import numpyro
 import numpyro.distributions as dist
+from typing import Optional
 
 from src.data.dictionary import ShapeDictionary
 from src import utils
@@ -142,11 +143,22 @@ class BackgroundDecoder(nnx.Module):
                                jnp.ones_like(background))
         return jnp.reshape(background, self.bg_shape + (1,))
 
-def captcha_model(backgrounder: BackgroundDecoder, placements: ShapePlacements):
+def over(bg, fg):
+    alphas = jnp.where(fg.sum(axis=-1, keepdims=True),
+                       jnp.ones(fg.shape[:-1] + (1,)),
+                       jnp.zeros(fg.shape[:-1] + (1,)))
+    return alphas * fg + (1. - alphas) * bg
+
+def captcha_model(placements: ShapePlacements,
+                  backgrounder: Optional[BackgroundDecoder]=None):
     rgb_prior = dist.Uniform(0., 1.).expand((3,))
     color = numpyro.sample("color", rgb_prior.to_event(1))
     color = color[jnp.newaxis, jnp.newaxis, :]
 
-    background = backgrounder()
-    foreground = placements()
-    return utils.soft_clamp((background + foreground) * color, 0., 1.)
+    foreground = placements() * color
+    if backgrounder is not None:
+        background = backgrounder() * color
+    else:
+        background = jnp.ones_like(foreground)
+
+    return utils.soft_clamp(over(background, foreground), 0., 1.)
