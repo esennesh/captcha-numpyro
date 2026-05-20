@@ -3,13 +3,7 @@ defaults:
 
 _target_: src.model.model.captcha_model
 _partial_: true
-backgrounder:
-  _target_: src.model.model.BackgroundDecoder
-  height: 100
-  width: 200
-  rngs:
-    _target_: flax.nnx.Rngs
-    default: 1234
+backgrounder: null
 placements:
   _target_: src.model.model.ShapePlacements
   prior:
