@@ -5,6 +5,7 @@ import jax.numpy as jnp
 from jaxtyping import Array, Float
 import numpyro
 import numpyro.distributions as dist
+from numpyro.contrib.module import nnx_module
 from typing import Optional
 
 from src.data.dictionary import ShapeDictionary
@@ -171,19 +172,32 @@ class BackgroundDecoder(nnx.Module):
         background = self.decoder(z_bg)
         background = jnp.where(background > 0., background,
                                jnp.ones_like(background))
-        return jnp.reshape(background, self.bg_shape + (1,))
+        return jnp.reshape(background, z_bg.shape[:-1] + self.bg_shape + (1,))
 
-def captcha_model(placements: ShapePlacements,
-                  backgrounder: Optional[BackgroundDecoder]=None):
+def generate_captcha(placements: ShapePlacements,
+                     backgrounder: Optional[BackgroundDecoder]=None):
     rgb_prior = dist.Uniform(0., 1.).expand((3,))
     color = numpyro.sample("color", rgb_prior.to_event(1))
     color = color[:, jnp.newaxis, jnp.newaxis, :]
     color = jnp.concatenate((color, jnp.ones(color.shape[:-1] + (1,))), axis=-1)
 
-    foreground = placements() * color
+    foreground = placements()
+    foreground = foreground * color
     if backgrounder is not None:
         background = backgrounder() * color
     else:
         background = jnp.ones_like(foreground)
 
     return utils.soft_clamp(over(background, foreground)[..., :-1], 0., 1.)
+
+def captcha_model(images, placements: ShapePlacements,
+                  backgrounder: Optional[BackgroundDecoder]=None, scale=None):
+    placements = nnx_module("placements_p", placements)
+    if backgrounder is not None:
+        backgrounder = nnx_module("backgrounder_p", backgrounder)
+    if scale is None:
+        scale = jnp.exp(numpyro.param("log_scale", jnp.zeros(())))
+    with numpyro.plate("batch", images.shape[0]):
+        prediction = generate_captcha(placements, backgrounder)
+        return numpyro.sample("obs", dist.Normal(prediction, scale).to_event(3),
+                              obs=images)
