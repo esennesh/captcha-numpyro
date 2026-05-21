@@ -2,13 +2,118 @@ from flax import nnx
 from flax.nnx.nn.linear import canonicalize_padding
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Float
+from jaxtyping import Array, DTypeLike, Float
 import numpyro
 import numpyro.distributions as dist
-from typing import Optional
+from typing import Optional, Sequence
 
 from src.data.dictionary import ShapeDictionary
 from src import utils
+
+def conv_transpose_local(lhs: Array, rhs: Array, strides: Sequence[int],
+                         padding: str | Sequence[tuple[int, int]],
+                         rhs_dilation: Sequence[int] | None = None,
+                         dimension_numbers: jax.lax.ConvGeneralDilatedDimensionNumbers = None,
+                         transpose_kernel: bool = False,
+                         precision: jax.lax.PrecisionLike = None,
+                         use_consistent_padding: bool = False) -> Array:
+    """Convenience wrapper for calculating the unshared N-d convolution "transpose".
+
+    This function directly calculates a fractionally strided conv rather than
+    indirectly calculating the gradient (transpose) of a forward convolution.
+
+    Notes:
+    TensorFlow/Keras Compatibility: By default, JAX does NOT reverse the
+    kernel's spatial dimensions. This differs from TensorFlow's "Conv2DTranspose"
+    and similar frameworks, which flip spatial axes and swap input/output channels.
+
+    To match TensorFlow/Keras behavior, set "transpose_kernel=True" .
+
+    Args:
+    lhs: a rank `n+2` dimensional input array.
+    rhs: a rank `n+2` dimensional array of kernel weights.
+    strides: sequence of `n` integers, sets fractional stride.
+    padding: 'SAME', 'VALID', or a sequence of `n` integer 2-tuples describing before-and-after
+      padding for each spatial dimension. If `use_consistent_padding=True`, this is interpreted
+      as the padding of the corresponding forward conv, which effectively adds
+      `dilation * (kernel_size - 1) - padding` zero padding to each side
+      of the input so that `conv_transpose` becomes the gradient of `conv` when given the same padding
+      and stride arguments. This is the behavior in PyTorch. If `use_consistent_padding=False`,
+      the 'SAME' and 'VALID' strings are interpreted as the padding of the corresponding forward conv,
+      but integer tuples are interpreted as padding for the transposed convolution.
+    rhs_dilation: `None`, or a sequence of `n` integers, giving the
+      dilation factor to apply in each spatial dimension of `rhs`. RHS dilation
+      is also known as atrous convolution.
+    dimension_numbers: tuple of dimension descriptors as in
+      lax.conv_general_dilated. Defaults to tensorflow convention.
+    transpose_kernel: if True flips spatial axes and swaps the input/output
+      channel axes of the kernel. This makes the output of this function identical
+      to the gradient-derived functions like keras.layers.Conv2DTranspose
+      applied to the same kernel. For typical use in neural nets this is completely
+      pointless and just makes input/output channel specification confusing.
+    precision: Optional. Either ``None``, which means the default precision for
+      the backend, a :class:`~jax.lax.Precision` enum value (``Precision.DEFAULT``,
+      ``Precision.HIGH`` or ``Precision.HIGHEST``) or a tuple of two
+      :class:`~jax.lax.Precision` enums indicating precision of ``lhs``` and ``rhs``.
+    preferred_element_type: Optional. Either ``None``, which means the default
+      accumulation type for the input types, or a datatype, indicating to
+      accumulate results to and return a result with that datatype.
+    use_consistent_padding : In older versions of jax, the `padding` argument was interpreted differently
+      depending on whether it was a string or a sequence of integers. Strings were interpreted as padding
+      for the forward convolution, while integers were interpreted as padding for the transposed convolution.
+      If `use_consistent_padding` is False, this inconsistent behavior is preserved for backwards compatibility.
+    Returns:
+    Transposed N-d convolution, with output padding following the conventions of
+    keras.layers.Conv2DTranspose.
+    """
+    from jax._src import core
+    from jax._src.lax import convolution
+    import numpy as np
+
+    assert len(lhs.shape) == len(rhs.shape) and len(lhs.shape) >= 2
+    ndims = len(lhs.shape)
+    one = (1,) * (ndims - 2)
+    # Set dimensional layout defaults if not specified.
+    if dimension_numbers is None:
+        if ndims == 2:
+            dimension_numbers = ('NC', 'IO', 'NC')
+        elif ndims == 3:
+            dimension_numbers = ('NHC', 'HIO', 'NHC')
+        elif ndims == 4:
+            dimension_numbers = ('NHWC', 'HWIO', 'NHWC')
+        elif ndims == 5:
+            dimension_numbers = ('NHWDC', 'HWDIO', 'NHWDC')
+        else:
+            raise ValueError('No 4+ dimensional dimension_number defaults.')
+    dn = jax.lax.conv_dimension_numbers(lhs.shape, rhs.shape, dimension_numbers)
+    k_shape = np.take(rhs.shape, dn.rhs_spec)
+    k_sdims = k_shape[2:]
+    # Calculate correct output shape given padding and strides.
+    if rhs_dilation is None:
+        rhs_dilation = (1,) * (rhs.ndim - 2)
+    pads: str | Sequence[tuple[int, int]]
+    if use_consistent_padding or (isinstance(padding, str) and padding in {'SAME', 'VALID'}):
+        effective_k_size = map(lambda k, r: core.dilate_dim(k, r), k_sdims, rhs_dilation)
+        replicated_padding = [padding] * len(strides) if isinstance(padding, str) else padding
+        pads = tuple(convolution._conv_transpose_padding(k, s, p)
+                     for k,s,p in zip(effective_k_size, strides,
+                                      replicated_padding))
+    else:
+        pads = padding
+    if transpose_kernel:
+        # flip spatial dims and swap input / output channel axes
+        rhs = convolution._flip_axes(rhs, np.array(dn.rhs_spec)[2:])
+        rhs = rhs.swapaxes(dn.rhs_spec[0], dn.rhs_spec[1])
+
+    import pdb; pdb.set_trace()
+    spatial_shape = tuple(lhs.shape[d] for d in dn.lhs_spec[2:])
+    rhs = jax.lax.collapse(rhs, 0, dn.rhs_spec[1] + 1)
+    # rhs = jnp.broadcast_to(rhs[jnp.newaxis, jnp.newaxis, ...],
+    #                        spatial_shape + rhs.shape)
+    return jax.lax.conv_general_dilated_local(
+    # return conv_general_dilated(
+        lhs, rhs, one, pads, strides, rhs_dilation, dn, precision=precision,
+    )
 
 class PVaePrior(nnx.Module):
     def __init__(self, shape, *, rngs: nnx.Rngs):
@@ -63,12 +168,11 @@ class ExternalKernelConvTranspose(nnx.ConvTranspose):
 
         inputs, kernel = self.promote_dtype((inputs, kernel), dtype=self.dtype)
 
-        y = jax.lax.conv_transpose(
+        y = conv_transpose_local(
             inputs, kernel, strides, padding_lax,
             rhs_dilation=kernel_dilation,
             transpose_kernel=self.transpose_kernel,
             precision=self.precision,
-            preferred_element_type=self.preferred_element_type,
         )
 
         if self.padding == 'CIRCULAR':
