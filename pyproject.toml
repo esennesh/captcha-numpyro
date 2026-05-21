@@ -28,6 +28,7 @@ dependencies = [
     "rootutils>=1.0.7",
     "tensorboard>=2.20.0",
     "tensorboardx>=2.6.4",
+    "tfp-nightly>=0.26.0.dev20260520",
     "torch>=2.8.0",
     "torchvision>=0.23.0",
 ]
