@@ -6,6 +6,9 @@ from jaxlie._base import MatrixLieGroup
 from jaxlie.utils import register_lie_group
 from jaxtyping import Array, Float
 import flax.nnx as nnx
+import numpyro
+import dm_pix as pix
+from tensorflow_probability.substrates.jax import distributions as tfd
 from typing import Optional, Tuple
 
 
@@ -112,6 +115,18 @@ class SO2RPlus(MatrixLieGroup):
 
     log_scale: jax.Array
     """Log of the scale factor. Shape: `(*, 1)`."""
+
+    def __call__(
+        self, image: Float[Array, "*batch height width"]
+    ) -> Float[Array, "*batch height width"]:
+        radians = self.rotation().as_radians()
+        jax.debug.print("Rotate by {}", radians)
+        image = pix.rotate(image, radians)
+
+        jax.debug.print("Scale by {}", jnp.exp(self.scaling().log_scale))
+        scale = self.scaling().apply(jnp.array([1., 1.]))
+        return jax.image.scale_and_translate(image, image.shape, (1, 2), scale,
+                                             jnp.zeros((2,)), "cubic-pytorch")
 
     @classmethod
     def identity(cls, batch_axes: jdc.Static[Tuple[int, ...]] = ()) -> "SO2RPlus":
