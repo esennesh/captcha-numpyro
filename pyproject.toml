@@ -32,5 +32,3 @@ dependencies = [
     "torchvision>=0.23.0",
 ]
 
-[tool.uv.sources]
-numpyro = { git = "https://github.com/pyro-ppl/numpyro.git" }
