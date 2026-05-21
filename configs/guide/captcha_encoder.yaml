@@ -1,0 +1,17 @@
+_target_: src.inference.captcha_encoder.captcha_guide
+_partial_: true
+backgrounder:
+  _target_: src.inference.captcha_encoder.BackgroundEncoder
+  rngs:
+    _target_: flax.nnx.Rngs
+    default: 1234
+color_finder:
+  _target_: src.inference.captcha_encoder.ColorFinder
+  rngs:
+    _target_: flax.nnx.Rngs
+    default: 5678
+placements:
+  _target_: src.inference.captcha_encoder.ShapePlacer
+  rngs:
+    _target_: flax.nnx.Rngs
+    default: 9012
