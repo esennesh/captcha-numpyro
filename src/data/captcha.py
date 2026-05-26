@@ -30,7 +30,6 @@ class CaptchaDataset(Dataset):
         label = np.array([CHAR_TO_IDX[c] for c in chars], dtype=np.int64)
         img = Image.open(path).convert("RGB").resize((self._width, self._height))
         x = np.array(img, dtype=np.float32) / 255.0
-        x = x.transpose(2, 0, 1)  # (H, W, 3) -> (3, H, W)
         return x, label
 
 
