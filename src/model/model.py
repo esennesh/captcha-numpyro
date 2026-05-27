@@ -10,6 +10,29 @@ from typing import Optional
 from src.data.dictionary import ShapeDictionary
 from src import utils
 
+
+def over(bg, fg):
+    """
+    Combines a foreground and background image layer.
+    Both inputs should have a shape of (H, W, 4) containing RGBA channels.
+    """
+    # Split RGB and Alpha channels
+    fg_rgb, fg_alpha = fg[..., :3], fg[..., 3:4]
+    bg_rgb, bg_alpha = bg[..., :3], bg[..., 3:4]
+
+    # Calculate the combined alpha channel
+    out_alpha = fg_alpha + bg_alpha * (1.0 - fg_alpha)
+
+    # Prevent division by zero if both alphas are 0
+    safe_alpha = jnp.where(out_alpha == 0.0, 1.0, out_alpha)
+
+    # Calculate the composited RGB colors
+    out_rgb = fg_rgb * fg_alpha + bg_rgb * bg_alpha * (1.0 - fg_alpha)
+    out_rgb = out_rgb / safe_alpha
+
+    # Combine back into RGBA and return
+    return jnp.concatenate([out_rgb, out_alpha], axis=-1)
+
 class PVaePrior(nnx.Module):
     def __init__(self, shape, *, rngs: nnx.Rngs):
         self.u = nnx.Param(rngs.uniform(shape=shape, minval=-10., maxval=-9.))
@@ -145,17 +168,12 @@ class BackgroundDecoder(nnx.Module):
                                jnp.ones_like(background))
         return jnp.reshape(background, self.bg_shape + (1,))
 
-def over(bg, fg):
-    alphas = jnp.where(fg.sum(axis=-1, keepdims=True),
-                       jnp.ones(fg.shape[:-1] + (1,)),
-                       jnp.zeros(fg.shape[:-1] + (1,)))
-    return alphas * fg + (1. - alphas) * bg
-
 def captcha_model(placements: ShapePlacements,
                   backgrounder: Optional[BackgroundDecoder]=None):
     rgb_prior = dist.Uniform(0., 1.).expand((3,))
     color = numpyro.sample("color", rgb_prior.to_event(1))
     color = color[jnp.newaxis, jnp.newaxis, :]
+    color = jnp.concatenate((color, jnp.ones(color.shape[:-1] + (1,))), axis=-1)
 
     foreground = placements() * color
     if backgrounder is not None:
@@ -163,4 +181,4 @@ def captcha_model(placements: ShapePlacements,
     else:
         background = jnp.ones_like(foreground)
 
-    return utils.soft_clamp(over(background, foreground), 0., 1.)
+    return utils.soft_clamp(over(background, foreground)[..., :-1], 0., 1.)
