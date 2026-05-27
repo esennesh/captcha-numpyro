@@ -1,5 +1,5 @@
 defaults:
-  - placements/shaper/shape_dict: sandbox
+  - placements/shaper/shape_dict: recaptcha_old
 
 _target_: src.model.model.generate_captcha
 _partial_: true
@@ -8,6 +8,11 @@ placements:
   _target_: src.model.model.ShapePlacements
   prior:
     _target_: src.model.model.PlacementsPrior
+    kh: 100
+    kw: 100
+    img_h: 100
+    img_w: 200
+    num_features: 186
     rngs:
       _target_: flax.nnx.Rngs
       default: 1234
