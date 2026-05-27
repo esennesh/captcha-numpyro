@@ -38,7 +38,7 @@ class PVaePrior(nnx.Module):
         self.u = nnx.Param(rngs.uniform(shape=shape, minval=-10., maxval=-9.))
 
     def __call__(self, rngs=None):
-        return dist.Poisson(jnp.exp(self.u)).to_event(2)
+        return dist.Poisson(jnp.exp(self.u)).to_event(3)
 
 class PlacementsPrior(nnx.Module):
     def __init__(self, kw: int=40, kh: int=40, img_w: int=160, img_h: int=60,
