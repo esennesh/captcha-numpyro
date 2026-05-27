@@ -133,9 +133,12 @@ class ShapeConvTranspose(nnx.Module):
         self.shape_dict = shape_dict
 
     def __call__(self, activations: Array, rngs=None):
-        deconv = jax.vmap(self.deconv, in_axes=0, out_axes=0)
-        return deconv(activations[..., jnp.newaxis],
-                      self.shape_dict.shapes[..., jnp.newaxis])
+        deconv = jax.vmap(jax.vmap(self.deconv))
+        shape_dict = jnp.broadcast_to(
+            self.shape_dict.shapes[jnp.newaxis, ..., jnp.newaxis],
+            activations.shape[:1] + self.shape_dict.shapes.shape + (1,)
+        )
+        return deconv(activations[..., jnp.newaxis], shape_dict)
 
 class ShapePlacements(nnx.Module):
     def __init__(self, prior: PlacementsPrior, shaper: ShapeConvTranspose,
