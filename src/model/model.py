@@ -120,10 +120,7 @@ class ShapePlacements(nnx.Module):
 
     def __call__(self, rngs=None):
         wheres = numpyro.sample("what_x_where", self.prior(rngs=rngs))
-        layers = self.shaper(wheres)
-        spikes = wheres.sum(axis=(-2, -1), keepdims=True)
-        spikes = spikes / (spikes.sum(axis=0, keepdims=True) + 1)
-        return (layers * spikes[..., jnp.newaxis]).sum(axis=0)
+        return self.shaper(wheres).sum(axis=0)
 
 class BackgroundDecoder(nnx.Module):
     def __init__(self, embedding_dim: int=50, height=60, hiddens=400, width=160,
