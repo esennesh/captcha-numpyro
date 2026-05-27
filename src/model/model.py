@@ -70,6 +70,7 @@ class ExternalKernelConvTranspose(nnx.ConvTranspose):
             precision=self.precision,
             preferred_element_type=self.preferred_element_type,
         )
+        y = jnp.clip(y, 0., None)
 
         if self.padding == 'CIRCULAR':
             scaled_x_dims = [x * s for x, s in zip(jnp.shape(inputs)[1:-1],
