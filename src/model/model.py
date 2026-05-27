@@ -91,6 +91,10 @@ class ExternalKernelConvTranspose(nnx.ConvTranspose):
         if num_batch_dimensions != 1:
             y = jnp.reshape(y, input_batch_shape + y.shape[1:])
 
+        y_alpha = jnp.where(y > 0, jnp.ones(y.shape[:-1] + (1,)),
+                            jnp.zeros(y.shape[:-1] + (1,)))
+        y = jnp.concatenate((y, y, y, y_alpha), axis=-1)
+
         return y
 
 class ShapeConvTranspose(nnx.Module):
