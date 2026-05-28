@@ -4,7 +4,7 @@ width: 160
 height: 60
 num_chars: 1
 test_split: 0.2
-batch_size: 32
+batch_size: 10
 indexed: false
 validation_split: 0.1
 num_workers: 0
