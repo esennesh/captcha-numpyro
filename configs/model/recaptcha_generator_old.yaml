@@ -7,7 +7,7 @@ backgrounder: null
 placements:
   _target_: src.model.model.ShapePlacements
   prior:
-    _target_: src.model.model.PlacementsPrior
+    _target_: src.model.model.PoissonGatedSlabPrior
     kh: 100
     kw: 100
     img_h: 100
