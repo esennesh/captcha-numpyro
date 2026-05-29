@@ -3,6 +3,7 @@ from flax.nnx.nn.linear import canonicalize_padding
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float
+import math
 import numpyro
 import numpyro.distributions as dist
 from numpyro.contrib.module import nnx_module
@@ -37,7 +38,8 @@ def over(bg, fg):
 class PVaePrior(nnx.Module):
     def __init__(self, shape, *, rngs: nnx.Rngs):
         self.shape = shape
-        self.u = nnx.Param(rngs.uniform(shape=shape, minval=-10., maxval=-9.))
+        rate = rngs.uniform(minval=1., maxval=4.)
+        self.u = nnx.Param(jnp.log(jnp.ones(shape) * rate / math.prod(shape)))
 
     def __call__(self, rngs=None):
         return dist.Poisson(jnp.exp(self.u)).to_event(len(self.shape))
