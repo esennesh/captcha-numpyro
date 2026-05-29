@@ -8,8 +8,8 @@ placements:
   _target_: src.model.model.ShapePlacements
   prior:
     _target_: src.model.model.PoissonGatedSlabPrior
-    kh: 100
-    kw: 100
+    kh: 60
+    kw: 60
     img_h: 100
     img_w: 200
     num_features: 186
