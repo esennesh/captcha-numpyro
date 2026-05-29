@@ -116,10 +116,6 @@ class ExternalKernelConvTranspose(nnx.ConvTranspose):
         if num_batch_dimensions != 1:
             y = jnp.reshape(y, input_batch_shape + y.shape[1:])
 
-        y_alpha = jnp.where(y > 0, jnp.ones(y.shape[:-1] + (1,)),
-                            jnp.zeros(y.shape[:-1] + (1,)))
-        y = jnp.concatenate((y, y, y, y_alpha), axis=-1)
-
         return y
 
 class ShapeConvTranspose(nnx.Module):
@@ -134,26 +130,77 @@ class ShapeConvTranspose(nnx.Module):
                                                   **kwargs, rngs=rngs)
         self.shape_dict = shape_dict
 
-    def __call__(self, activations: Array, rngs=None):
+    def __call__(self, activations: Array, kernels: Optional[Array] = None,
+                 rngs=None):
+        if kernels is None:
+            kernels = self.shape_dict.shapes
         deconv = jax.vmap(jax.vmap(self.deconv))
-        shape_dict = jnp.broadcast_to(
-            self.shape_dict.shapes[jnp.newaxis, ..., jnp.newaxis],
-            activations.shape[:1] + self.shape_dict.shapes.shape + (1,)
+        kernel_array = jnp.broadcast_to(
+            kernels[jnp.newaxis, ..., jnp.newaxis],
+            activations.shape[:1] + kernels.shape + (1,)
         )
-        return deconv(activations[..., jnp.newaxis], shape_dict)
+        return deconv(activations[..., jnp.newaxis], kernel_array)
 
 class ShapePlacements(nnx.Module):
+    """Depth-softmax compositing of glyph placements.
+
+    Each source cell ``c = (k, h', w')`` in the sampled ``wheres`` Poisson
+    activation field is treated as a placement whose distance from an imagined
+    background decreases as its activation count ``a_c`` grows. The compositing
+    weight is ``w_c = a_c ** beta``, and the per-pixel output is an
+    activation-weighted average over all placements whose glyph footprint
+    covers that pixel:
+
+        color(p) = sum_k conv_transpose(a_k**beta, K_k)(p)
+                 / sum_k conv_transpose(a_k**beta, M_k)(p)
+        alpha(p) = 1 - exp(- alpha_sharpness * sum_k conv_transpose(
+                                                       a_k**beta, M_k)(p))
+
+    where ``K_k`` is the glyph kernel for class ``k`` and ``M_k = (K_k > 0)``
+    is its binary support mask. ``beta -> infty`` hardens toward winner-take-all
+    (closest placement wins per pixel), ``beta = 1`` gives a count-weighted
+    blend, and any ``beta > 0`` makes zero-activation cells drop out.
+    """
+
     def __init__(self, prior: PlacementsPrior, shaper: ShapeConvTranspose,
-                 num_hiddens=64, *, rngs: nnx.Rngs):
+                 num_hiddens=64, beta: float = 1.0,
+                 alpha_sharpness: float = 5.0, *, rngs: nnx.Rngs):
         num_shapes = len(prior.topography.u)
         self.prior = prior
         self.shaper = shaper
+        self.beta = beta
+        self.alpha_sharpness = alpha_sharpness
         assert len(self.shaper.shape_dict.shapes) == num_shapes
 
     def __call__(self, rngs=None):
         wheres = numpyro.sample("what_x_where", self.prior(rngs=rngs))
-        layers = self.shaper(wheres)
-        return jnp.take(jax.lax.associative_scan(over, layers, axis=-4), -1, -4)
+
+        # Per-source-cell compositing weight a_c ** beta.
+        weights = wheres ** self.beta                       # (B, K, H', W')
+
+        # Numerator: conv_transpose with glyph kernels K_k, summed across K.
+        # Denominator: conv_transpose with binary masks M_k = (K_k > 0).
+        shapes = self.shaper.shape_dict.shapes
+        masks = (shapes > 0).astype(shapes.dtype)
+        color_layers = self.shaper(weights)                 # (B, K, H, W, 1)
+        mask_layers  = self.shaper(weights, kernels=masks)  # (B, K, H, W, 1)
+
+        num = color_layers.sum(axis=-4)                     # (B, H, W, 1)
+        den = mask_layers.sum(axis=-4)                      # (B, H, W, 1)
+
+        # Safe-divide for the grayscale color; uncovered pixels are 0.
+        eps = 1e-8
+        gray = jnp.where(den > eps,
+                         num / jnp.maximum(den, eps),
+                         jnp.zeros_like(num))
+        gray = jnp.clip(gray, 0., 1.)
+
+        # Beer-Lambert-style smooth alpha; saturates as coverage accumulates.
+        alpha = 1.0 - jnp.exp(-self.alpha_sharpness * den)
+
+        # Grayscale glyph -> RGB by broadcast, then concat alpha for RGBA.
+        rgb = jnp.broadcast_to(gray, gray.shape[:-1] + (3,))
+        return jnp.concatenate((rgb, alpha), axis=-1)       # (B, H, W, 4)
 
 class BackgroundDecoder(nnx.Module):
     def __init__(self, embedding_dim: int=50, height=60, hiddens=400, width=160,
