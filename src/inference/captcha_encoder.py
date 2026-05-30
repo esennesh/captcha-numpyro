@@ -1,82 +1,200 @@
-import numpyro.distributions as dist
+"""SPAIR-style encoder for the CAPTCHA generative model's latent surface.
+
+A single stride-1 SAME-padding CNN backbone produces image-resolution
+features; three composition-based heads (placement, colour, background)
+share those features and emit the variational distributions for the
+model's sample sites:
+
+  - ``ShapePlacer``        -> ``z_count``, ``z_mark``     (per-patch)
+  - ``ColorFinder``        -> ``color``                   (global)
+  - ``BackgroundEncoder``  -> ``bg``                       (global, optional)
+
+The placement head's patch projection is a single ``(kh, kw)`` VALID conv
+that maps the backbone features to exactly the placement grid shape
+``(H', W') = ((H - kh)//stride + 1, (W - kw)//stride + 1)`` -- the same
+geometry as ``PoissonGatedSlabPrior`` on the generative side, so each
+per-patch posterior parameter sees exactly one glyph's worth of input
+pixels and aligns spatially with the corresponding prior cell.
+
+The guide structurally mirrors the prior: ``z_mark``'s posterior is a
+``GatedSpikeAndSlab`` gated by the encoder's *own* ``z_count`` sample,
+keeping model and guide log-probs consistent at empty patches.
+"""
+
+from typing import Optional, Tuple
+
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float
 from flax import nnx
-from numpyro.contrib.module import nnx_module
 import numpyro
+import numpyro.distributions as dist
+from numpyro.contrib.module import nnx_module
 
-from src.inference import slot_attn
+from src.distributions import GatedSpikeAndSlab, OneHotCategorical
+
+
+class Backbone(nnx.Module):
+    """Shared image-resolution CNN backbone.
+
+    Stride-1 SAME-padding so spatial dimensions are preserved, letting
+    downstream patch / global heads pick their own pooling geometry.
+    """
+
+    def __init__(self, in_channels: int = 3,
+                 hidden_dims: Tuple[int, ...] = (16, 32, 64),
+                 *, rngs: nnx.Rngs):
+        layers = []
+        ch_in = in_channels
+        for ch_out in hidden_dims:
+            layers.append(nnx.Conv(ch_in, ch_out, (3, 3),
+                                   padding="SAME", rngs=rngs))
+            layers.append(nnx.relu)
+            ch_in = ch_out
+        self.layers = nnx.Sequential(*layers)
+        self.out_channels = hidden_dims[-1]
+
+    def __call__(
+        self, images: Float[Array, "B H W C_in"]
+    ) -> Float[Array, "B H W C_out"]:
+        return self.layers(images)
+
+
+class ShapePlacer(nnx.Module):
+    """SPAIR-style per-patch placement encoder.
+
+    Takes the shared backbone features, projects them to the placement
+    grid resolution via a single ``(kh, kw)`` VALID conv, then emits
+    per-patch ``z_count`` (Poisson) and ``z_mark`` (gated spike-and-slab)
+    sample sites.
+    """
+
+    def __init__(self, backbone_channels: int = 64,
+                 kw: int = 60, kh: int = 60,
+                 img_w: int = 200, img_h: int = 100,
+                 num_features: int = 36, stride: int = 1,
+                 feat_dim: int = 64,
+                 *, rngs: nnx.Rngs):
+        self.kw, self.kh = kw, kh
+        self.stride = stride
+        self.height = (img_h - kh) // stride + 1
+        self.width  = (img_w - kw) // stride + 1
+        self.num_features = num_features
+
+        # Patch projection: (kh, kw) VALID conv, stride=stride. Output
+        # shape matches the placement prior's grid exactly, and the
+        # kh×kw receptive field per output position is one glyph's
+        # worth of input pixels.
+        self.to_patches = nnx.Conv(
+            backbone_channels, feat_dim, (kh, kw),
+            padding="VALID", strides=(stride, stride), rngs=rngs,
+        )
+
+        # Per-patch heads (1×1 convs over the (H', W', feat_dim) map).
+        self.count_head = nnx.Conv(feat_dim, 1, (1, 1), rngs=rngs)
+        self.mark_head  = nnx.Conv(feat_dim, num_features, (1, 1), rngs=rngs)
+
+    def __call__(
+        self, features: Float[Array, "B H W C_feat"]
+    ) -> Tuple[Array, Array]:
+        patches = nnx.relu(self.to_patches(features))    # (B, H', W', feat_dim)
+
+        # Poisson rate for the count. softplus ensures nonnegativity;
+        # squeeze the trailing channel of size 1.
+        rate = jax.nn.softplus(self.count_head(patches)[..., 0])  # (B, H', W')
+        z_count = numpyro.sample(
+            "z_count", dist.Poisson(rate).to_event(2),
+        )
+
+        # Mark: properly gated spike-and-slab on the encoder side, exactly
+        # mirroring the prior so model/guide log-probs match at empty patches.
+        K = self.num_features
+        mark_logits = self.mark_head(patches)                    # (B, H', W', K)
+        spike = dist.Delta(jnp.zeros(K), event_dim=1)
+        slab  = OneHotCategorical(logits=mark_logits)
+        z_mark = numpyro.sample(
+            "z_mark",
+            GatedSpikeAndSlab(z_count, spike, slab).to_event(2),
+        )
+        return z_count, z_mark
+
+
+class ColorFinder(nnx.Module):
+    """Global RGB encoder.
+
+    Global-average-pools the backbone features, then emits ``color``
+    (3-d Normal with sigmoid-loc, softplus-scale).
+    """
+
+    def __init__(self, backbone_channels: int = 64,
+                 hidden_dim: int = 128, *, rngs: nnx.Rngs):
+        self.head = nnx.Sequential(
+            nnx.Linear(backbone_channels, hidden_dim, rngs=rngs), nnx.relu,
+            nnx.Linear(hidden_dim, 3 * 2, rngs=rngs),
+        )
+
+    def __call__(
+        self, features: Float[Array, "B H W C_feat"]
+    ) -> Float[Array, "B 3"]:
+        x = features.mean(axis=(1, 2))                # (B, C_feat)
+        params = self.head(x).reshape(-1, 2, 3)       # (B, 2, 3)
+        return numpyro.sample(
+            "color",
+            dist.Normal(
+                jax.nn.sigmoid(params[:, 0]),
+                jax.nn.softplus(params[:, 1]),
+            ).to_event(1),
+        )
 
 
 class BackgroundEncoder(nnx.Module):
-    def __init__(self, embedding_dim: int=50, height=60, hiddens=400, width=160,
+    """Global background-latent encoder.
+
+    Global-average-pools the backbone features, then emits ``bg``
+    (Normal with diagonal scale).
+    """
+
+    def __init__(self, backbone_channels: int = 64,
+                 embedding_dim: int = 50, hidden_dim: int = 128,
                  *, rngs: nnx.Rngs):
-        self.bg_shape = (height, width)
         self.embedding_dim = embedding_dim
-        self.encoder = nnx.Sequential(
-            nnx.Linear(height * width, hiddens, rngs=rngs), nnx.silu,
-            nnx.Linear(hiddens, embedding_dim * 2, rngs=rngs)
-        )
-
-    def __call__(self, images, rngs: nnx.Rngs=None):
-        images = jax.lax.collapse(images, -2)
-        params = self.encoder(images).reshape(-1, self.embedding_dim, 2)
-        loc, scale = params[..., 0], jnp.exp(params[..., 1])
-        return numpyro.sample("bg", dist.Normal(loc, scale).to_event(1))
-
-class ColorFinder(nnx.Module):
-    def __init__(self, hidden_dim=128, *, rngs: nnx.Rngs):
-        self.cnn = nnx.Sequential(
-            nnx.Conv(3,  16, (3, 3), strides=(2, 2), padding='SAME', rngs=rngs),
-            nnx.relu,
-            nnx.Conv(16, 32, (3, 3), strides=(2, 2), padding='SAME', rngs=rngs),
-            nnx.relu,
-            nnx.Conv(32, 64, (3, 3), strides=(2, 2), padding='SAME', rngs=rngs),
-            nnx.relu,
-            nnx.Conv(64, 64, (3, 3), strides=(2, 2), padding='SAME', rngs=rngs),
-            nnx.relu,
-        )
-        self.linear_head = nnx.Linear(64, 3 * 2, rngs=rngs)
-
-    def __call__(
-        self, images: Float[Array, "*batch H W channels"]
-    ) -> Float[Array, "*batch channels"]:
-        x = self.cnn(images)          # (B, 4, 10, 64)
-        x = x.mean(axis=(1, 2))       # global average pool → (B, 64)
-        params = self.linear_head(x).reshape(-1, 2, 3) # (B, 6)
-        rgb_q = dist.Normal(jax.nn.sigmoid(params[:, 0]),
-                            jax.nn.softplus(params[:, 1]))
-        return numpyro.sample("color", rgb_q.to_event(1))
-
-class ShapePlacer(nnx.Module):
-    def __init__(self, kw: int=40, kh: int=40, hidden_dim=128, img_w: int=160,
-                 img_h: int=60, num_features: int=36, num_iterations: int=10,
-                 stride: int=1, *, rngs: nnx.Rngs):
-        self.num_features = num_features
-        self.slots_h = (img_h - kh) // stride + 1
-        self.slots_w = (img_w - kw) // stride + 1
-
-        self.slot_encoder = slot_attn.SlotAttentionEncoder(
-            (img_h, img_w), self.slots_h * self.slots_w, num_iterations,
-            rngs=rngs, slot_dim=self.num_features
+        self.head = nnx.Sequential(
+            nnx.Linear(backbone_channels, hidden_dim, rngs=rngs), nnx.relu,
+            nnx.Linear(hidden_dim, embedding_dim * 2, rngs=rngs),
         )
 
     def __call__(
-        self, images: Float[Array, "*batch IH IW channels"]
-    ) -> Float[Array, "*batch K OH OW"]:
-        u_hw = self.slot_encoder(images).reshape(-1, self.num_features,
-                                                 self.slots_h, self.slots_w)
-        rate = jnp.exp(u_hw)
-        return numpyro.sample("what_x_where", dist.Poisson(rate).to_event(3))
+        self, features: Float[Array, "B H W C_feat"]
+    ) -> Float[Array, "B D"]:
+        x = features.mean(axis=(1, 2))                              # (B, C_feat)
+        params = self.head(x).reshape(-1, 2, self.embedding_dim)    # (B, 2, D)
+        return numpyro.sample(
+            "bg",
+            dist.Normal(
+                params[:, 0],
+                jax.nn.softplus(params[:, 1]),
+            ).to_event(1),
+        )
 
-def captcha_guide(images, backgrounder: BackgroundEncoder,
-                  color_finder: ColorFinder, placements: ShapePlacer):
-    backgrounder = nnx_module("backgrounder_q", backgrounder)
-    color_finder = nnx_module("color_finder", color_finder)
+
+def captcha_guide(images, backbone: Backbone, placements: ShapePlacer,
+                  color_finder: ColorFinder,
+                  backgrounder: Optional[BackgroundEncoder] = None):
+    """Guide function mirroring ``captcha_model``.
+
+    Runs the shared backbone once and feeds its features to each head.
+    The ``bg`` site is only emitted when a ``BackgroundEncoder`` is
+    provided, matching the model's conditional ``backgrounder``.
+    """
+    backbone = nnx_module("backbone_q", backbone)
     placements = nnx_module("placements_q", placements)
+    color_finder = nnx_module("color_finder_q", color_finder)
+    if backgrounder is not None:
+        backgrounder = nnx_module("backgrounder_q", backgrounder)
 
     with numpyro.plate("batch", images.shape[0]):
-        c = color_finder(images)
-        backgrounder(images.mean(axis=-1))
-        placements(images)
+        features = backbone(images)
+        color_finder(features)
+        if backgrounder is not None:
+            backgrounder(features)
+        placements(features)
