@@ -1,17 +1,27 @@
 _target_: src.inference.captcha_encoder.captcha_guide
 _partial_: true
-backgrounder:
-  _target_: src.inference.captcha_encoder.BackgroundEncoder
+backbone:
+  _target_: src.inference.captcha_encoder.Backbone
+  hidden_dims: [16, 32, 64]
   rngs:
     _target_: flax.nnx.Rngs
-    default: 1234
-color_finder:
-  _target_: src.inference.captcha_encoder.ColorFinder
-  rngs:
-    _target_: flax.nnx.Rngs
-    default: 5678
+    default: 3456
 placements:
   _target_: src.inference.captcha_encoder.ShapePlacer
+  backbone_channels: 64
+  num_features: 108
   rngs:
     _target_: flax.nnx.Rngs
     default: 9012
+color_finder:
+  _target_: src.inference.captcha_encoder.ColorFinder
+  backbone_channels: 64
+  rngs:
+    _target_: flax.nnx.Rngs
+    default: 5678
+backgrounder:
+  _target_: src.inference.captcha_encoder.BackgroundEncoder
+  backbone_channels: 64
+  rngs:
+    _target_: flax.nnx.Rngs
+    default: 1234
