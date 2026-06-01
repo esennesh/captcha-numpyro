@@ -9,5 +9,11 @@ learner:
   optim:
     learning_rate: 1e-5
 
+guide:
+  backgrounder: null
+
+model:
+  backgrounder: null
+
 trainer:
   epochs: 100
