@@ -69,12 +69,9 @@ class ShapePlacer(nnx.Module):
     sample sites.
     """
 
-    def __init__(self, backbone_channels: int = 64,
-                 kw: int = 60, kh: int = 60,
-                 img_w: int = 200, img_h: int = 100,
-                 num_features: int = 36, stride: int = 1,
-                 feat_dim: int = 64,
-                 *, rngs: nnx.Rngs):
+    def __init__(self, backbone_channels: int = 64, kw: int = 60, kh: int = 60,
+                 img_w: int = 180, img_h: int = 80, num_features: int = 36,
+                 stride: int = 1, feat_dim: int = 64, *, rngs: nnx.Rngs):
         self.kw, self.kh = kw, kh
         self.stride = stride
         self.height = (img_h - kh) // stride + 1
@@ -97,6 +94,7 @@ class ShapePlacer(nnx.Module):
     def __call__(
         self, features: Float[Array, "B H W C_feat"]
     ) -> Tuple[Array, Array]:
+        B = features.shape[0]
         patches = nnx.relu(self.to_patches(features))    # (B, H', W', feat_dim)
 
         # Poisson rate for the count. softplus ensures nonnegativity;
@@ -109,8 +107,8 @@ class ShapePlacer(nnx.Module):
         # Mark: properly gated spike-and-slab on the encoder side, exactly
         # mirroring the prior so model/guide log-probs match at empty patches.
         K = self.num_features
-        mark_logits = self.mark_head(patches)                    # (B, H', W', K)
-        spike = dist.Delta(jnp.zeros(K), event_dim=1)
+        mark_logits = self.mark_head(patches)                   # (B, H', W', K)
+        spike = dist.Delta(jnp.zeros((B, 1, 1, K)), event_dim=1)
         slab  = OneHotCategorical(logits=mark_logits)
         z_mark = numpyro.sample(
             "z_mark",
