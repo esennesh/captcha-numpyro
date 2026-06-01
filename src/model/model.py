@@ -88,7 +88,7 @@ class PoissonGatedSlabPrior(nnx.Module):
     Sample sites emitted into the numpyro trace: ``z_count`` and ``z_class``.
     """
 
-    def __init__(self, kw: int=40, kh: int=40, img_w: int=200, img_h: int=100,
+    def __init__(self, kw: int=60, kh: int=60, img_w: int=180, img_h: int=80,
                  num_features: int=36, stride: int=1, hidden_dim: int=16,
                  num_conv_layers: int=2, log_rate_init: float=-0.5, *,
                  rngs: nnx.Rngs):
@@ -135,6 +135,7 @@ class PoissonGatedSlabPrior(nnx.Module):
 
         # Per-patch Poisson presence/intensity. -> (..., H, W)
         z = numpyro.sample("z_count", dist.Poisson(jnp.exp(u)).to_event(2))
+        B = z.shape[0]
 
         # Per-patch mark — properly gated by z: a Delta on the zero K-vector
         # at empty patches (z == 0), a OneHotCategorical otherwise. Stops
@@ -142,9 +143,10 @@ class PoissonGatedSlabPrior(nnx.Module):
         # unconditional mark site would emit at empty patches.
         K = self._num_features
         logits = jnp.broadcast_to(self.class_logits,
-                                  (self.height, self.width, K))
-        spike = dist.Delta(jnp.zeros(K), event_dim=1)       # event_shape (K,)
-        slab  = OneHotCategorical(logits=logits)            # batch (H, W)
+                                  (B, self.height, self.width, K))
+        # -> event_shape (K,)
+        spike = dist.Delta(jnp.zeros((B, 1, 1, K)), event_dim=1)
+        slab  = OneHotCategorical(logits=logits)              # batch (B, H, W)
         # -> # (..., H, W, K)
         mark = numpyro.sample("z_mark", GatedSpikeAndSlab(z, spike,
                                                           slab).to_event(2))
