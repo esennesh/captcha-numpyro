@@ -1,5 +1,8 @@
 from collections import namedtuple
 import jax
+from jax.example_libraries.optimizers import (OptimizerState,
+                                              pack_optimizer_state,
+                                              unpack_optimizer_state)
 import json
 from importlib.util import find_spec
 import logging
