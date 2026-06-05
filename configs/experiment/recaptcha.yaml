@@ -1,0 +1,13 @@
+# @package _global_
+
+defaults:
+  - override /data: recaptcha
+  - override /guide: captcha_encoder
+  - override /model: captcha
+
+learner:
+  optim:
+    learning_rate: 1e-5
+
+trainer:
+  epochs: 100
