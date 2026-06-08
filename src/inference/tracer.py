@@ -94,12 +94,14 @@ class ParticleTracer(ELBOMixin):
                       if site["type"] == "sample" and name not in graph_state
             })
             graph_state.update({
-                name: (site["value"], 0., 0., False)
+                name: (site["value"], jnp.zeros(site["value"].shape[:1]),
+                       jnp.zeros(site["value"].shape[:1]), False)
                 for name, site in model_trace.items()
                 if site["type"] == "deterministic"
             })
             graph_state.update({
-                name: (site["value"], 0., 0., False)
+                name: (site["value"], jnp.zeros(site["value"].shape[:1]),
+                       jnp.zeros(site["value"].shape[:1]), False)
                 for name, site in guide_trace.items()
                 if site["type"] == "deterministic"
             })
