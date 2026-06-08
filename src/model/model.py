@@ -10,7 +10,7 @@ from numpyro.contrib.module import nnx_module
 from typing import Optional
 
 from src.data.dictionary import ShapeDictionary
-from src.distributions import GatedSpikeAndSlab, OneHotCategorical
+from src.distributions import CategoricalSpikeAndSlab
 from src import utils
 
 
@@ -69,28 +69,9 @@ class PlacementsPrior(nnx.Module):
     def __call__(self, rngs=None):
         return self.topography(rngs=rngs)
 
-class PoissonGatedSlabPrior(nnx.Module):
-    """Marked Poisson-Bernoulli per-patch placement prior.
-
-    Each patch ``(h, w)`` independently draws
-
-        z_{h,w}   ~ Poisson(exp(u_{h,w}))         # presence + intensity
-        k_{h,w}   ~ Categorical(class_logits)      # which glyph
-        wheres[k, h, w] = z_{h,w} * 1[k = k_{h,w}]  # one-hot * count
-
-    so at most one glyph fires per patch, weighted by its Poisson count.
-    The per-patch log-rate field ``u`` is produced by a small CNN refining
-    a learnable base field ``u_init`` (initialised at ``log_rate_init``
-    for sparse defaults). The Categorical logits are shared across patches,
-    so the layout prior lives in ``u`` and the identity prior lives in
-    ``class_logits``.
-
-    Sample sites emitted into the numpyro trace: ``z_count`` and ``z_class``.
-    """
-
+class TopographicPoisson(nnx.Module):
     def __init__(self, kw: int=60, kh: int=60, img_w: int=180, img_h: int=80,
-                 num_features: int=36, stride: int=1, hidden_dim: int=16,
-                 num_conv_layers: int=2, log_rate_init: float=-0.5, *,
+                 num_features: int=36, stride: int=1, rate_init: float=1., *,
                  rngs: nnx.Rngs):
         self.height = (img_h - kh) // stride + 1
         self.width  = (img_w - kw) // stride + 1
@@ -99,60 +80,21 @@ class PoissonGatedSlabPrior(nnx.Module):
         # Learnable per-patch base log-rate. exp(-6) ≈ 0.0025 per patch;
         # at 21 * 121 = 2541 patches this gives ~6 expected placements per
         # image — a sensible captcha default. Tune with log_rate_init.
-        log_rate_init = jnp.log(jnp.exp(log_rate_init) /\
-                                (self.height * self.width))
-        self.u_init = nnx.Param(jnp.full((self.height, self.width, 1),
+        log_rate_init = jnp.log(
+            rate_init / (self.height * self.width * self.num_features)
+        )
+        self.u_init = nnx.Param(jnp.full((self.num_features, self.height,
+                                          self.width),
                                 log_rate_init))
-
-        # Small CNN producing a *refinement* to u_init (residual). The
-        # last conv is zero-initialised so at init the CNN is the identity
-        # function and u ≈ u_init (preserves the sparse default).
-        layers = []
-        in_ch = 1
-        for _ in range(num_conv_layers - 1):
-            layers.append(nnx.Conv(in_ch, hidden_dim, (3, 3),
-                                   padding="SAME", rngs=rngs))
-            layers.append(nnx.relu)
-            in_ch = hidden_dim
-        layers.append(nnx.Conv(in_ch, 1, (3, 3), padding="SAME",
-                               kernel_init=nnx.initializers.zeros,
-                               bias_init=nnx.initializers.zeros,
-                               rngs=rngs))
-        self.rate_cnn = nnx.Sequential(*layers)
-
-        # Shared categorical logits, uniform over glyphs at init.
-        self.class_logits = nnx.Param(jnp.zeros((num_features,)))
 
     @property
     def num_features(self) -> int:
         return self._num_features
 
     def __call__(self, rngs=None):
-        # CNN-refined log-rate field (residual; CNN starts as identity).
-        u = self.u_init                                      # (H, W, 1)
-        refinement = self.rate_cnn(u[jnp.newaxis])[0]        # (H, W, 1)
-        u = (u + refinement)[..., 0]                         # (H, W)
-
-        # Per-patch Poisson presence/intensity. -> (..., H, W)
-        z = numpyro.sample("z_count", dist.Poisson(jnp.exp(u)).to_event(2))
-        B = z.shape[0]
-
-        # Per-patch mark — properly gated by z: a Delta on the zero K-vector
-        # at empty patches (z == 0), a OneHotCategorical otherwise. Stops
-        # the spurious categorical log-prob contribution that an
-        # unconditional mark site would emit at empty patches.
-        K = self._num_features
-        logits = jnp.broadcast_to(self.class_logits,
-                                  (B, self.height, self.width, K))
-        # -> event_shape (K,)
-        spike = dist.Delta(jnp.zeros((B, 1, 1, K)), event_dim=1)
-        slab  = OneHotCategoricalLogits(logits)              # batch (B, H, W)
-        # -> # (..., H, W, K)
-        mark = numpyro.sample("z_mark", GatedSpikeAndSlab(z, spike,
-                                                          slab).to_event(2))
-
-        # Pack into the (..., K, H, W) tensor expected by ShapeConvTranspose.
-        return z[..., None, :, :] * jnp.moveaxis(mark, -1, -3)
+        u = self.u_init # (K, H, W)
+        # Per-patch, per-character Poisson presence/intensity. -> (..., K, H, W)
+        return numpyro.sample("z_count", dist.Poisson(jnp.exp(u)).to_event(3))
 
 class ExternalKernelConvTranspose(nnx.ConvTranspose):
     def __init__(self, *args, **kwargs):
