@@ -146,7 +146,7 @@ class PoissonGatedSlabPrior(nnx.Module):
                                   (B, self.height, self.width, K))
         # -> event_shape (K,)
         spike = dist.Delta(jnp.zeros((B, 1, 1, K)), event_dim=1)
-        slab  = OneHotCategorical(logits=logits)              # batch (B, H, W)
+        slab  = OneHotCategoricalLogits(logits)              # batch (B, H, W)
         # -> # (..., H, W, K)
         mark = numpyro.sample("z_mark", GatedSpikeAndSlab(z, spike,
                                                           slab).to_event(2))
