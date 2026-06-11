@@ -1,0 +1,26 @@
+# @package _global_
+
+defaults:
+  - override /data: captcha1
+  - override /guide: auto_mean_field
+  - override /learner: batchvi
+  - override /model: captcha
+
+data:
+  drop_last: true
+  indexed: true
+
+learner:
+  optim:
+    learning_rate: 1e-5
+
+model:
+  backgrounder: null
+  placements:
+    prior:
+      img_h: 80
+      img_w: 80
+
+trainer:
+  epochs: 100
+  save_period: 20
