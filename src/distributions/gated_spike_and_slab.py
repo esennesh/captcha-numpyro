@@ -23,8 +23,10 @@ import jax.numpy as jnp
 from jax import lax
 
 from numpyro.distributions import constraints
-from numpyro.distributions.distribution import Distribution
+from numpyro.distributions.distribution import Delta, Distribution
 from numpyro.distributions.util import is_prng_key, validate_sample
+
+from .one_hot_categorical import OneHotCategoricalLogits
 
 
 class GatedSpikeAndSlab(Distribution):
@@ -126,3 +128,22 @@ class GatedSpikeAndSlab(Distribution):
             self.slab.expand(self.batch_shape).mean,
             self.spike.expand(self.batch_shape).mean,
         )
+
+class CategoricalSpikeAndSlab(GatedSpikeAndSlab):
+    arg_constraints = {"slab_logits": constraints.real_vector,
+                       "spike_delta": constraints.real_vector}
+
+    def __init__(self, gate, spike_delta: jax.Array, slab_logits: jax.Array, *,
+                 validate_args: Optional[bool] = None):
+        spike_delta = Delta(jax.lax.broadcast_like(spike_delta, slab_logits),
+                            event_dim=1)
+        slab = OneHotCategoricalLogits(slab_logits)
+        super().__init__(gate, spike_delta, slab)
+
+    @property
+    def slab_logits(self):
+        return self.slab.logits
+
+    @property
+    def spike_delta(self):
+        return self.spike.v
