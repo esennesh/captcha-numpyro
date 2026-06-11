@@ -2,15 +2,17 @@
 
 defaults:
   - override /data: captcha
-  - override /guide: captcha_encoder
+  - override /guide: auto_mean_field
+  - override /learner: batchvi
   - override /model: captcha
+
+data:
+  drop_last: true
+  indexed: true
 
 learner:
   optim:
     learning_rate: 1e-5
-
-guide:
-  backgrounder: null
 
 model:
   backgrounder: null
