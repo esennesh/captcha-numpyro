@@ -201,8 +201,7 @@ class ShapePlacements(nnx.Module):
 
         # Safe-divide for the grayscale color; uncovered pixels are 0.
         eps = 1e-8
-        gray = jnp.where(den > eps,
-                         num / jnp.maximum(den, eps),
+        gray = jnp.where(den > eps, num / jnp.maximum(den, eps),
                          jnp.zeros_like(num))
         gray = jnp.clip(gray, 0., 1.)
 
