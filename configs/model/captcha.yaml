@@ -11,7 +11,7 @@ backgrounder:
 placements:
   _target_: src.model.model.ShapePlacements
   prior:
-    _target_: src.model.model.PoissonGatedSlabPrior
+    _target_: src.model.model.TopographicPoisson
     num_features: 108
     rngs:
       _target_: flax.nnx.Rngs

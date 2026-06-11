@@ -10,7 +10,6 @@ from numpyro.contrib.module import nnx_module
 from typing import Optional
 
 from src.data.dictionary import ShapeDictionary
-from src.distributions import CategoricalSpikeAndSlab
 from src import utils
 
 
@@ -35,39 +34,6 @@ def over(bg, fg):
 
     # Combine back into RGBA and return
     return jnp.concatenate([out_rgb, out_alpha], axis=-1)
-
-class PVaePrior(nnx.Module):
-    """Per-(class, patch) independent-Poisson placement prior.
-
-    Samples once at the ``what_x_where`` site and returns the activation
-    tensor of shape ``(*batch, K, H', W')``.
-    """
-
-    def __init__(self, shape, *, rngs: nnx.Rngs):
-        self.shape = shape
-        rate = rngs.uniform(minval=1., maxval=4.)
-        self.u = nnx.Param(jnp.log(jnp.ones(shape) * rate / math.prod(shape)))
-
-    def __call__(self, rngs=None):
-        return numpyro.sample(
-            "what_x_where",
-            dist.Poisson(jnp.exp(self.u)).to_event(len(self.shape)),
-        )
-
-class PlacementsPrior(nnx.Module):
-    def __init__(self, kw: int=40, kh: int=40, img_w: int=160, img_h: int=60,
-                 num_features: int=36, stride: int=1, *, rngs: nnx.Rngs):
-        height, width = (img_h - kh) // stride + 1, (img_w - kw) // stride + 1
-        self._num_features = num_features
-        self.topography = PVaePrior(shape=(num_features, height, width),
-                                    rngs=rngs)
-
-    @property
-    def num_features(self) -> int:
-        return self._num_features
-
-    def __call__(self, rngs=None):
-        return self.topography(rngs=rngs)
 
 class TopographicPoisson(nnx.Module):
     def __init__(self, kw: int=60, kh: int=60, img_w: int=180, img_h: int=80,
