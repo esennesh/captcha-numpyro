@@ -162,9 +162,7 @@ class ShapePlacements(nnx.Module):
     covers that pixel:
 
         color(p) = sum_k conv_transpose(a_k**beta, K_k)(p)
-                 / sum_k conv_transpose(a_k**beta, M_k)(p)
-        alpha(p) = 1 - exp(- alpha_sharpness * sum_k conv_transpose(
-                                                       a_k**beta, M_k)(p))
+        alpha(p) = 1 - exp(- alpha_sharpness * color(p))
 
     where ``K_k`` is the glyph kernel for class ``k`` and ``M_k = (K_k > 0)``
     is its binary support mask. ``beta -> infty`` hardens toward winner-take-all
@@ -192,21 +190,13 @@ class ShapePlacements(nnx.Module):
         # Numerator: conv_transpose with glyph kernels K_k, summed across K.
         # Denominator: conv_transpose with binary masks M_k = (K_k > 0).
         shapes = self.shaper.shape_dict.shapes
-        masks = (shapes > 0).astype(shapes.dtype)
-        color_layers = self.shaper(weights)                 # (B, K, H, W, 1)
-        mask_layers  = self.shaper(weights, kernels=masks)  # (B, K, H, W, 1)
-
-        num = color_layers.sum(axis=-4)                     # (B, H, W, 1)
-        den = mask_layers.sum(axis=-4)                      # (B, H, W, 1)
-
-        # Safe-divide for the grayscale color; uncovered pixels are 0.
-        eps = 1e-8
-        gray = jnp.where(den > eps, num / jnp.maximum(den, eps),
-                         jnp.zeros_like(num))
-        gray = jnp.clip(gray, 0., 1.)
+        images = self.shaper(weights)                # (B, K, H, W, 1)
+        masks = images > 0.
+        alphas = masks / (masks.sum(axis=-4, keepdims=True) + 1)
+        gray = (images * alphas).sum(axis=-4)        # (B, H, W, 1)
 
         # Beer-Lambert-style smooth alpha; saturates as coverage accumulates.
-        alpha = 1.0 - jnp.exp(-self.alpha_sharpness * den)
+        alpha = 1.0 - jnp.exp(-self.alpha_sharpness * gray)
 
         # Grayscale glyph -> RGB by broadcast, then concat alpha for RGBA.
         rgb = jnp.broadcast_to(gray, gray.shape[:-1] + (3,))
