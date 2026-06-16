@@ -62,6 +62,33 @@ class TopographicPoisson(nnx.Module):
         # Per-patch, per-character Poisson presence/intensity. -> (..., K, H, W)
         return numpyro.sample("z_count", dist.Poisson(jnp.exp(u)).to_event(3))
 
+class SparsePatchPrior(nnx.Module):
+    def __init__(self, kw: int=60, kh: int=60, img_w: int=180, img_h: int=80,
+                 num_features: int=36, stride: int=1, hidden_dim: int=16,
+                 num_conv_layers: int=2, rate_init: float=1, *, rngs: nnx.Rngs):
+        self.height = (img_h - kh) // stride + 1
+        self.width  = (img_w - kw) // stride + 1
+        self._num_features = num_features
+
+        # Learnable total rate in image, divided between patches.
+        # Tune with rate_init.
+        log_rate_init = -jnp.log(
+            rate_init / (self.height * self.width * self._num_features)
+        )
+        self.log_rate = nnx.Param(
+            jnp.full((self._num_features, self.height, self.width),
+                     log_rate_init)
+        )
+
+    @property
+    def num_features(self) -> int:
+        return self._num_features
+
+    def __call__(self, rngs=None):
+        # Per-patch Exponential presence/intensity. -> (..., H, W)
+        rate = jnp.exp(self.log_rate)
+        return numpyro.sample("z_count", dist.Exponential(rate).to_event(3))
+
 class ExternalKernelConvTranspose(nnx.ConvTranspose):
     def __init__(self, *args, **kwargs):
         kwargs["use_bias"] = False
