@@ -400,3 +400,93 @@ class AdaptiveParticleTracer(ParticleTracer):
 
 class AdaptiveElboTracer(AdaptiveParticleTracer, ELBOTracer):
     pass
+
+class DoubleCVTracer(ParticleTracer):
+    """Double control variate for discrete latents (Titsias & Shi, 2022),
+    'more computation' variant: the control variate is the first-order Taylor
+    expansion of the ELBO integrand about the variational mean E_q[z], using
+    grad_z ELBO evaluated there (their Eq. 7).
+
+    DRAFT — written against the tracer interface but NOT yet run.
+
+      grad_phi ELBO = E[(f - f~) s_phi]            (CV2: REINFORCE the remainder)
+                    + grad_phi E_q[f~],            (CV1: exact = g . grad_phi E_q[z])
+      f~(z) = f(zbar) + g . (z - zbar),  zbar = E_q[z],  g = grad_z f(zbar).
+
+    Only the *sampling* of z is non-differentiable; the integrand
+    f(z) = log p(x, z) - log q(z) is smooth in z, so g = grad_z f at the mean is
+    one extra backward pass through the decoder — the 'more computation' the
+    paper trades for lower variance, and it needs no analytic E_q, so it
+    survives a nonlinear decoder. E_q[z] for every guide latent is obtained
+    generically with the ``posterior_mean`` handler.
+
+    Assumes each latent's log_prob has a smooth continuous extension (Poisson
+    via gammaln) and a defined ``.mean``, and that ``param_map`` carries the
+    guide params (true for the graphical monad; batchvi keeps them elsewhere).
+    """
+    def __init__(self, *args, online=False, **kwargs):
+        self._online = online
+        super().__init__(*args, **kwargs)
+
+    def _guide_means(self, rng_key, param_map, guide, args, kwargs):
+        seeded = numpyro.handlers.substitute(
+            numpyro.handlers.seed(guide, rng_key), data=param_map)
+        gtr = numpyro.handlers.trace(
+            posterior_mean(seeded)).get_trace(*args, **kwargs)
+        return {n: s["value"] for n, s in gtr.items()
+                if s["type"] == "sample" and not s.get("is_observed", False)}
+
+    def loss(self, rng_key, param_map, particle_params, model, guide,
+             *args, **kwargs):
+        sg = jax.lax.stop_gradient
+        # 1. K particles from the parent sampler
+        traces, mutables = self(rng_key, param_map, particle_params, model,
+                                guide, *args, **kwargs)
+        logp_total = sum(site[1] * (site[3] | (not self._online)) for site in
+                         traces.values())    # (K, B)
+        logq_total = sum(site[2] * (site[3] | (not self._online)) for site in
+                         traces.values())    # (K, B)
+        f = logp_total - logq_total                              # (K, B)
+
+        # 2. variational means E_q[z] for every guide latent (live in phi)
+        means = self._guide_means(rng_key, param_map, guide, args, kwargs)
+        zbar = {k: sg(v) for k, v in means.items()}              # detached refs
+        frozen = sg(param_map)
+
+        # 3. ELBO integrand and its z-gradient AT the means (Eq. 7)
+        def elbo_at(values):
+            m_lp, _ = compute_log_probs(model, args, kwargs,
+                                        {**frozen, **values})
+            q_lp, _ = compute_log_probs(guide, args, kwargs,
+                                        {**frozen, **values})
+            fbar = sum(v * (traces[k][3] | (not self._online)) for k, v in
+                       m_lp.items()) -\
+                   sum(q_lp[k] * (traces[k][3] | (not self._online)) for k in
+                       values)  # (B,)
+            return fbar.sum(), fbar
+        g, fbar = jax.grad(elbo_at, has_aux=True)(zbar)          # g: {n: (B, D)}
+        g = {k: sg(v) for k, v in g.items()}
+        fbar = sg(fbar)                                          # (B,)
+
+        # 4. linear surrogate f~(z) and its (small) remainder
+        ftilde = fbar[None]                                      # (1, B) -> (K, B)
+        for name, gz in g.items():
+            zk = traces[name][0]                                 # (K, B, D)
+            ftilde = ftilde + jnp.sum(gz[None] * (zk - zbar[name][None]),
+                                      axis=-1)
+        remainder = f - ftilde                                   # (K, B)
+        K = remainder.shape[0]
+        baseline = (remainder.sum(0, keepdims=True) - remainder) / (K - 1)
+        advantage = sg(remainder - baseline)                     # (K, B)
+
+        # 5. surrogate: theta + value pathwise (entropy detached in phi);
+        #    CV2 REINFORCE on the remainder; CV1 exact grad_phi E_q[f~]
+        #    = g . grad_phi E_q[z]  (value 0, gradient is the reparam-like term)
+        cv2 = logq_total * advantage                             # (K, B)
+        cv1 = sum(jnp.sum(g[k] * (means[k] - sg(means[k])), axis=-1)
+                  for k in g)                                    # (B,)
+        elbo = (logp_total - sg(logq_total)) + (cv2 - sg(cv2))   # (K, B)
+        loss = -(elbo.mean(axis=0) + cv1).sum()
+
+        return loss, {"log_w": f.sum(axis=-1), "mutables": mutables,
+                      "trace": traces}
