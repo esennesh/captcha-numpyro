@@ -12,15 +12,16 @@ data:
 
 learner:
   optim:
-    learning_rate: 1e-5
+    learning_rate: 1e-4
 
 model:
   backgrounder: null
   placements:
     prior:
+      _target_: src.model.model.SparsePatchPrior
       img_h: 80
       img_w: 80
 
 trainer:
   epochs: 100
-  save_period: 20
+  save_period: 100
