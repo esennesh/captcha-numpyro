@@ -227,7 +227,9 @@ class ShapePlacements(nnx.Module):
 
         # Grayscale glyph -> RGB by broadcast, then concat alpha for RGBA.
         rgb = jnp.broadcast_to(gray, gray.shape[:-1] + (3,))
-        return jnp.concatenate((rgb, alpha), axis=-1)       # (B, H, W, 4)
+        rgba = jnp.concatenate((rgb, alpha), axis=-1)       # (B, H, W, 4)
+        log_variance = weights.sum(axis=(-3, -2, -1))     # (B,)
+        return rgba, jnp.exp(log_variance)
 
 class BackgroundDecoder(nnx.Module):
     def __init__(self, embedding_dim: int=50, height=60, hiddens=400, width=160,
@@ -255,14 +257,16 @@ def generate_captcha(placements: ShapePlacements,
     color = color[:, jnp.newaxis, jnp.newaxis, :]
     color = jnp.concatenate((color, jnp.ones(color.shape[:-1] + (1,))), axis=-1)
 
-    foreground = placements()
+    foreground, dvar = placements()
     foreground = foreground * color
+    dvar = dvar[..., jnp.newaxis, jnp.newaxis, jnp.newaxis]
     if backgrounder is not None:
         background = backgrounder() * color
     else:
         background = jnp.ones_like(foreground)
 
-    return utils.soft_clamp(over(background, foreground)[..., :-1], 0., 1.)
+    composite = over(background, foreground)[..., :-1]
+    return composite, dvar * (composite > 0).astype(dvar.dtype)
 
 def captcha_model(images, placements: ShapePlacements,
                   backgrounder: Optional[BackgroundDecoder]=None, scale=None):
@@ -272,6 +276,7 @@ def captcha_model(images, placements: ShapePlacements,
     if scale is None:
         scale = jnp.exp(numpyro.param("log_scale", jnp.zeros(())))
     with numpyro.plate("batch", images.shape[0]):
-        prediction = generate_captcha(placements, backgrounder)
+        prediction, dvar = generate_captcha(placements, backgrounder)
+        scale = jnp.sqrt(scale ** 2 + dvar)
         return numpyro.sample("obs", dist.Normal(prediction, scale).to_event(3),
                               obs=images)
