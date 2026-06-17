@@ -252,7 +252,7 @@ class BackgroundDecoder(nnx.Module):
 
 def generate_captcha(placements: ShapePlacements,
                      backgrounder: Optional[BackgroundDecoder]=None):
-    rgb_prior = dist.Uniform(jnp.zeros((3,)), jnp.ones((3,)))
+    rgb_prior = dist.Beta(jnp.ones((3,)), jnp.ones((3,)))
     color = numpyro.sample("color", rgb_prior.to_event(1))
     color = color[:, jnp.newaxis, jnp.newaxis, :]
     color = jnp.concatenate((color, jnp.ones(color.shape[:-1] + (1,))), axis=-1)
