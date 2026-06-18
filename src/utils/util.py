@@ -3,6 +3,7 @@ import jax
 from jax.example_libraries.optimizers import (OptimizerState,
                                               pack_optimizer_state,
                                               unpack_optimizer_state)
+import jax.numpy as jnp
 import json
 from importlib.util import find_spec
 import logging
@@ -66,7 +67,6 @@ InitialGraph = namedtuple("InitialGraph", ["constrain_fn", "guide_trace",
 def initialize_traces(model, guide, rng, params, *args, **kwargs):
     from functools import partial
     import itertools
-    import jax.numpy as jnp
     from jax import random
     from numpyro.distributions import constraints
     from numpyro.distributions.transforms import biject_to
@@ -301,14 +301,11 @@ class reconstruct(numpyro.primitives.Messenger):
             msg["done"] = False
 
 def serialize_key(node):
-    import jax.numpy as jnp
-
     if hasattr(node, "dtype") and jnp.issubdtype(node.dtype, jax.dtypes.prng_key):
         return jax.random.key_data(node)
     return node
 
 def unserialize_key(path, node):
-    import jax.numpy as jnp
     from jax.tree_util import DictKey
 
     if path[-1] == DictKey(key="rng_key"):
