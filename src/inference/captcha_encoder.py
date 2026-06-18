@@ -81,40 +81,27 @@ class ShapePlacer(nnx.Module):
         # shape matches the placement prior's grid exactly, and the
         # kh×kw receptive field per output position is one glyph's
         # worth of input pixels.
-        self.to_patches = nnx.Conv(
-            backbone_channels, feat_dim, (kh, kw),
-            padding="VALID", strides=(stride, stride), rngs=rngs,
+        self.to_patches = nnx.Sequential(
+            nnx.Conv(backbone_channels, feat_dim, (kh, kw), padding="VALID",
+                     strides=(stride, stride), rngs=rngs),
+            nnx.relu
         )
 
         # Per-patch heads (1×1 convs over the (H', W', feat_dim) map).
-        self.count_head = nnx.Conv(feat_dim, 1, (1, 1), rngs=rngs)
-        self.mark_head  = nnx.Conv(feat_dim, num_features, (1, 1), rngs=rngs)
+        self.count_head = nnx.Conv(feat_dim, self.num_features, (1, 1),
+                                   rngs=rngs)
 
     def __call__(
         self, features: Float[Array, "B H W C_feat"]
     ) -> Tuple[Array, Array]:
         B = features.shape[0]
-        patches = nnx.relu(self.to_patches(features))    # (B, H', W', feat_dim)
+        patches = self.to_patches(features)    # (B, H', W', feat_dim)
 
         # Poisson rate for the count. softplus ensures nonnegativity;
         # squeeze the trailing channel of size 1.
-        rate = jax.nn.softplus(self.count_head(patches)[..., 0])  # (B, H', W')
-        z_count = numpyro.sample(
-            "z_count", dist.Poisson(rate).to_event(2),
-        )
-
-        # Mark: properly gated spike-and-slab on the encoder side, exactly
-        # mirroring the prior so model/guide log-probs match at empty patches.
-        K = self.num_features
-        mark_logits = self.mark_head(patches)                   # (B, H', W', K)
-        spike = dist.Delta(jnp.zeros((B, 1, 1, K)), event_dim=1)
-        slab  = OneHotCategorical(logits=mark_logits)
-        z_mark = numpyro.sample(
-            "z_mark",
-            GatedSpikeAndSlab(z_count, spike, slab).to_event(2),
-        )
-        return z_count, z_mark
-
+        rate = jax.nn.softplus(self.count_head(patches))  # (B, H', W', K)
+        rate = jnp.moveaxis(rate, -1, -3) # (B, K, H', W')
+        return numpyro.sample("z_count", dist.Poisson(rate).to_event(3))
 
 class ColorFinder(nnx.Module):
     """Global RGB encoder.
