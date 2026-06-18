@@ -15,7 +15,8 @@ from typing import Any, Dict
 from .learner import ParamLearner
 from src.data import DataModule
 from src.inference.tracer import ParticleTracer
-from src.utils import initialize_traces, is_autoguide, reconstruct
+from src.utils import (effective_sample_size, initialize_traces, is_autoguide,
+                       reconstruct)
 
 class GraphicalModelLearner(ParamLearner):
     def __init__(self, data_shape, guide, model, optim, rng,
