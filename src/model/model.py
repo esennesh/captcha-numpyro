@@ -183,39 +183,20 @@ class ShapePlacements(nnx.Module):
     blend, and any ``beta > 0`` makes zero-activation cells drop out.
     """
 
-    def __init__(self, prior, shaper: ShapeConvTranspose,
-                 num_hiddens=64, beta: float = 1.0,
-                 alpha_sharpness: float = 5.0, *, rngs: nnx.Rngs):
+    def __init__(self, prior, shaper: ShapeConvTranspose, num_hiddens=64, *,
+                 rngs: nnx.Rngs):
         self.prior = prior
         self.shaper = shaper
-        self.beta = beta
-        self.alpha_sharpness = alpha_sharpness
         assert len(self.shaper.shape_dict.shapes) == prior.num_features
 
     def __call__(self, rngs=None):
         # The prior emits its own sample sites and returns the packed
         # (..., K, H', W') activation tensor.
-        wheres = self.prior(rngs=rngs)
+        wheres = self.prior(rngs=rngs)          # (B, K, H', W')
+        images = self.shaper(weights).squeeze() # (B, K, H, W)
 
-        # Per-source-cell compositing weight a_c ** beta.
-        weights = wheres ** self.beta                       # (B, K, H', W')
-
-        # Numerator: conv_transpose with glyph kernels K_k, summed across K.
-        # Denominator: conv_transpose with binary masks M_k = (K_k > 0).
-        shapes = self.shaper.shape_dict.shapes
-        images = self.shaper(weights)                # (B, K, H, W, 1)
-        masks = images > 0.
-        alphas = masks / (masks.sum(axis=-4, keepdims=True) + 1)
-        gray = (images * alphas).sum(axis=-4)        # (B, H, W, 1)
-
-        # Beer-Lambert-style smooth alpha; saturates as coverage accumulates.
-        alpha = 1.0 - jnp.exp(-self.alpha_sharpness * gray)
-
-        # Grayscale glyph -> RGB by broadcast, then concat alpha for RGBA.
-        rgb = jnp.broadcast_to(gray, gray.shape[:-1] + (3,))
-        rgba = jnp.concatenate((rgb, alpha), axis=-1)       # (B, H, W, 4)
         log_variance = weights.sum(axis=(-3, -2, -1))     # (B,)
-        return rgba, jnp.exp(log_variance)
+        return screen_blend(images, axis=-3), jnp.exp(log_variance)
 
 class BackgroundDecoder(nnx.Module):
     def __init__(self, embedding_dim: int=50, height=60, hiddens=400, width=160,
