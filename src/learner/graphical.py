@@ -186,6 +186,20 @@ class GraphicalModelLearner(ParamLearner):
 
         return state.guide_trace, state.model_trace
 
+    def _step_telemetry(self, loss, state):
+        metrics = {"loss": loss}
+        metrics.update({
+            key: value for key, value in state.items()
+            if isinstance(value, jax.Array)
+        })
+        if "log_w" in metrics and "ess" not in metrics:
+            metrics["ess"] = jax.numpy.mean(
+                effective_sample_size(metrics["log_w"], normalized=True)
+             )
+        predictions = {k: v["ev"] for k, v in state["trace"].items()
+                       if v["observed"].all()}
+        return metrics, predictions
+
     @cached_property
     def _update(self):
         @jax.jit
@@ -217,14 +231,14 @@ class GraphicalModelLearner(ParamLearner):
     def test_step(self, data, *args, **kwargs):
         loss, self._rng, state = self._evaluate(data, self.parameters, self.rng)
         self._buffer_state.update(state["mutables"])
-        return {"loss": loss, "log_w": state["log_w"]}
+        return self._step_telemetry(loss, state)
 
     def train_step(self, data, *args, **kwargs):
         loss, self.optim_state, self._rng, state = self._update(
             data, self.optim_state, self.rng
         )
         self._buffer_state.update(state["mutables"])
-        return {"loss": loss, "log_w": state["log_w"]}
+        return self._step_telemetry(loss, state)
 
     def validate(self, loss: float):
         if self.scheduler:
@@ -235,4 +249,4 @@ class GraphicalModelLearner(ParamLearner):
     def valid_step(self, data, *args, **kwargs):
         loss, self._rng, state = self._evaluate(data, self.parameters, self.rng)
         self._buffer_state.update(state["mutables"])
-        return {"loss": loss, "log_w": state["log_w"]}
+        return self._step_telemetry(loss, state)
