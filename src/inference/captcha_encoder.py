@@ -184,7 +184,7 @@ def captcha_guide(images, backbone: Backbone, placements: ShapePlacer,
         backgrounder = nnx_module("backgrounder_q", backgrounder)
 
     with numpyro.plate("batch", images.shape[0]):
-        features = backbone(images)
+        features = backbone(jnp.moveaxis(images, -3, -1))
         color_finder(features)
         if backgrounder is not None:
             backgrounder(features)
