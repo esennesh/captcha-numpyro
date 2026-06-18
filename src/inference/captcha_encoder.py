@@ -135,14 +135,9 @@ class ColorFinder(nnx.Module):
     ) -> Float[Array, "B 3"]:
         x = features.mean(axis=(1, 2))                # (B, C_feat)
         params = self.head(x).reshape(-1, 2, 3)       # (B, 2, 3)
-        return numpyro.sample(
-            "color",
-            dist.Normal(
-                jax.nn.sigmoid(params[:, 0]),
-                jax.nn.softplus(params[:, 1]),
-            ).to_event(1),
-        )
-
+        return numpyro.sample("color", dist.Beta(
+            jax.nn.softplus(params[:, 0]), jax.nn.softplus(params[:, 1])
+        ).to_event(1))
 
 class BackgroundEncoder(nnx.Module):
     """Global background-latent encoder.
