@@ -266,6 +266,7 @@ def generate_captcha(placements: ShapePlacements,
         background = jnp.ones_like(foreground)
 
     composite = over(background, foreground)[..., :-1]
+    composite = jnp.moveaxis(composite, -1, -3)
     return composite, dvar * (composite > 0).astype(dvar.dtype)
 
 def captcha_model(images, placements: ShapePlacements,
