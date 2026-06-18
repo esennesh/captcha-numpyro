@@ -59,7 +59,6 @@ class Backbone(nnx.Module):
     ) -> Float[Array, "B H W C_out"]:
         return self.layers(images)
 
-
 class ShapePlacer(nnx.Module):
     """SPAIR-style per-patch placement encoder.
 
