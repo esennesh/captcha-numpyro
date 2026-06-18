@@ -147,9 +147,8 @@ class BackgroundEncoder(nnx.Module):
     (Normal with diagonal scale).
     """
 
-    def __init__(self, backbone_channels: int = 64,
-                 embedding_dim: int = 50, hidden_dim: int = 128,
-                 *, rngs: nnx.Rngs):
+    def __init__(self, backbone_channels: int = 64, embedding_dim: int = 50,
+                 hidden_dim: int = 128, *, rngs: nnx.Rngs):
         self.embedding_dim = embedding_dim
         self.head = nnx.Sequential(
             nnx.Linear(backbone_channels, hidden_dim, rngs=rngs), nnx.relu,
@@ -168,7 +167,6 @@ class BackgroundEncoder(nnx.Module):
                 jax.nn.softplus(params[:, 1]),
             ).to_event(1),
         )
-
 
 def captcha_guide(images, backbone: Backbone, placements: ShapePlacer,
                   color_finder: ColorFinder,
