@@ -13,27 +13,13 @@ from src.data.dictionary import ShapeDictionary
 from src import utils
 
 
-def over(bg, fg):
-    """
-    Combines a foreground and background image layer.
-    Both inputs should have a shape of (H, W, 4) containing RGBA channels.
-    """
-    # Split RGB and Alpha channels
-    fg_rgb, fg_alpha = fg[..., :3], fg[..., 3:4]
-    bg_rgb, bg_alpha = bg[..., :3], bg[..., 3:4]
-
-    # Calculate the combined alpha channel
-    out_alpha = fg_alpha + bg_alpha * (1.0 - fg_alpha)
-
-    # Prevent division by zero if both alphas are 0
-    safe_alpha = jnp.where(out_alpha == 0.0, 1.0, out_alpha)
-
-    # Calculate the composited RGB colors
-    out_rgb = fg_rgb * fg_alpha + bg_rgb * bg_alpha * (1.0 - fg_alpha)
-    out_rgb = out_rgb / safe_alpha
-
-    # Combine back into RGBA and return
-    return jnp.concatenate([out_rgb, out_alpha], axis=-1)
+def screen_blend(layers, axis=0, logits=False):
+    if logits:
+        layers = jax.nn.sigmoid(layers)
+    p = 1.0 - jnp.prod(1.0 - layers, axis=0)
+    if logits:
+        return jax.scipy.special.logit(p)
+    return p
 
 class TopographicPoisson(nnx.Module):
     def __init__(self, kw: int=60, kh: int=60, img_w: int=180, img_h: int=80,
