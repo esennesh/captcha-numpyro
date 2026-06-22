@@ -279,5 +279,8 @@ def captcha_model(images, placements: ShapePlacements,
     with numpyro.plate("batch", images.shape[0]):
         prediction, dvar = generate_captcha(placements, backgrounder)
         scale = jnp.sqrt(scale ** 2 + dvar)
+        numpyro.deterministic("salience_map",
+                              utils.gaussian_variance_image(prediction, scale,
+                                                            image_layout="HWC"))
         return numpyro.sample("obs", dist.Normal(prediction, scale).to_event(3),
                               obs=images)
