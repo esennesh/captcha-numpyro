@@ -21,6 +21,9 @@ def screen_blend(layers, axis=0, logits=False):
         return jax.scipy.special.logit(p)
     return p
 
+def intensity_blend(layers, axis=0, temperature=1.):
+    return screen_blend(1 - jnp.exp(-temperature * layers), axis=axis)
+
 class TopographicPoisson(nnx.Module):
     def __init__(self, kw: int=60, kh: int=60, img_w: int=180, img_h: int=80,
                  num_features: int=36, stride: int=1, rate_init: float=1., *,
