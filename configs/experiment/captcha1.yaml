@@ -3,7 +3,7 @@
 defaults:
   - override /data: captcha1
   - override /guide: captcha_encoder
-  - override /learner: batchvi
+  - override /learner: graphical
   - override /model: captcha
 
 data:
