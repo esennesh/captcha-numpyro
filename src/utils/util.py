@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import json
 from importlib.util import find_spec
 import logging
+import math
 import numpy as np
 import numpyro
 import pandas as pd
@@ -32,6 +33,85 @@ def effective_sample_size(log_weights, normalized: bool=False, axis: int=0):
     if normalized:
         ess = ess / log_weights.shape[axis]
     return ess
+
+def gaussian_variance_image(loc, scale, *, blur_sigma=3.0, eps=1e-6,
+                            image_layout="CHW", normalize=True):
+    """Blur a Gaussian mean image where the pixel variance is large.
+
+    If ``m`` is the mean image and ``s`` is the Gaussian scale image, this
+    returns
+
+        (1 - w) * m + w * gaussian_blur(m),
+
+    where ``w = s ** 2 / max(s ** 2)`` when ``normalize`` is true. A scalar
+    positive ``scale`` therefore gives a uniformly blurred mean image, while a
+    per-pixel ``scale`` leaves low-variance pixels sharp and high-variance
+    pixels soft.
+    """
+    image_layout = image_layout.upper()
+    loc = jnp.asarray(loc)
+    scale = jnp.asarray(scale)
+    if image_layout not in ("CHW", "HWC"):
+        raise ValueError("image_layout must be 'CHW' or 'HWC'.")
+
+    grayscale = loc.ndim == 2
+    if grayscale:
+        loc_hwc = loc[..., jnp.newaxis]
+    elif image_layout == "CHW":
+        loc_hwc = jnp.moveaxis(loc, -3, -1)
+    else:
+        loc_hwc = loc
+
+    height, width, channels = loc_hwc.shape[-3:]
+    if blur_sigma <= 0:
+        blurred_hwc = loc_hwc
+    else:
+        radius = math.ceil(3 * blur_sigma)
+        x = jnp.arange(-radius, radius + 1, dtype=loc_hwc.dtype)
+        kernel = jnp.exp(-0.5 * (x / blur_sigma) ** 2)
+        kernel = kernel / jnp.sum(kernel)
+
+        batch_shape = loc_hwc.shape[:-3]
+        loc_nhwc = jnp.reshape(loc_hwc, (-1, height, width, channels))
+        horizontal = jnp.broadcast_to(kernel[jnp.newaxis, :, jnp.newaxis,
+                                             jnp.newaxis],
+                                      (1, kernel.shape[0], 1, channels))
+        vertical = jnp.broadcast_to(kernel[:, jnp.newaxis, jnp.newaxis,
+                                           jnp.newaxis],
+                                    (kernel.shape[0], 1, 1, channels))
+        blurred_nhwc = jax.lax.conv_general_dilated(
+            loc_nhwc, vertical, (1, 1), "SAME", dimension_numbers=(
+                "NHWC", "HWIO", "NHWC"), feature_group_count=channels
+        )
+        blurred_nhwc = jax.lax.conv_general_dilated(
+            blurred_nhwc, horizontal, (1, 1), "SAME", dimension_numbers=(
+                "NHWC", "HWIO", "NHWC"), feature_group_count=channels
+        )
+        blurred_hwc = jnp.reshape(blurred_nhwc, batch_shape +\
+                                  (height, width, channels))
+
+    if scale.ndim == 0:
+        weight = jnp.ones_like(loc_hwc) * (scale > eps)
+    else:
+        if scale.ndim == 2:
+            scale_hwc = scale[..., jnp.newaxis]
+        elif image_layout == "CHW":
+            scale_hwc = jnp.moveaxis(scale, -3, -1)
+        else:
+            scale_hwc = scale
+        variance = scale_hwc ** 2
+        if normalize:
+            variance = variance / jnp.maximum(
+                jnp.max(variance, axis=(-3, -2, -1), keepdims=True), eps
+            )
+        weight = jnp.clip(variance, 0., 1.)
+
+    image_hwc = (1 - weight) * loc_hwc + weight * blurred_hwc
+    if grayscale:
+        return image_hwc[..., 0]
+    if image_layout == "CHW":
+        return jnp.moveaxis(image_hwc, -1, -3)
+    return image_hwc
 
 def soft_clamp(x, a, b, beta=20.0):
     # smooth max(x, a) - smooth max(x - (b - a), a) shifted
