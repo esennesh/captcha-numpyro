@@ -198,7 +198,8 @@ class GraphicalModelLearner(ParamLearner):
                 effective_sample_size(metrics["log_w"], normalized=True)
              )
         predictions = {k: v["ev"] for k, v in state["trace"].items()
-                       if v["observed"].all()}
+                       if v["observed"].all() or ((v["log_p"] == 0.).all() and
+                                                  (v["log_q"] == 0.).all())}
         return metrics, predictions
 
     @cached_property
