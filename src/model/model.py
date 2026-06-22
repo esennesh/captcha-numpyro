@@ -192,11 +192,11 @@ class ShapePlacements(nnx.Module):
     def __call__(self, rngs=None):
         # The prior emits its own sample sites and returns the packed
         # (..., K, H', W') activation tensor.
-        wheres = self.prior(rngs=rngs)          # (B, K, H', W')
-        images = self.shaper(weights).squeeze() # (B, K, H, W)
-
-        log_variance = weights.sum(axis=(-3, -2, -1))     # (B,)
-        return screen_blend(images, axis=-3), jnp.exp(log_variance)
+        wheres = self.prior(rngs=rngs) # (B, K, H', W')
+        images = self.shaper(wheres)   # (B, K, H, W, 1)
+        masks = (self.shaper.shape_dict.shapes > 0.).astype(images.dtype)
+        masks = self.shaper(wheres, kernels=masks) # (B, K, H, W, 1)
+        return intensity_blend(images, axis=-4), masks.sum(axis=-4)
 
 class BackgroundDecoder(nnx.Module):
     def __init__(self, embedding_dim: int=50, height=60, hiddens=400, width=160,
