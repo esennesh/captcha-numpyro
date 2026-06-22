@@ -32,4 +32,5 @@ model:
 
 trainer:
   epochs: 100
+  metrics: ["ess"]
   save_period: 100
