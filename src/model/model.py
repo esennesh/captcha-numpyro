@@ -16,7 +16,7 @@ from src import utils
 def screen_blend(layers, axis=0, logits=False):
     if logits:
         layers = jax.nn.sigmoid(layers)
-    p = 1.0 - jnp.prod(1.0 - layers, axis=0)
+    p = 1.0 - jnp.prod(1.0 - layers, axis=axis)
     if logits:
         return jax.scipy.special.logit(p)
     return p
@@ -241,7 +241,6 @@ def generate_captcha(placements: ShapePlacements,
     rgb_prior = dist.Beta(jnp.ones((3,)), jnp.ones((3,)))
     color = numpyro.sample("color", rgb_prior.to_event(1))
     color = color[:, jnp.newaxis, jnp.newaxis, :]
-    color = jnp.concatenate((color, jnp.ones(color.shape[:-1] + (1,))), axis=-1)
 
     foreground, dvar = placements()
     foreground = foreground * color
@@ -250,7 +249,7 @@ def generate_captcha(placements: ShapePlacements,
     else:
         background = jnp.ones_like(foreground)
 
-    composite = screen_blend(jnp.concatenate((background, foreground), axis=-1),
+    composite = screen_blend(jnp.stack((background, foreground), axis=-1),
                              axis=-1)
     composite = jnp.moveaxis(composite, -1, -3)
     return (composite, jnp.moveaxis(dvar, -1, -3) * (composite > 0).astype(dvar.dtype))
