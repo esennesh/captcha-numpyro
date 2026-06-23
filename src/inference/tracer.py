@@ -101,37 +101,38 @@ class ParticleTracer(ELBOMixin):
             check_model_guide_match(model_trace, guide_trace)
             _validate_model(model_trace, plate_warning="loose")
 
-            graph_state = {
-                name: trace_entry(
-                    site,
-                    site["log_prob"],
-                    guide_trace[name]["log_prob"] if name in guide_trace
-                    else jnp.zeros_like(site["log_prob"]),
-                    site["is_observed"],
-                )
-                for name, site in model_trace.items()
-                if site["type"] == "sample"
-            }
-            graph_state.update({
-                name: trace_entry(
-                    site,
-                    jnp.zeros_like(site["log_prob"]),
-                    site["log_prob"],
-                    False,
-                )
-                for name, site in guide_trace.items()
-                if site["type"] == "sample" and name not in graph_state
-            })
-            graph_state.update({
-                name: trace_entry(site, 0., 0., False)
-                for name, site in model_trace.items()
-                if site["type"] == "deterministic"
-            })
-            graph_state.update({
-                name: trace_entry(site, 0., 0., False)
-                for name, site in guide_trace.items()
-                if site["type"] == "deterministic"
-            })
+            graph_state = {}
+            for name, site in model_trace.items():
+                if site["type"] == "sample":
+                    graph_state[name] = trace_entry(
+                        site, site["log_prob"],
+                        guide_trace[name]["log_prob"] if name in guide_trace
+                        else jnp.zeros_like(site["log_prob"]),
+                        site["is_observed"]
+                    )
+                elif site["type"] == "deterministic":
+                    indep_shape = sum([(frame.size,) for frame
+                                       in site["cond_indep_stack"]], start=())
+                    graph_state[name] = trace_entry(site,
+                                                    jnp.zeros(indep_shape),
+                                                    jnp.zeros(indep_shape),
+                                                    False)
+            for name, site in guide_trace.items():
+                if name in graph_state:
+                    continue
+
+                if site["type"] == "sample":
+                    graph_state[name] = trace_entry(
+                        site, jnp.zeros_like(site["log_prob"]),
+                        site["log_prob"], False
+                    )
+                elif site["type"] == "deterministic":
+                    indep_shape = sum([(frame.size,) for frame
+                                       in site["cond_indep_stack"]], start=())
+                    graph_state[name] = trace_entry(site,
+                                                    jnp.zeros(indep_shape),
+                                                    jnp.zeros(indep_shape),
+                                                    False)
             mutables = {name: site["value"] for name, site in
                         model_trace.items() if site["type"] == "mutable"}
 
