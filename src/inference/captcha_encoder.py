@@ -34,6 +34,10 @@ from numpyro.contrib.module import nnx_module
 from src.distributions import GatedSpikeAndSlab, OneHotCategorical
 
 
+def softplus_inverse(x):
+    return jnp.log(jnp.expm1(x))
+
+
 class Backbone(nnx.Module):
     """Shared image-resolution CNN backbone.
 
@@ -68,14 +72,21 @@ class ShapePlacer(nnx.Module):
     sample sites.
     """
 
-    def __init__(self, backbone_channels: int = 64, kw: int = 60, kh: int = 60,
-                 img_w: int = 180, img_h: int = 80, num_features: int = 36,
-                 stride: int = 1, feat_dim: int = 64, *, rngs: nnx.Rngs):
+    def __init__(self, backbone_channels: int = 64, count_init: float = 1.,
+                 feat_dim: int = 64, img_h: int = 80, img_w: int = 180,
+                 kh: int = 60, kw: int = 60, num_features: int = 36,
+                 stride: int = 1, *, rngs: nnx.Rngs):
         self.kw, self.kh = kw, kh
         self.stride = stride
         self.height = (img_h - kh) // stride + 1
         self.width  = (img_w - kw) // stride + 1
         self.num_features = num_features
+        count_rate_init = count_init / (self.height * self.width *
+                                        self.num_features)
+        count_bias_init = float(softplus_inverse(jnp.asarray(count_rate_init)))
+
+        def count_head_bias_init(key, shape, dtype=jnp.float32):
+            return jnp.full(shape, count_bias_init, dtype)
 
         # Patch projection: (kh, kw) VALID conv, stride=stride. Output
         # shape matches the placement prior's grid exactly, and the
@@ -89,6 +100,8 @@ class ShapePlacer(nnx.Module):
 
         # Per-patch heads (1×1 convs over the (H', W', feat_dim) map).
         self.count_head = nnx.Conv(feat_dim, self.num_features, (1, 1),
+                                   bias_init=count_head_bias_init,
+                                   kernel_init=jax.nn.initializers.zeros,
                                    rngs=rngs)
 
     def __call__(
