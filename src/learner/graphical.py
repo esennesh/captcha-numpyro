@@ -193,10 +193,20 @@ class GraphicalModelLearner(ParamLearner):
             key: value for key, value in state.items()
             if isinstance(value, jax.Array)
         })
+        metrics["nll"] = -sum(node["observed"] * node["log_p"] for node
+                              in state["trace"].values()).mean()
+        metrics["kl"] = sum(~node["observed"] * (node["log_q"] - node["log_p"])
+                            for node in state["trace"].values()).mean()
+        metrics["log_Z"] = jax.nn.log_softmax(state["log_w"], axis=0).sum()
+        if "z_count" in state["trace"]:
+            metrics["z_count_total"] = state["trace"]["z_count"]["ev"].sum(
+                axis=(-3, -2, -1)
+            ).mean()
         if "log_w" in metrics and "ess" not in metrics:
             metrics["ess"] = jax.numpy.mean(
                 effective_sample_size(metrics["log_w"], normalized=True)
              )
+        metrics["log_w"] = metrics["log_w"].mean()
         predictions = {k: v["ev"] for k, v in state["trace"].items()
                        if v["observed"].all() or ((v["log_p"] == 0.).all() and
                                                   (v["log_q"] == 0.).all())}
