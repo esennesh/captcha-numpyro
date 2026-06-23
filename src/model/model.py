@@ -233,10 +233,9 @@ def generate_captcha(placements: ShapePlacements,
     else:
         background = jnp.ones_like(foreground)
 
-    composite = screen_blend(jnp.stack((background, foreground), axis=-1),
-                             axis=-1)
-    composite = jnp.moveaxis(composite, -1, -3)
-    return (composite, jnp.moveaxis(dvar, -1, -3) * (composite > 0).astype(dvar.dtype))
+    image = jnp.where(foreground.sum(axis=-1, keepdims=True) > 0., foreground,
+                      background)
+    return (jnp.moveaxis(image, -1, -3), jnp.moveaxis(dvar, -1, -3))
 
 def captcha_model(images, placements: ShapePlacements,
                   backgrounder: Optional[BackgroundDecoder]=None, scale=None):
