@@ -259,7 +259,6 @@ def generate_captcha(placements: ShapePlacements,
 
     foreground, dvar = placements()
     foreground = foreground * color
-    dvar = dvar[..., jnp.newaxis, jnp.newaxis, jnp.newaxis]
     if backgrounder is not None:
         background = backgrounder() * color
     else:
@@ -267,7 +266,7 @@ def generate_captcha(placements: ShapePlacements,
 
     composite = over(background, foreground)[..., :-1]
     composite = jnp.moveaxis(composite, -1, -3)
-    return composite, dvar * (composite > 0).astype(dvar.dtype)
+    return (composite, jnp.moveaxis(dvar, -1, -3) * (composite > 0).astype(dvar.dtype))
 
 def captcha_model(images, placements: ShapePlacements,
                   backgrounder: Optional[BackgroundDecoder]=None, scale=None):
@@ -279,8 +278,9 @@ def captcha_model(images, placements: ShapePlacements,
     with numpyro.plate("batch", images.shape[0]):
         prediction, dvar = generate_captcha(placements, backgrounder)
         scale = jnp.sqrt(scale ** 2 + dvar)
-        numpyro.deterministic("salience_map",
-                              utils.gaussian_variance_image(prediction, scale,
-                                                            image_layout="HWC"))
+
+        salience_map = utils.gaussian_variance_image(prediction, scale,
+                                                     image_layout="CHW")
+        numpyro.deterministic("salience_map", salience_map)
         return numpyro.sample("obs", dist.Normal(prediction, scale).to_event(3),
                               obs=images)
