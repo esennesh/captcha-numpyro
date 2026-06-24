@@ -10,6 +10,7 @@ from numpyro.contrib.module import nnx_module
 from typing import Optional
 
 from src.data.dictionary import ShapeDictionary
+from src.distributions import ConcreteLogits
 from src import utils
 
 
@@ -34,6 +35,79 @@ def over(bg, fg):
 
     # Combine back into RGBA and return
     return jnp.concatenate([out_rgb, out_alpha], axis=-1)
+
+
+def _as_nhwc_dictionary(shapes: Array) -> Array:
+    shapes = jnp.asarray(shapes)
+    if shapes.ndim != 4:
+        raise ValueError(f"Expected dictionary shape (K, H, W, C), got {shapes.shape}")
+    if shapes.shape[-1] in (1, 3, 4):
+        return shapes
+    if shapes.shape[1] in (1, 3, 4):
+        return jnp.moveaxis(shapes, 1, -1)
+    raise ValueError(
+        "Could not infer dictionary channel axis; expected either "
+        f"(K, H, W, C) or (K, C, H, W), got {shapes.shape}"
+    )
+
+
+def _dictionary_conv_scores(images: Array, shapes: Array, stride: int) -> Array:
+    dictionary = _as_nhwc_dictionary(shapes)
+    images = _match_dictionary_channels(images, dictionary.shape[-1])
+    kernel = jnp.moveaxis(dictionary, 0, -1)
+    return jax.lax.conv_general_dilated(
+        images, kernel, (stride, stride), "VALID",
+        dimension_numbers=("NHWC", "HWIO", "NHWC"),
+    )
+
+
+def _logmeanexp(x: Array, axis: int) -> Array:
+    return jax.nn.logsumexp(x, axis=axis) - math.log(x.shape[axis])
+
+
+def _match_dictionary_channels(images: Array, channels: int) -> Array:
+    image_channels = images.shape[-1]
+    if image_channels == channels:
+        return 1.0 - images
+    if channels == 1:
+        return 1.0 - images.mean(axis=-1, keepdims=True)
+    if image_channels == 1:
+        images = 1.0 - images
+        return jnp.broadcast_to(images, images.shape[:-1] + (channels,))
+    if image_channels < channels:
+        # Pad missing trailing channels (e.g. RGB -> RGBA) with 1's so the
+        # subsequent (1 - x) inversion zeroes them out and they contribute
+        # nothing to the dictionary-matching score.
+        pad_shape = images.shape[:-1] + (channels - image_channels,)
+        images = jnp.concatenate(
+            [images, jnp.ones(pad_shape, dtype=images.dtype)], axis=-1,
+        )
+        return 1.0 - images
+    raise ValueError(
+        f"Cannot match image channels {image_channels} to dictionary channels {channels}"
+    )
+
+
+def _render_dictionary_placements(activations: Array, shapes: Array,
+                                  stride: int) -> Array:
+    dictionary = _as_nhwc_dictionary(shapes)
+
+    def render_one(activation, glyph):
+        # With transpose_kernel=True the supplied kernel has the layout of the
+        # *forward* conv it transposes: HWIO with I = deconv-output channels
+        # (= dictionary channels C) and O = deconv-input channels (= 1 here).
+        kernel = glyph[..., jnp.newaxis]
+        return jax.lax.conv_transpose(
+            activation[..., jnp.newaxis], kernel, (stride, stride), "VALID",
+            dimension_numbers=("NHWC", "HWIO", "NHWC"),
+            transpose_kernel=True,
+        )
+
+    rendered = jax.vmap(render_one, in_axes=(1, 0), out_axes=1)(
+        activations, dictionary,
+    )
+    return jnp.clip(rendered.sum(axis=1), 0., None)
+
 
 class TopographicPoisson(nnx.Module):
     def __init__(self, kw: int=60, kh: int=60, img_w: int=180, img_h: int=80,
@@ -151,6 +225,98 @@ class ShapeConvTranspose(nnx.Module):
         )
         return deconv(activations[..., jnp.newaxis], kernel_array)
 
+class BayesianMarioNettePlacements(nnx.Module):
+    """Bayesian MarioNette-style glyph placements from dictionary matches.
+
+    For image ``x``, glyph dictionary ``d_i``, and anchor ``j = (h, w)``,
+    this module computes scores
+
+        s[j, i] = sum_{u, v, c} x[h + u, w + v, c] d_i[u, v, c].
+
+    The anchor switch and glyph identity are then explicit random variables:
+
+        z_switch[j] ~ RelaxedBernoulli(logits=b + a logmeanexp_i(s[j, i]))
+        z_mark[j]   ~ Concrete(logits=s[j, :]).
+
+    Rendering uses ``z_switch[j] * z_mark[j, i]`` as the dictionary placement
+    activation and applies no transformations beyond anchored translation.
+    """
+
+    def __init__(self, shape_dict: ShapeDictionary, alpha_sharpness: float = 5.0,
+                 mark_temperature: float = 0.5, score_scale: float = 1.0,
+                 stride: int = 1, switch_bias: float = -6.0,
+                 switch_scale: float = 1.0, switch_temperature: float = 0.5, *,
+                 rngs: Optional[nnx.Rngs] = None):
+        del rngs
+        self.alpha_sharpness = alpha_sharpness
+        self.mark_temperature = mark_temperature
+        self.score_scale = score_scale
+        self.shape_dict = shape_dict
+        self.stride = stride
+        self.switch_bias = switch_bias
+        self.switch_scale = switch_scale
+        self.switch_temperature = switch_temperature
+
+    @property
+    def num_features(self) -> int:
+        return self.shape_dict.shapes.shape[0]
+
+    def score_logits(self, images: Array) -> Array:
+        scores = _dictionary_conv_scores(images, self.shape_dict.shapes,
+                                         self.stride)
+        return self.score_scale * scores
+
+    def switch_logits(self, score_logits: Array) -> Array:
+        evidence = _logmeanexp(score_logits, axis=-1)
+        return self.switch_bias + self.switch_scale * evidence
+
+    def __call__(self, images: Array, rngs=None):
+        del rngs
+        mark_logits = self.score_logits(images)
+        switch_logits = self.switch_logits(mark_logits)
+
+        z_mark = numpyro.sample(
+            "z_mark", ConcreteLogits(
+                temperature=self.mark_temperature, logits=mark_logits,
+            ).to_event(2),
+        )
+        z_switch = numpyro.sample(
+            "z_switch", dist.RelaxedBernoulli(
+                temperature=self.switch_temperature, logits=switch_logits,
+            ).to_event(2),
+        )
+
+        activations = jnp.moveaxis(z_mark * z_switch[..., jnp.newaxis], -1, 1)
+        rendered = _render_dictionary_placements(
+            activations, self.shape_dict.shapes, self.stride,
+        )
+        # Pick the alpha source by inspecting the rendered output's channel
+        # layout: an RGBA dictionary carries an explicit alpha in the 4th
+        # channel; a single-channel dictionary uses its only channel; an RGB
+        # dictionary has no native alpha so we fall back to the channel max
+        # as a brightness proxy.
+        if rendered.shape[-1] == 1:
+            alpha_source = rendered
+            rgb_raw = rendered
+        elif rendered.shape[-1] == 4:
+            alpha_source = rendered[..., 3:4]
+            rgb_raw = rendered[..., :3]
+        else:  # 3
+            alpha_source = rendered.max(axis=-1, keepdims=True)
+            rgb_raw = rendered
+
+        # Normalize RGB by the alpha source so the compositing colour is the
+        # intrinsic ink colour at each pixel (bounded to [0, 1]) rather than
+        # the raw sum over overlapping placements. Otherwise the alpha
+        # channel — which saturates via Beer-Lambert — reaches ~1 in regions
+        # where the linear RGB sum is still small, and Porter-Duff over
+        # paints a dark opaque fringe.
+        rgb = jnp.clip(rgb_raw / jnp.maximum(alpha_source, 1e-6), 0., 1.)
+        if rendered.shape[-1] == 1:
+            rgb = jnp.broadcast_to(rgb, rgb.shape[:-1] + (3,))
+        alpha = 1.0 - jnp.exp(-self.alpha_sharpness * alpha_source)
+        return jnp.concatenate((rgb, alpha), axis=-1)
+
 class ShapePlacements(nnx.Module):
     """Depth-softmax compositing of glyph placements.
 
@@ -237,6 +403,21 @@ def generate_captcha(placements: ShapePlacements,
 
     return utils.soft_clamp(over(background, foreground)[..., :-1], 0., 1.)
 
+def generate_marionette_captcha(images, placements: BayesianMarioNettePlacements,
+                                backgrounder: Optional[BackgroundDecoder]=None):
+    rgb_prior = dist.Uniform(jnp.zeros((3,)), jnp.ones((3,)))
+    color = numpyro.sample("color", rgb_prior.to_event(1))
+    color = color[:, jnp.newaxis, jnp.newaxis, :]
+    color = jnp.concatenate((color, jnp.ones(color.shape[:-1] + (1,))), axis=-1)
+
+    foreground = placements(images) * color
+    if backgrounder is not None:
+        background = backgrounder() * color
+    else:
+        background = jnp.ones_like(foreground)
+
+    return utils.soft_clamp(over(background, foreground)[..., :-1], 0., 1.)
+
 def captcha_model(images, placements: ShapePlacements,
                   backgrounder: Optional[BackgroundDecoder]=None, scale=None):
     placements = nnx_module("placements_p", placements)
@@ -246,5 +427,21 @@ def captcha_model(images, placements: ShapePlacements,
         scale = jnp.exp(numpyro.param("log_scale", jnp.zeros(())))
     with numpyro.plate("batch", images.shape[0]):
         prediction = generate_captcha(placements, backgrounder)
+        return numpyro.sample("obs", dist.Normal(prediction, scale).to_event(3),
+                              obs=images)
+
+def marionette_captcha_model(images, placements: BayesianMarioNettePlacements,
+                             backgrounder: Optional[BackgroundDecoder]=None,
+                             scale=None):
+    placements = nnx_module("placements_p", placements)
+    if backgrounder is not None:
+        backgrounder = nnx_module("backgrounder_p", backgrounder)
+    if scale is None:
+        scale = jnp.exp(numpyro.param("log_scale", jnp.zeros(())))
+    with numpyro.plate("batch", images.shape[0]):
+        prediction = generate_marionette_captcha(images, placements,
+                                                 backgrounder)
+        prediction = jnp.moveaxis(prediction, -1, -3)
+        images = jnp.moveaxis(images, -1, -3)
         return numpyro.sample("obs", dist.Normal(prediction, scale).to_event(3),
                               obs=images)
