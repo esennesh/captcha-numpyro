@@ -1,0 +1,22 @@
+defaults:
+  - placements/shaper/shape_dict@placements.shape_dict: sandbox
+
+_target_: src.model.model.marionette_captcha_model
+_partial_: true
+backgrounder:
+  _target_: src.model.model.BackgroundDecoder
+  rngs:
+    _target_: flax.nnx.Rngs
+    default: 1234
+placements:
+  _target_: src.model.model.BayesianMarioNettePlacements
+  alpha_sharpness: 5.0
+  mark_temperature: 0.5
+  rngs:
+    _target_: flax.nnx.Rngs
+    default: 5678
+  score_scale: 0.01
+  stride: 1
+  switch_bias: -6.0
+  switch_scale: 1.0
+  switch_temperature: 0.5
