@@ -23,10 +23,16 @@ def configure_sample(msg: Message, /, **kwargs) -> Dict:
 
 def expected_value(site: Dict):
     fn = site.get("fn", None)
-    mean = getattr(fn, "mean", None)
+    try:
+        mean = getattr(fn, "mean", None)
+    except NotImplementedError:
+        return site["value"]
     if mean is None:
         return site["value"]
-    return mean() if callable(mean) else mean
+    try:
+        return mean() if callable(mean) else mean
+    except NotImplementedError:
+        return site["value"]
 
 def trace_entry(site: Dict, log_p, log_q, observed):
     return {
