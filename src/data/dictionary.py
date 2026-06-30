@@ -55,25 +55,26 @@ class ShapeDictionary(nnx.Pytree):
 
     @classmethod
     def load(cls, path: str):
+        # Dictionary PNGs are black backgrounds with white shape masks and an
+        # explicit alpha channel, so they're already in ink-positive polarity.
+        # No inversion needed — just scale to [0, 1].
         def transform(img):
-            img = np.array(img, dtype=jnp.float32) / 255.
-            return 1. - img
+            return np.array(img, dtype=jnp.float32) / 255.
 
-        shapes = load_dictionary(path, mode="L", transform=transform)
+        shapes = load_dictionary(path, mode="RGBA", transform=transform)
         return cls(shapes=jnp.stack(tuple(shapes.values()), axis=0),
                    targets={i: k for i, k in enumerate(shapes)})
 
     @classmethod
     def load_nested(cls, path: str):
         def transform(img):
-            img = np.array(img, dtype=jnp.float32) / 255.
-            return 1. - img
+            return np.array(img, dtype=jnp.float32) / 255.
 
-        shapes = load_nested_dictionary(path, mode="L", transform=transform)
+        shapes = load_nested_dictionary(path, mode="RGBA", transform=transform)
         return cls(shapes=jnp.stack(tuple(shapes.values()), axis=0),
                    targets={key: i for i, key in enumerate(shapes)})
 
     @classmethod
     def randomize(cls, k: int, h: int, w: int, *, rngs: nnx.Rngs):
-        return cls(shapes=rngs.normal(shape=(k, h, w, 1)),
+        return cls(shapes=rngs.normal(shape=(k, h, w, 4)),
                    targets={str(c): c for c in range(k)})
