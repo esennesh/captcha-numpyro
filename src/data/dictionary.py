@@ -48,6 +48,25 @@ def load_nested_dictionary(
     return dictionary
 
 
+def _rgba_shape_transform(img: np.ndarray) -> np.ndarray:
+    """Load-time transform for RGBA dictionary glyphs.
+
+    Scales to [0, 1] and, when a fourth alpha channel is present, replaces it
+    with ``file_alpha * max(RGB)``. This makes the alpha channel reflect the
+    actual shape mask even when the source PNGs were grayscale/RGB and PIL
+    synthesized a uniform ``alpha = 1`` during ``convert("RGBA")`` — the
+    black-background pixels then correctly read as transparent, and any
+    genuine transparency the file carried is still respected.
+    """
+    arr = np.array(img, dtype=jnp.float32) / 255.
+    if arr.shape[-1] == 4:
+        derived_alpha = arr[..., :3].max(axis=-1, keepdims=True)
+        arr = np.concatenate(
+            [arr[..., :3], arr[..., 3:4] * derived_alpha], axis=-1,
+        )
+    return arr
+
+
 @nnx.dataclass
 class ShapeDictionary(nnx.Pytree):
     shapes: Float[Array, "K H W C"] = nnx.data()
@@ -58,19 +77,15 @@ class ShapeDictionary(nnx.Pytree):
         # Dictionary PNGs are black backgrounds with white shape masks and an
         # explicit alpha channel, so they're already in ink-positive polarity.
         # No inversion needed — just scale to [0, 1].
-        def transform(img):
-            return np.array(img, dtype=jnp.float32) / 255.
-
-        shapes = load_dictionary(path, mode="RGBA", transform=transform)
+        shapes = load_dictionary(path, mode="RGBA",
+                                 transform=_rgba_shape_transform)
         return cls(shapes=jnp.stack(tuple(shapes.values()), axis=0),
                    targets={i: k for i, k in enumerate(shapes)})
 
     @classmethod
     def load_nested(cls, path: str):
-        def transform(img):
-            return np.array(img, dtype=jnp.float32) / 255.
-
-        shapes = load_nested_dictionary(path, mode="RGBA", transform=transform)
+        shapes = load_nested_dictionary(path, mode="RGBA",
+                                        transform=_rgba_shape_transform)
         return cls(shapes=jnp.stack(tuple(shapes.values()), axis=0),
                    targets={key: i for i, key in enumerate(shapes)})
 
