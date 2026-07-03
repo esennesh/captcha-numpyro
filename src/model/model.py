@@ -60,11 +60,6 @@ def _dictionary_conv_scores(images: Array, shapes: Array, stride: int) -> Array:
         dimension_numbers=("NHWC", "HWIO", "NHWC"),
     )
 
-
-def _logmeanexp(x: Array, axis: int) -> Array:
-    return jax.nn.logsumexp(x, axis=axis) - math.log(x.shape[axis])
-
-
 def _match_dictionary_channels(images: Array, channels: int) -> Array:
     image_channels = images.shape[-1]
     if image_channels == channels:
@@ -267,7 +262,7 @@ class BayesianMarioNettePlacements(nnx.Module):
         return self.score_scale * scores
 
     def switch_logits(self, score_logits: Array) -> Array:
-        evidence = _logmeanexp(score_logits, axis=-1)
+        evidence = jax.nn.logmeanexp(score_logits, axis=-1)
         return self.switch_bias + self.switch_scale * evidence
 
     def __call__(self, images: Array, rngs=None):
