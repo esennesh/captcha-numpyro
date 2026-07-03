@@ -237,48 +237,39 @@ class BayesianMarioNettePlacements(nnx.Module):
     activation and applies no transformations beyond anchored translation.
     """
 
-    def __init__(self, shape_dict: ShapeDictionary, alpha_sharpness: float = 5.0,
-                 mark_temperature: float = 0.5, score_scale: float = 1.0,
-                 stride: int = 1, switch_bias: float = -6.0,
-                 switch_scale: float = 1.0, switch_temperature: float = 0.5, *,
-                 rngs: Optional[nnx.Rngs] = None):
+    def __init__(self, shape_dict: ShapeDictionary, alpha_sharpness: float=5.0,
+                 img_h: int = 60, img_w: int = 160, kh: int = 60, kw: int = 60,
+                 mark_temperature: float = 0.5, stride: int = 1,
+                 switch_temperature: float = 0.5, *,
+                 rngs: Optional[nnx.Rngs]=None):
         del rngs
         self.alpha_sharpness = alpha_sharpness
+        self.height = (img_h - kh) // stride + 1
         self.mark_temperature = mark_temperature
-        self.score_scale = score_scale
         self.shape_dict = shape_dict
         self.stride = stride
-        self.switch_bias = switch_bias
-        self.switch_scale = switch_scale
         self.switch_temperature = switch_temperature
+        self.width = (img_w - kw) // stride + 1
 
     @property
     def num_features(self) -> int:
         return self.shape_dict.shapes.shape[0]
 
-    def score_logits(self, images: Array) -> Array:
-        scores = _dictionary_conv_scores(images, self.shape_dict.shapes,
-                                         self.stride)
-        return self.score_scale * scores
-
-    def switch_logits(self, score_logits: Array) -> Array:
-        evidence = jax.nn.logmeanexp(score_logits, axis=-1)
-        return self.switch_bias + self.switch_scale * evidence
-
-    def __call__(self, images: Array, rngs=None):
+    def __call__(self, rngs=None):
         del rngs
-        mark_logits = self.score_logits(images)
-        switch_logits = self.switch_logits(mark_logits)
 
         z_mark = numpyro.sample(
             "z_mark", ConcreteLogits(
-                temperature=self.mark_temperature, logits=mark_logits,
-            ).to_event(2),
+                logits=jnp.zeros((1, self.height, self.width,
+                                  len(self.shape_dict))),
+                temperature=self.mark_temperature
+            ).to_event(2)
         )
         z_switch = numpyro.sample(
             "z_switch", dist.RelaxedBernoulli(
-                temperature=self.switch_temperature, logits=switch_logits,
-            ).to_event(2),
+                logits=jnp.zeros((1, self.height, self.width)),
+                temperature=self.switch_temperature
+            ).to_event(2)
         )
 
         activations = jnp.moveaxis(z_mark * z_switch[..., jnp.newaxis], -1, 1)
@@ -405,7 +396,7 @@ def generate_marionette_captcha(images, placements: BayesianMarioNettePlacements
     color = color[:, jnp.newaxis, jnp.newaxis, :]
     color = jnp.concatenate((color, jnp.ones(color.shape[:-1] + (1,))), axis=-1)
 
-    foreground = placements(images) * color
+    foreground = placements() * color
     if backgrounder is not None:
         background = backgrounder() * color
     else:
