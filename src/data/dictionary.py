@@ -72,6 +72,9 @@ class ShapeDictionary(nnx.Pytree):
     shapes: Float[Array, "K H W C"] = nnx.data()
     targets: Dict[str | tuple[str, str, int, int], int] = nnx.data()
 
+    def __len__(self):
+        return self.shapes.shape[0]
+
     @classmethod
     def load(cls, path: str):
         # Dictionary PNGs are black backgrounds with white shape masks and an
