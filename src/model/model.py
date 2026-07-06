@@ -238,12 +238,13 @@ class BayesianMarioNettePlacements(nnx.Module):
     """
 
     def __init__(self, shape_dict: ShapeDictionary, alpha_sharpness: float=5.0,
-                 img_h: int = 60, img_w: int = 160, kh: int = 60, kw: int = 60,
-                 mark_temperature: float = 0.5, stride: int = 1,
-                 switch_temperature: float = 0.5, *,
+                 expected_switches: int=1, img_h: int = 60, img_w: int = 160,
+                 kh: int = 60, kw: int = 60, mark_temperature: float = 0.1,
+                 stride: int = 1, switch_temperature: float = 0.1, *,
                  rngs: Optional[nnx.Rngs]=None):
         del rngs
         self.alpha_sharpness = alpha_sharpness
+        self.expected_switches = expected_switches
         self.height = (img_h - kh) // stride + 1
         self.mark_temperature = mark_temperature
         self.shape_dict = shape_dict
@@ -265,9 +266,12 @@ class BayesianMarioNettePlacements(nnx.Module):
                 temperature=self.mark_temperature
             ).to_event(2)
         )
+        expected_logit = math.log(self.expected_switches) -\
+                         math.log(self.height * self.width -
+                                  self.expected_switches)
         z_switch = numpyro.sample(
             "z_switch", dist.RelaxedBernoulli(
-                logits=jnp.zeros((1, self.height, self.width)),
+                logits=jnp.ones((1, self.height, self.width)) * expected_logit,
                 temperature=self.switch_temperature
             ).to_event(2)
         )
