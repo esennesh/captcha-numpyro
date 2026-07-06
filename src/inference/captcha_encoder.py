@@ -295,18 +295,18 @@ class MarioNettePlacer(nnx.Module):
         self.hidden_dim = hidden_dim
         self.kh = kh
         self.kw = kw
-        self.mark_temperature = mark_temperature
+        self.mark_temperature = nnx.Param(jnp.array(mark_temperature))
         self.patch_norm = nnx.LayerNorm(feat_dim, rngs=rngs)
         self.score_scale = score_scale
         self.shape_dict = shape_dict
         self.stride = stride
-        self.switch_bias = switch_bias
+        self.switch_bias = nnx.Param(jnp.array(switch_bias))
         self.switch_head = nnx.Conv(hidden_dim, 1, (1, 1), rngs=rngs)
         self.switch_hidden = nnx.Conv(feat_dim, hidden_dim, (1, 1), rngs=rngs)
         self.switch_norm = nnx.GroupNorm(
             hidden_dim, num_groups=_valid_num_groups(hidden_dim), rngs=rngs,
         )
-        self.switch_temperature = switch_temperature
+        self.switch_temperature = nnx.Param(jnp.array(switch_temperature))
         self.to_patches = nnx.Conv(
             backbone_channels, feat_dim, (kh, kw),
             padding="VALID", strides=(stride, stride), rngs=rngs,
