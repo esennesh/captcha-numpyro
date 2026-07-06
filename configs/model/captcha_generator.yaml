@@ -1,29 +1,19 @@
 defaults:
-  - placements/shaper/shape_dict: sandbox
+  - placements/shaper/shape_dict@placements.shape_dict: sandbox
 
-_target_: src.model.model.generate_captcha
+_target_: src.model.model.generate_marionette_captcha
 _partial_: true
 backgrounder: null
 placements:
-  _target_: src.model.model.ShapePlacements
-  prior:
-    _target_: src.model.model.TopographicPoisson
-    kh: 60
-    kw: 60
-    img_h: 100
-    img_w: 200
-    num_features: 108
-    rngs:
-      _target_: flax.nnx.Rngs
-      default: 1234
+  _target_: src.model.model.BayesianMarioNettePlacements
+  alpha_sharpness: 5.0
+  img_h: 80
+  img_w: 80
+  kh: 38
+  kw: 26
+  mark_temperature: 0.1
   rngs:
     _target_: flax.nnx.Rngs
-    default: 9101112
-  shaper:
-    _target_: src.model.model.ShapeConvTranspose
-    padding: "VALID"
-    rngs:
-      _target_: flax.nnx.Rngs
-      default: 5678
-    strides: 1
-    transpose_kernel: true
+    default: 5678
+  stride: 1
+  switch_temperature: 0.1
