@@ -1,9 +1,9 @@
 defaults:
   - _self_
-  - data: mnist
-  - guide: vae
+  - data: captcha
+  - guide: marionette_captcha_encoder
   - learner: graphical
-  - model: vae
+  - model: marionette_captcha
   - trainer: default
   - paths: default
   - extras: default
