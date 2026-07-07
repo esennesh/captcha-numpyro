@@ -179,39 +179,32 @@ class MarioNettePlacer(nnx.Module):
         self.kh = kh
         self.kw = kw
         self.mark_temperature = nnx.Param(jnp.array(mark_temperature))
-        self.patch_norm = nnx.LayerNorm(feat_dim, rngs=rngs)
+        self.patch_norm =
         self.score_scale = score_scale
         self.shape_dict = shape_dict
         self.stride = stride
-        self.switch_bias = nnx.Param(jnp.array(switch_bias))
-        self.switch_head = nnx.Conv(hidden_dim, 1, (1, 1), rngs=rngs)
-        self.switch_hidden = nnx.Conv(feat_dim, hidden_dim, (1, 1), rngs=rngs)
-        self.switch_norm = nnx.GroupNorm(
-            hidden_dim, num_groups=_valid_num_groups(hidden_dim), rngs=rngs,
+        self.switch_predictor = nnx.Sequential(
+            nnx.Conv(self.num_features, feat_dim, (kh, kw), padding="VALID",
+                     strides=(stride, stride), rngs=rngs),
+            nnx.LayerNorm(feat_dim, rngs=rngs), nnx.leaky_relu,
+            nnx.Conv(feat_dim, hidden_dim, (1, 1), rngs=rngs),
+            nnx.GroupNorm(hidden_dim, num_groups=_valid_num_groups(hidden_dim),
+                          rngs=rngs),
+            nnx.leaky_relu,
+            nnx.Conv(hidden_dim, 1, (1, 1), rngs=rngs)
         )
         self.switch_temperature = nnx.Param(jnp.array(switch_temperature))
-        self.to_patches = nnx.Conv(
-            backbone_channels, feat_dim, (kh, kw),
-            padding="VALID", strides=(stride, stride), rngs=rngs,
-        )
         self.width = (img_w - kw) // stride + 1
 
     @property
     def num_features(self) -> int:
-        return self.shape_dict.shapes.shape[0]
+        return len(self.shape_dict)
 
-    def __call__(
-        self, images: Float[Array, "B H W C_in"],
-        features: Float[Array, "B H W C_feat"],
-    ) -> Tuple[Array, Array]:
-        mark_logits = self.score_scale * _dictionary_conv_scores(
-            images, self.shape_dict.shapes, self.stride,
+    def __call__(self, images: Float[Array, "B H W C_in"]) -> Tuple[Array, Array]:
+        scores = self.score_scale * _dictionary_conv_scores(
+            images, self.shape_dict.shapes, self.stride
         )
-        patches = self.patch_norm(self.to_patches(features))
-        switch_hidden = nnx.leaky_relu(self.switch_norm(
-            self.switch_hidden(patches),
-        ))
-        switch_logits = self.switch_bias + self.switch_head(switch_hidden)[..., 0]
+        switch_logits = self.switch_bias + self.switch_predictor(scores)[..., 0]
 
         z_mark = numpyro.sample(
             "z_mark", ConcreteLogits(
@@ -273,4 +266,4 @@ def marionette_captcha_guide(
         color_finder(features)
         if backgrounder is not None:
             backgrounder(features)
-        placements(images, features)
+        placements(images)
