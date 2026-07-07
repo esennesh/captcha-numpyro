@@ -27,7 +27,7 @@ import numpyro.distributions as dist
 from numpyro.contrib.module import nnx_module
 
 from src.data.dictionary import ShapeDictionary
-from src.distributions import ConcreteLogits
+from src.distributions import Concrete
 
 
 def _as_nhwc_dictionary(shapes: Array) -> Array:
@@ -48,11 +48,11 @@ def _dictionary_conv_scores(images: Array, shapes: Array, stride: int) -> Array:
     dictionary = _as_nhwc_dictionary(shapes)
     images = _match_dictionary_channels(images, dictionary.shape[-1])
     kernel = jnp.moveaxis(dictionary, 0, -1)
-    return jax.lax.conv_general_dilated(
-        images, kernel, (stride, stride), "VALID",
-        dimension_numbers=("NHWC", "HWIO", "NHWC"),
-    )
-
+    scores = jax.lax.conv_general_dilated(images, kernel, (stride, stride),
+                                          "VALID",
+                                          dimension_numbers=("NHWC", "HWIO",
+                                                             "NHWC"))
+    return jnp.clip(scores, 0., None)
 
 def _match_dictionary_channels(images: Array, channels: int) -> Array:
     image_channels = images.shape[-1]
@@ -179,13 +179,15 @@ class MarioNettePlacer(nnx.Module):
         self.kh = kh
         self.kw = kw
         self.mark_temperature = nnx.Param(jnp.array(mark_temperature))
-        self.patch_norm =
         self.score_scale = score_scale
         self.shape_dict = shape_dict
         self.stride = stride
+        self.switch_bias = switch_bias
+        # Pointwise stack over the K glyph-score channels: it maps
+        # ``scores`` (B, H', W', K) -> (B, H', W', 1) without touching the
+        # spatial axes, so the switch logits stay on the anchor grid.
         self.switch_predictor = nnx.Sequential(
-            nnx.Conv(self.num_features, feat_dim, (kh, kw), padding="VALID",
-                     strides=(stride, stride), rngs=rngs),
+            nnx.Conv(self.num_features, feat_dim, (1, 1), rngs=rngs),
             nnx.LayerNorm(feat_dim, rngs=rngs), nnx.leaky_relu,
             nnx.Conv(feat_dim, hidden_dim, (1, 1), rngs=rngs),
             nnx.GroupNorm(hidden_dim, num_groups=_valid_num_groups(hidden_dim),
@@ -204,18 +206,29 @@ class MarioNettePlacer(nnx.Module):
         scores = self.score_scale * _dictionary_conv_scores(
             images, self.shape_dict.shapes, self.stride
         )
-        switch_logits = self.switch_bias + self.switch_predictor(scores)[..., 0]
-
         z_mark = numpyro.sample(
-            "z_mark", ConcreteLogits(
-                temperature=self.mark_temperature, logits=mark_logits,
+            "z_mark", Concrete(
+                temperature=self.mark_temperature,
+                probs=scores + jnp.finfo(scores.dtype).eps
             ).to_event(2),
         )
+
+        # Per-anchor confidence that *some* glyph is present: treat the scores
+        # as parameters to a Dirichlet distribution and take its concentration.
+        # The pointwise predictor learns a residual correction on top of this
+        # concentration signal.
+        numpyro.deterministic("scores", scores)
+        confidence = scores.sum(axis=-1, keepdims=True)
+        numpyro.deterministic("switch_confidence", confidence)
+        switch_logits = (self.switch_predictor(scores) + confidence +
+                         self.switch_bias).squeeze(-1)
+        numpyro.deterministic("switch_logits", switch_logits)
         z_switch = numpyro.sample(
             "z_switch", dist.RelaxedBernoulli(
                 temperature=self.switch_temperature, logits=switch_logits,
             ).to_event(2),
         )
+
         return z_switch, z_mark
 
 
