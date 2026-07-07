@@ -48,11 +48,10 @@ def _dictionary_conv_scores(images: Array, shapes: Array, stride: int) -> Array:
     dictionary = _as_nhwc_dictionary(shapes)
     images = _match_dictionary_channels(images, dictionary.shape[-1])
     kernel = jnp.moveaxis(dictionary, 0, -1)
-    scores = jax.lax.conv_general_dilated(images, kernel, (stride, stride),
-                                          "VALID",
-                                          dimension_numbers=("NHWC", "HWIO",
-                                                             "NHWC"))
-    return jnp.clip(scores, 0., None)
+    return jax.lax.conv_general_dilated(images, kernel, (stride, stride),
+                                        "VALID",
+                                        dimension_numbers=("NHWC", "HWIO",
+                                                           "NHWC"))
 
 def _match_dictionary_channels(images: Array, channels: int) -> Array:
     image_channels = images.shape[-1]
@@ -179,7 +178,7 @@ class MarioNettePlacer(nnx.Module):
         self.kh = kh
         self.kw = kw
         self.mark_temperature = nnx.Param(jnp.array(mark_temperature))
-        self.score_scale = score_scale
+        self.score_scale = nnx.Param(jnp.array(score_scale))
         self.shape_dict = shape_dict
         self.stride = stride
         self.switch_bias = switch_bias
@@ -207,10 +206,8 @@ class MarioNettePlacer(nnx.Module):
             images, self.shape_dict.shapes, self.stride
         )
         z_mark = numpyro.sample(
-            "z_mark", Concrete(
-                temperature=self.mark_temperature,
-                probs=scores + jnp.finfo(scores.dtype).eps
-            ).to_event(2),
+            "z_mark", Concrete(temperature=self.mark_temperature,
+                               logits=scores).to_event(2),
         )
 
         # Per-anchor confidence that *some* glyph is present: treat the scores
@@ -218,7 +215,7 @@ class MarioNettePlacer(nnx.Module):
         # The pointwise predictor learns a residual correction on top of this
         # concentration signal.
         numpyro.deterministic("scores", scores)
-        confidence = scores.sum(axis=-1, keepdims=True)
+        confidence = jax.nn.sigmoid(scores).sum(axis=-1, keepdims=True)
         numpyro.deterministic("switch_confidence", confidence)
         switch_logits = (self.switch_predictor(scores) + confidence +
                          self.switch_bias).squeeze(-1)
