@@ -11,9 +11,9 @@ placements:
   img_w: 80
   kh: 38
   kw: 26
-  mark_temperature: 0.1
+  mark_temperature: 1.
   rngs:
     _target_: flax.nnx.Rngs
     default: 5678
   stride: 1
-  switch_temperature: 0.1
+  switch_temperature: 1.
