@@ -71,6 +71,25 @@ def _render_dictionary_placements(activations: Array, shapes: Array,
     return jnp.clip(rendered.sum(axis=1), 0., None)
 
 
+def _dictionary_support_masks(shapes: Array, threshold: float = 0.0) -> Array:
+    """Per-glyph 0/1 support masks, shaped ``(K, kh, kw, 1)``.
+
+    A glyph "touches" a pixel wherever its alpha support exceeds ``threshold``.
+    The alpha source follows the same convention as
+    :meth:`BayesianMarioNettePlacements.render`: the explicit alpha channel for
+    RGBA glyphs, the sole channel for single-channel glyphs, and the per-pixel
+    channel max as a brightness proxy for RGB glyphs.
+    """
+    dictionary = _as_nhwc_dictionary(shapes)
+    if dictionary.shape[-1] == 4:
+        alpha = dictionary[..., 3:4]
+    elif dictionary.shape[-1] == 1:
+        alpha = dictionary
+    else:
+        alpha = dictionary.max(axis=-1, keepdims=True)
+    return (alpha > threshold).astype(dictionary.dtype)
+
+
 class BayesianMarioNettePlacements(nnx.Module):
     """Bayesian MarioNette-style glyph placements from dictionary matches.
 
@@ -107,9 +126,16 @@ class BayesianMarioNettePlacements(nnx.Module):
     def num_features(self) -> int:
         return self.shape_dict.shapes.shape[0]
 
-    def __call__(self, rngs=None):
-        del rngs
+    def sample_latents(self):
+        """Draw the per-anchor switch and glyph-identity latents.
 
+        Returns ``(z_switch, z_mark)`` with shapes ``(1, H, W)`` and
+        ``(1, H, W, K)`` (broadcast over any enclosing plate). These are the
+        ``numpyro.sample`` sites ``"z_switch"`` and ``"z_mark"`` that
+        :meth:`__call__` also draws; call this once and thread the results
+        through :meth:`render` and :meth:`switch_coverage` so both consume the
+        same samples rather than re-sampling the sites.
+        """
         z_mark = numpyro.sample(
             "z_mark", ConcreteLogits(
                 logits=jnp.zeros((1, self.height, self.width,
@@ -126,7 +152,37 @@ class BayesianMarioNettePlacements(nnx.Module):
                 temperature=self.switch_temperature
             ).to_event(2)
         )
+        return z_switch, z_mark
 
+    def switch_coverage(self, z_switch, z_mark, *, threshold: float = 0.0):
+        """Soft count of active switches touching each output pixel.
+
+        For every output pixel this returns ``sum_j z_switch[j] * (footprint of
+        the glyph placed at anchor j)``, i.e. how many active switches place a
+        glyph that covers the pixel. It reuses the exact placement geometry of
+        :meth:`render` (anchored ``conv_transpose`` at ``self.stride``) but
+        renders each glyph's 0/1 support mask instead of its intensity, so the
+        accumulated value counts overlapping placements rather than summing
+        their ink.
+
+        Because ``z_switch``/``z_mark`` are relaxed (continuous in ``[0, 1]``),
+        the count is soft; threshold the latents beforehand for a hard count.
+        The result is differentiable in the latents, so it can serve as an
+        overlap penalty (e.g. penalising pixels with coverage > 1).
+
+        :param z_switch: per-anchor switch activations, shape ``(..., H, W)``.
+        :param z_mark: per-anchor glyph identities, shape ``(..., H, W, K)``.
+        :param threshold: a glyph touches a pixel where its alpha support
+            exceeds this value.
+        :return: coverage counts, shape ``(..., out_h, out_w)``.
+        """
+        masks = _dictionary_support_masks(self.shape_dict.shapes, threshold)
+        activations = jnp.moveaxis(z_mark * z_switch[..., jnp.newaxis], -1, 1)
+        coverage = _render_dictionary_placements(activations, masks, self.stride)
+        return coverage[..., 0]
+
+    def render(self, z_switch, z_mark):
+        """Composite the RGBA foreground implied by the given latents."""
         activations = jnp.moveaxis(z_mark * z_switch[..., jnp.newaxis], -1, 1)
         rendered = _render_dictionary_placements(
             activations, self.shape_dict.shapes, self.stride,
@@ -157,6 +213,11 @@ class BayesianMarioNettePlacements(nnx.Module):
             rgb = jnp.broadcast_to(rgb, rgb.shape[:-1] + (3,))
         alpha = 1.0 - jnp.exp(-self.alpha_sharpness * alpha_source)
         return jnp.concatenate((rgb, alpha), axis=-1)
+
+    def __call__(self, rngs=None):
+        del rngs
+        z_switch, z_mark = self.sample_latents()
+        return self.render(z_switch, z_mark)
 
 class BackgroundDecoder(nnx.Module):
     def __init__(self, embedding_dim: int=50, height=60, hiddens=400, width=160,
