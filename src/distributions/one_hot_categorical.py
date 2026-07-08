@@ -268,6 +268,19 @@ class ConcreteLogits(Distribution):
         )
         return log_normalizer + log_numerator - K * log_denominator
 
+    def entropy(self):
+        """Shannon entropy of the underlying categorical ``softmax(logits)``.
+
+        The Concrete / Gumbel-Softmax density has no closed-form differential
+        entropy, so this returns the entropy of the discrete distribution it
+        relaxes -- the ``temperature -> 0`` limit, independent of
+        ``temperature``. This is the quantity you want for an entropy bonus /
+        regulariser on the assignment. For the differential entropy of the
+        relaxed density itself, Monte-Carlo estimate ``-log_prob(rsample)``.
+        """
+        log_probs = jax.nn.log_softmax(self.logits, axis=-1)
+        return -(jnp.exp(log_probs) * log_probs).sum(axis=-1)
+
 
 def Concrete(temperature, probs=None, logits=None, *,
              validate_args: Optional[bool] = None):
