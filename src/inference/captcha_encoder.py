@@ -43,6 +43,11 @@ def _as_nhwc_dictionary(shapes: Array) -> Array:
         f"(K, H, W, C) or (K, C, H, W), got {shapes.shape}"
     )
 
+def _center_scores(scores, axis=-1):
+    loc = scores.mean(axis=axis, keepdims=True)
+    std = scores.std(axis=(-1, -2, -3), keepdims=True)
+
+    return (scores - loc) / jnp.maximum(std, 1e-6)
 
 def _dictionary_conv_scores(images: Array, shapes: Array, stride: int) -> Array:
     dictionary = _as_nhwc_dictionary(shapes)
@@ -162,23 +167,22 @@ class MarioNettePlacer(nnx.Module):
     convolution scores and answer which glyph best matches the observed image
     patch at that anchor:
 
-        lambda[j, i] = score_scale * sum_{u, v, c} x[j + (u, v), c] d_i[u, v, c].
+        lambda[j, i] = sum_{u, v, c} x[j + (u, v), c] d_i[u, v, c].
     """
 
     def __init__(self, shape_dict: ShapeDictionary,
                  backbone_channels: int = 64, feat_dim: int = 64,
                  hidden_dim: int = 128, img_h: int = 60,
                  img_w: int = 160, kh: int = 60, kw: int = 60,
-                 mark_temperature: float = 0.5, score_scale: float = 1.0,
-                 stride: int = 1, switch_bias: float = -4.0,
-                 switch_temperature: float = 0.5, *, rngs: nnx.Rngs):
+                 mark_temperature: float = 0.5, stride: int = 1,
+                 switch_bias: float = -4.0, switch_temperature: float = 0.5, *,
+                 rngs: nnx.Rngs):
         self.feat_dim = feat_dim
         self.height = (img_h - kh) // stride + 1
         self.hidden_dim = hidden_dim
         self.kh = kh
         self.kw = kw
         self.mark_temperature = nnx.Param(jnp.array(mark_temperature))
-        self.score_scale = nnx.Param(jnp.array(score_scale))
         self.shape_dict = shape_dict
         self.stride = stride
         self.switch_bias = switch_bias
@@ -202,12 +206,13 @@ class MarioNettePlacer(nnx.Module):
         return len(self.shape_dict)
 
     def __call__(self, images: Float[Array, "B H W C_in"]) -> Tuple[Array, Array]:
-        scores = self.score_scale * _dictionary_conv_scores(
-            images, self.shape_dict.shapes, self.stride
-        )
+        scores = _dictionary_conv_scores(images, self.shape_dict.shapes,
+                                         self.stride)
+        scores = _center_scores(scores)
+        mark_dist = Concrete(temperature=self.mark_temperature,
+                             logits=scores)
         z_mark = numpyro.sample(
-            "z_mark", Concrete(temperature=self.mark_temperature,
-                               logits=scores).to_event(2),
+            "z_mark", mark_dist.to_event(2),
         )
 
         # Per-anchor confidence that *some* glyph is present: treat the scores
@@ -215,15 +220,16 @@ class MarioNettePlacer(nnx.Module):
         # The pointwise predictor learns a residual correction on top of this
         # concentration signal.
         numpyro.deterministic("scores", scores)
-        confidence = jax.nn.sigmoid(scores).sum(axis=-1, keepdims=True)
-        numpyro.deterministic("switch_confidence", confidence)
-        switch_logits = (self.switch_predictor(scores) + confidence +
+        # confidence = jnp.exp(scores).sum(axis=-1, keepdims=True)
+        uncertainty = mark_dist.entropy()[..., jnp.newaxis]
+        numpyro.deterministic("switch_uncertainty", uncertainty)
+        switch_logits = (self.switch_predictor(scores) - uncertainty +
                          self.switch_bias).squeeze(-1)
         numpyro.deterministic("switch_logits", switch_logits)
         z_switch = numpyro.sample(
             "z_switch", dist.RelaxedBernoulli(
                 temperature=self.switch_temperature, logits=switch_logits,
-            ).to_event(2),
+            ).to_event(2)
         )
 
         return z_switch, z_mark
