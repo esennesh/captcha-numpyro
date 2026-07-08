@@ -243,8 +243,14 @@ class ConcreteLogits(Distribution):
 
     @validate_sample
     def log_prob(self, value):
-        eps = jnp.finfo(jnp.result_type(value)).tiny
-        value = jnp.clip(value, eps, 1.0)
+        # Clamp samples away from the simplex vertices before taking logs. The
+        # Concrete density diverges as any component -> 0, so peaked samples
+        # (which underflow to exactly 0 in float32) send ``log_prob`` to
+        # +/-1e7 and overflow the backward pass. ``finfo.tiny`` (~1e-38) is far
+        # too small a floor -- ``log(1e-38) ~ -87`` still blows up for hot
+        # logits -- so we clamp to a numerically comfortable ``1e-6``.
+        eps = 1e-6
+        value = jnp.clip(value, eps, 1.0 - eps)
         logits = jnp.broadcast_to(self.logits, self.batch_shape + self.event_shape)
         temperature = jnp.broadcast_to(self.temperature, self.batch_shape)
         log_value = jnp.log(value)
