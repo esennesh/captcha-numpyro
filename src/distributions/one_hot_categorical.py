@@ -243,8 +243,14 @@ class ConcreteLogits(Distribution):
 
     @validate_sample
     def log_prob(self, value):
-        eps = jnp.finfo(jnp.result_type(value)).tiny
-        value = jnp.clip(value, eps, 1.0)
+        # Clamp samples away from the simplex vertices before taking logs. The
+        # Concrete density diverges as any component -> 0, so peaked samples
+        # (which underflow to exactly 0 in float32) send ``log_prob`` to
+        # +/-1e7 and overflow the backward pass. ``finfo.tiny`` (~1e-38) is far
+        # too small a floor -- ``log(1e-38) ~ -87`` still blows up for hot
+        # logits -- so we clamp to a numerically comfortable ``1e-6``.
+        eps = 1e-6
+        value = jnp.clip(value, eps, 1.0 - eps)
         logits = jnp.broadcast_to(self.logits, self.batch_shape + self.event_shape)
         temperature = jnp.broadcast_to(self.temperature, self.batch_shape)
         log_value = jnp.log(value)
@@ -261,6 +267,19 @@ class ConcreteLogits(Distribution):
             + (K - 1) * jnp.log(temperature)
         )
         return log_normalizer + log_numerator - K * log_denominator
+
+    def entropy(self):
+        """Shannon entropy of the underlying categorical ``softmax(logits)``.
+
+        The Concrete / Gumbel-Softmax density has no closed-form differential
+        entropy, so this returns the entropy of the discrete distribution it
+        relaxes -- the ``temperature -> 0`` limit, independent of
+        ``temperature``. This is the quantity you want for an entropy bonus /
+        regulariser on the assignment. For the differential entropy of the
+        relaxed density itself, Monte-Carlo estimate ``-log_prob(rsample)``.
+        """
+        log_probs = jax.nn.log_softmax(self.logits, axis=-1)
+        return -(jnp.exp(log_probs) * log_probs).sum(axis=-1)
 
 
 def Concrete(temperature, probs=None, logits=None, *,

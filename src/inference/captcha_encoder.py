@@ -27,7 +27,7 @@ import numpyro.distributions as dist
 from numpyro.contrib.module import nnx_module
 
 from src.data.dictionary import ShapeDictionary
-from src.distributions import ConcreteLogits
+from src.distributions import Concrete
 
 
 def _as_nhwc_dictionary(shapes: Array) -> Array:
@@ -43,16 +43,20 @@ def _as_nhwc_dictionary(shapes: Array) -> Array:
         f"(K, H, W, C) or (K, C, H, W), got {shapes.shape}"
     )
 
+def _center_scores(scores, axis=-1):
+    loc = scores.mean(axis=axis, keepdims=True)
+    std = scores.std(axis=(-1, -2, -3), keepdims=True)
+
+    return (scores - loc) / jnp.maximum(std, 1e-6)
 
 def _dictionary_conv_scores(images: Array, shapes: Array, stride: int) -> Array:
     dictionary = _as_nhwc_dictionary(shapes)
     images = _match_dictionary_channels(images, dictionary.shape[-1])
     kernel = jnp.moveaxis(dictionary, 0, -1)
-    return jax.lax.conv_general_dilated(
-        images, kernel, (stride, stride), "VALID",
-        dimension_numbers=("NHWC", "HWIO", "NHWC"),
-    )
-
+    return jax.lax.conv_general_dilated(images, kernel, (stride, stride),
+                                        "VALID",
+                                        dimension_numbers=("NHWC", "HWIO",
+                                                           "NHWC"))
 
 def _match_dictionary_channels(images: Array, channels: int) -> Array:
     image_channels = images.shape[-1]
@@ -163,66 +167,71 @@ class MarioNettePlacer(nnx.Module):
     convolution scores and answer which glyph best matches the observed image
     patch at that anchor:
 
-        lambda[j, i] = score_scale * sum_{u, v, c} x[j + (u, v), c] d_i[u, v, c].
+        lambda[j, i] = sum_{u, v, c} x[j + (u, v), c] d_i[u, v, c].
     """
 
     def __init__(self, shape_dict: ShapeDictionary,
                  backbone_channels: int = 64, feat_dim: int = 64,
                  hidden_dim: int = 128, img_h: int = 60,
                  img_w: int = 160, kh: int = 60, kw: int = 60,
-                 mark_temperature: float = 0.5, score_scale: float = 1.0,
-                 stride: int = 1, switch_bias: float = -4.0,
-                 switch_temperature: float = 0.5, *, rngs: nnx.Rngs):
+                 mark_temperature: float = 0.5, stride: int = 1,
+                 switch_bias: float = -4.0, switch_temperature: float = 0.5, *,
+                 rngs: nnx.Rngs):
         self.feat_dim = feat_dim
         self.height = (img_h - kh) // stride + 1
         self.hidden_dim = hidden_dim
         self.kh = kh
         self.kw = kw
         self.mark_temperature = nnx.Param(jnp.array(mark_temperature))
-        self.patch_norm = nnx.LayerNorm(feat_dim, rngs=rngs)
-        self.score_scale = score_scale
         self.shape_dict = shape_dict
         self.stride = stride
-        self.switch_bias = nnx.Param(jnp.array(switch_bias))
-        self.switch_head = nnx.Conv(hidden_dim, 1, (1, 1), rngs=rngs)
-        self.switch_hidden = nnx.Conv(feat_dim, hidden_dim, (1, 1), rngs=rngs)
-        self.switch_norm = nnx.GroupNorm(
-            hidden_dim, num_groups=_valid_num_groups(hidden_dim), rngs=rngs,
+        self.switch_bias = switch_bias
+        # Pointwise stack over the K glyph-score channels: it maps
+        # ``scores`` (B, H', W', K) -> (B, H', W', 1) without touching the
+        # spatial axes, so the switch logits stay on the anchor grid.
+        self.switch_predictor = nnx.Sequential(
+            nnx.Conv(self.num_features, feat_dim, (1, 1), rngs=rngs),
+            nnx.LayerNorm(feat_dim, rngs=rngs), nnx.leaky_relu,
+            nnx.Conv(feat_dim, hidden_dim, (1, 1), rngs=rngs),
+            nnx.GroupNorm(hidden_dim, num_groups=_valid_num_groups(hidden_dim),
+                          rngs=rngs),
+            nnx.leaky_relu,
+            nnx.Conv(hidden_dim, 1, (1, 1), rngs=rngs)
         )
         self.switch_temperature = nnx.Param(jnp.array(switch_temperature))
-        self.to_patches = nnx.Conv(
-            backbone_channels, feat_dim, (kh, kw),
-            padding="VALID", strides=(stride, stride), rngs=rngs,
-        )
         self.width = (img_w - kw) // stride + 1
 
     @property
     def num_features(self) -> int:
-        return self.shape_dict.shapes.shape[0]
+        return len(self.shape_dict)
 
-    def __call__(
-        self, images: Float[Array, "B H W C_in"],
-        features: Float[Array, "B H W C_feat"],
-    ) -> Tuple[Array, Array]:
-        mark_logits = self.score_scale * _dictionary_conv_scores(
-            images, self.shape_dict.shapes, self.stride,
-        )
-        patches = self.patch_norm(self.to_patches(features))
-        switch_hidden = nnx.leaky_relu(self.switch_norm(
-            self.switch_hidden(patches),
-        ))
-        switch_logits = self.switch_bias + self.switch_head(switch_hidden)[..., 0]
-
+    def __call__(self, images: Float[Array, "B H W C_in"]) -> Tuple[Array, Array]:
+        scores = _dictionary_conv_scores(images, self.shape_dict.shapes,
+                                         self.stride)
+        scores = _center_scores(scores)
+        mark_dist = Concrete(temperature=self.mark_temperature,
+                             logits=scores)
         z_mark = numpyro.sample(
-            "z_mark", ConcreteLogits(
-                temperature=self.mark_temperature, logits=mark_logits,
-            ).to_event(2),
+            "z_mark", mark_dist.to_event(2),
         )
+
+        # Per-anchor confidence that *some* glyph is present: treat the scores
+        # as parameters to a Dirichlet distribution and take its concentration.
+        # The pointwise predictor learns a residual correction on top of this
+        # concentration signal.
+        numpyro.deterministic("scores", scores)
+        # confidence = jnp.exp(scores).sum(axis=-1, keepdims=True)
+        uncertainty = mark_dist.entropy()[..., jnp.newaxis]
+        numpyro.deterministic("switch_uncertainty", uncertainty)
+        switch_logits = (self.switch_predictor(scores) - uncertainty +
+                         self.switch_bias).squeeze(-1)
+        numpyro.deterministic("switch_logits", switch_logits)
         z_switch = numpyro.sample(
             "z_switch", dist.RelaxedBernoulli(
                 temperature=self.switch_temperature, logits=switch_logits,
-            ).to_event(2),
+            ).to_event(2)
         )
+
         return z_switch, z_mark
 
 
@@ -273,4 +282,4 @@ def marionette_captcha_guide(
         color_finder(features)
         if backgrounder is not None:
             backgrounder(features)
-        placements(images, features)
+        placements(images)

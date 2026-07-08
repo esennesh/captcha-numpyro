@@ -9,12 +9,7 @@ backbone:
   rngs:
     _target_: flax.nnx.Rngs
     default: 3456
-backgrounder:
-  _target_: src.inference.captcha_encoder.BackgroundEncoder
-  backbone_channels: 64
-  rngs:
-    _target_: flax.nnx.Rngs
-    default: 1234
+backgrounder: null
 color_finder:
   _target_: src.inference.captcha_encoder.MarioNetteColorFinder
   backbone_channels: 64
@@ -28,11 +23,10 @@ placements:
   img_w: 80
   kh: 38
   kw: 26
-  mark_temperature: 0.5
+  mark_temperature: 1.
   rngs:
     _target_: flax.nnx.Rngs
     default: 9012
-  score_scale: 0.01
   stride: 1
   switch_bias: -4.0
-  switch_temperature: 0.5
+  switch_temperature: 1.
