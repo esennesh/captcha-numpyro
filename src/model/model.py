@@ -177,7 +177,7 @@ class BackgroundDecoder(nnx.Module):
                                jnp.ones_like(background))
         return jnp.reshape(background, z_bg.shape[:-1] + self.bg_shape + (1,))
 
-def generate_marionette_captcha(images, placements: BayesianMarioNettePlacements,
+def generate_marionette_captcha(placements: BayesianMarioNettePlacements,
                                 backgrounder: Optional[BackgroundDecoder]=None):
     rgb_prior = dist.Uniform(jnp.zeros((3,)), jnp.ones((3,)))
     color = numpyro.sample("color", rgb_prior.to_event(1))
@@ -201,8 +201,7 @@ def marionette_captcha_model(images, placements: BayesianMarioNettePlacements,
     if scale is None:
         scale = jnp.exp(numpyro.param("log_scale", jnp.zeros(())))
     with numpyro.plate("batch", images.shape[0]):
-        prediction = generate_marionette_captcha(images, placements,
-                                                 backgrounder)
+        prediction = generate_marionette_captcha(placements, backgrounder)
         prediction = jnp.moveaxis(prediction, -1, -3)
         images = jnp.moveaxis(images, -1, -3)
         return numpyro.sample("obs", dist.Normal(prediction, scale).to_event(3),
