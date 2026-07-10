@@ -35,7 +35,7 @@ def _as_nhwc_dictionary(shapes: Array) -> Array:
     )
 
 
-def _render_dictionary_placements_per_feature(activations: Array, shapes: Array,
+def _render_dictionary_placements(activations: Array, shapes: Array,
                                               stride: int) -> Array:
     """Render each feature's placements separately, ``(N, K, out_h, out_w, C)``.
 
@@ -55,18 +55,9 @@ def _render_dictionary_placements_per_feature(activations: Array, shapes: Array,
             transpose_kernel=True,
         )
 
-    return jax.vmap(render_one, in_axes=(1, 0), out_axes=1)(
+    return jnp.clip(jax.vmap(render_one, in_axes=(1, 0), out_axes=1)(
         activations, dictionary,
-    )
-
-
-def _render_dictionary_placements(activations: Array, shapes: Array,
-                                  stride: int) -> Array:
-    rendered = _render_dictionary_placements_per_feature(
-        activations, shapes, stride,
-    )
-    return jnp.clip(rendered.sum(axis=1), 0., None)
-
+    ), 0., None)
 
 def _dictionary_support_masks(shapes: Array, threshold: float = 0.0) -> Array:
     """Per-glyph 0/1 support masks, shaped ``(K, kh, kw, 1)``.
@@ -130,7 +121,7 @@ class BayesianMarioNettePlacements(nnx.Module):
         ``(1, H, W, K)`` (broadcast over any enclosing plate). These are the
         ``numpyro.sample`` sites ``"z_switch"`` and ``"z_mark"`` that
         :meth:`__call__` also draws; call this once and thread the results
-        through :meth:`render` and :meth:`switch_coverage` so both consume the
+        through :meth:`render` and :meth:`glyph_coverage` so both consume the
         same samples rather than re-sampling the sites.
         """
         z_mark = numpyro.sample(
@@ -151,7 +142,7 @@ class BayesianMarioNettePlacements(nnx.Module):
         )
         return z_switch, z_mark
 
-    def per_glyph_coverage(self, z_switch, z_mark, *, threshold: float = 0.0):
+    def glyph_coverage(self, z_switch, z_mark, *, threshold: float = 0.0):
         """Per-glyph soft coverage, shape ``(..., out_h, out_w, K)``.
 
         Entry ``[..., i]`` is ``sum_j z_switch[j] * z_mark[j, i] * mask_i[p - j]``:
@@ -159,8 +150,7 @@ class BayesianMarioNettePlacements(nnx.Module):
         pixel. It reuses the exact placement geometry of :meth:`render` (anchored
         ``conv_transpose`` at ``self.stride``) but renders each glyph's 0/1 support
         mask instead of its intensity, so the value counts overlapping placements
-        rather than summing their ink. Summing over the last axis recovers
-        :meth:`switch_coverage`.
+        rather than summing their ink.
 
         Because ``z_switch``/``z_mark`` are relaxed (continuous in ``[0, 1]``) the
         counts are soft, and they are differentiable in the latents.
@@ -173,75 +163,23 @@ class BayesianMarioNettePlacements(nnx.Module):
         """
         masks = _dictionary_support_masks(self.shape_dict.shapes, threshold)
         activations = jnp.moveaxis(z_mark * z_switch[..., jnp.newaxis], -1, 1)
-        per_feature = _render_dictionary_placements_per_feature(
-            activations, masks, self.stride,
-        )
-        per_feature = jnp.clip(per_feature[..., 0], 0., None)  # (..., K, out_h, out_w)
-        return jnp.moveaxis(per_feature, -3, -1)               # (..., out_h, out_w, K)
-
-    def switch_coverage(self, z_switch, z_mark, *, threshold: float = 0.0):
-        """Soft count of active switches touching each output pixel.
-
-        For every output pixel this returns ``sum_j z_switch[j] * (footprint of
-        the glyph placed at anchor j)``, i.e. how many active switches place a
-        glyph that covers the pixel -- the sum over glyphs of
-        :meth:`per_glyph_coverage`.
-
-        Because ``z_switch``/``z_mark`` are relaxed (continuous in ``[0, 1]``),
-        the count is soft; threshold the latents beforehand for a hard count.
-        The result is differentiable in the latents, so it can serve as an
-        overlap penalty (e.g. penalising pixels with coverage > 1).
-
-        :param z_switch: per-anchor switch activations, shape ``(..., H, W)``.
-        :param z_mark: per-anchor glyph identities, shape ``(..., H, W, K)``.
-        :param threshold: a glyph touches a pixel where its alpha support
-            exceeds this value.
-        :return: coverage counts, shape ``(..., out_h, out_w)``.
-        """
-        return self.per_glyph_coverage(
-            z_switch, z_mark, threshold=threshold,
-        ).sum(axis=-1)
+        per_feature = _render_dictionary_placements(activations, masks,
+                                                    self.stride)
+        return jnp.clip(per_feature, 0., None)  # (..., K, out_h, out_w, 1)
 
     def render(self, z_switch, z_mark):
         """Composite the RGBA foreground implied by the given latents."""
         activations = jnp.moveaxis(z_mark * z_switch[..., jnp.newaxis], -1, 1)
-        rendered = _render_dictionary_placements(
-            activations, self.shape_dict.shapes, self.stride,
-        )
-        # Pick the alpha source by inspecting the rendered output's channel
-        # layout: an RGBA dictionary carries an explicit alpha in the 4th
-        # channel; a single-channel dictionary uses its only channel; an RGB
-        # dictionary has no native alpha so we fall back to the channel max
-        # as a brightness proxy.
-        if rendered.shape[-1] == 1:
-            alpha_source = rendered
-            rgb_raw = rendered
-        elif rendered.shape[-1] == 4:
-            alpha_source = rendered[..., 3:4]
-            rgb_raw = rendered[..., :3]
-        else:  # 3
-            alpha_source = rendered.max(axis=-1, keepdims=True)
-            rgb_raw = rendered
+        return _render_dictionary_placements(activations,
+                                             self.shape_dict.shapes,
+                                             self.stride)
 
-        # Normalize RGB by the alpha source so the compositing colour is the
-        # intrinsic ink colour at each pixel (bounded to [0, 1]) rather than
-        # the raw sum over overlapping placements. Otherwise the alpha
-        # channel — which saturates via Beer-Lambert — reaches ~1 in regions
-        # where the linear RGB sum is still small, and Porter-Duff over
-        # paints a dark opaque fringe.
-        rgb = jnp.clip(rgb_raw / jnp.maximum(alpha_source, 1e-6), 0., 1.)
-        if rendered.shape[-1] == 1:
-            rgb = jnp.broadcast_to(rgb, rgb.shape[:-1] + (3,))
-        alpha = 1.0 - jnp.exp(-self.alpha_sharpness * alpha_source)
-        return jnp.concatenate((rgb, alpha), axis=-1)
-
-    def __call__(self, rngs=None, return_coverage: bool=False):
+    def __call__(self, rngs=None):
         del rngs
         z_switch, z_mark = self.sample_latents()
         rgba = self.render(z_switch, z_mark)
-        if return_coverage:
-            return rgba, self.per_glyph_coverage(z_switch, z_mark)
-        return rgba
+        coverage = self.glyph_coverage(z_switch, z_mark)
+        return rgba, coverage
 
 class BackgroundDecoder(nnx.Module):
     def __init__(self, embedding_dim: int=50, height=60, hiddens=400, width=160,
@@ -263,32 +201,28 @@ class BackgroundDecoder(nnx.Module):
         return jnp.reshape(background, z_bg.shape[:-1] + self.bg_shape + (1,))
 
 def generate_marionette_captcha(placements: BayesianMarioNettePlacements,
-                                backgrounder: Optional[BackgroundDecoder]=None,
-                                return_coverage: bool=False):
+                                backgrounder: Optional[BackgroundDecoder]=None):
     rgb_prior = dist.Uniform(jnp.zeros((3,)), jnp.ones((3,)))
     color = numpyro.sample("color", rgb_prior.to_event(1))
-    color = color[:, jnp.newaxis, jnp.newaxis, :]
-    color = jnp.concatenate((color, jnp.ones(color.shape[:-1] + (1,))), axis=-1)
+    color = color[:, jnp.newaxis, jnp.newaxis, jnp.newaxis, :]
 
-    # ``placements`` is the nnx_module-wrapped callable, which only forwards to
-    # the module's ``__call__``; ask it for the per-glyph coverage there so the
-    # rendered foreground and the coverage (used as mixture weights downstream)
-    # come from a single draw of the placement latents.
-    coverage = None
-    if return_coverage:
-        rgba, coverage = placements(return_coverage=True)
-    else:
-        rgba = placements()
-    foreground = rgba * color
+    rgba, coverage = placements()
+    canvas_shape = list(rgba.shape)
+    canvas_shape[-4] = 1
+    canvas_shape = tuple(canvas_shape)
+    foreground = rgba[..., :-1] * color
+    foreground = jnp.concatenate((foreground, rgba[..., -1:]), axis=-1)
     if backgrounder is not None:
         background = backgrounder() * color
     else:
-        background = jnp.ones_like(foreground)
+        background = jnp.ones(canvas_shape[:-1] + (3,))
+        background_alpha = jnp.zeros(canvas_shape[:-1] + (1,)) + 1e-7
+        background = jnp.concatenate((background, background_alpha), axis=-1)
 
-    prediction = utils.soft_clamp(over(background, foreground)[..., :-1], 0., 1.)
-    if return_coverage:
-        return prediction, coverage
-    return prediction
+    prediction = jnp.concatenate((background, foreground), axis=-4)
+    coverage = jnp.concatenate((jnp.zeros(canvas_shape[:-1] + (1,)) + 1e-7,
+                                coverage), axis=-4)
+    return prediction, coverage
 
 def marionette_captcha_model(images, placements: BayesianMarioNettePlacements,
                              backgrounder: Optional[BackgroundDecoder]=None,
@@ -303,37 +237,28 @@ def marionette_captcha_model(images, placements: BayesianMarioNettePlacements,
         backgrounder = nnx_module("backgrounder_p", backgrounder)
 
     if scale is None:
-        scale = jnp.exp(numpyro.param("log_scale", jnp.zeros((n_components,))))
+        scale = jnp.exp(numpyro.param("log_scale", jnp.zeros((1,))))
     scale = jnp.broadcast_to(jnp.asarray(scale), (n_components,))
 
-    with numpyro.plate("batch", images.shape[0]):
+    batch_size = images.shape[0] if images is not None else 1
+    with numpyro.plate("batch", batch_size):
         prediction, coverage = generate_marionette_captcha(placements,
-                                                           backgrounder,
-                                                           return_coverage=True)
-        prediction = jnp.moveaxis(prediction, -1, -3)  # (B, C, H, W)
-        images = jnp.moveaxis(images, -1, -3)          # (B, C, H, W)
-        B, C, H, W = prediction.shape
+                                                           backgrounder)
+        coverage = jnp.moveaxis(coverage, -1, -3) # (B, K, 1, H, W)
+        coverage = jnp.moveaxis(coverage, -4, -1) # (B, 1, H, W, K)
+        if images is not None:
+            images = jnp.moveaxis(images, -1, -3)      # (B, C, H, W)
+        prediction = jnp.moveaxis(prediction, -1, -3)  # (B, K, C, H, W)
+        prediction = jnp.moveaxis(prediction, -4, -1)  # (B, C, H, W, K)
+        prediction = prediction[:, :-1, ...]
+        B, C, H, W, K = prediction.shape
 
-        # Mixing weights come from the per-glyph coverage: how much each glyph
-        # (as placed by the active switches) covers each pixel. The background
-        # component absorbs the leftover, low-coverage mass so the normalizer is
-        # max(1, total_coverage) and never vanishes; uncovered pixels fall
-        # entirely on the background component.
-        background_mass = jax.nn.relu(1.0 - coverage.sum(axis=-1, keepdims=True))
-        weights = jnp.concatenate([background_mass, coverage], axis=-1)
-        weights = weights / weights.sum(axis=-1, keepdims=True)  # (B, H, W, n)
-
-        # Every component shares the composited prediction as its mean and
-        # differs only through its per-component scale. Lay parameters out as
-        # (B, C, H, W, n_components) with the mixture axis last, broadcasting the
-        # (channel-independent) weights across the C channels.
-        loc = jnp.broadcast_to(prediction[..., jnp.newaxis],
-                               (B, C, H, W, n_components))
-        probs = jnp.broadcast_to(weights[:, jnp.newaxis],
-                                 (B, C, H, W, n_components))
+        # The coverage gives mixture weights, so normalize it.
+        coverage = coverage / coverage.sum(axis=-1, keepdims=True)
         likelihood = SpatialMixtureSameFamily(
-            dist.Categorical(probs=probs),
-            dist.Normal(loc, scale),
+            dist.Categorical(probs=coverage),
+            dist.Normal(prediction, scale),
             reinterpreted_batch_ndims=3,
         )
+        numpyro.deterministic("residual", images - likelihood.mean)
         return numpyro.sample("obs", likelihood, obs=images)
