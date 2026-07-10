@@ -257,5 +257,6 @@ def marionette_captcha_model(images, placements: BayesianMarioNettePlacements,
             dist.Normal(prediction, scale),
             reinterpreted_batch_ndims=3,
         )
-        numpyro.deterministic("residual", images - likelihood.mean)
+        if images is not None:
+            numpyro.deterministic("residual", images - likelihood.mean)
         return numpyro.sample("obs", likelihood, obs=images)
