@@ -211,17 +211,15 @@ def generate_marionette_captcha(placements: BayesianMarioNettePlacements,
     canvas_shape[-4] = 1
     canvas_shape = tuple(canvas_shape)
     foreground = rgba[..., :-1] * color
-    foreground = jnp.concatenate((foreground, rgba[..., -1:]), axis=-1)
     if backgrounder is not None:
         background = backgrounder() * color
     else:
         background = jnp.ones(canvas_shape[:-1] + (3,))
-        background_alpha = jnp.ones(canvas_shape[:-1] + (1,)) * 1 / (rgba.shape[-1] + 1)
-        background = jnp.concatenate((background, background_alpha), axis=-1)
 
     prediction = jnp.concatenate((background, foreground), axis=-4)
-    coverage = jnp.concatenate((jnp.zeros(canvas_shape[:-1] + (1,)) + 1e-7,
-                                coverage), axis=-4)
+
+    transmittance = jnp.prod(1. - coverage, axis=-4, keepdims=True)
+    coverage = jnp.concatenate((transmittance, coverage), axis=-4)
     return prediction, coverage
 
 def marionette_captcha_model(images, placements: BayesianMarioNettePlacements,
@@ -250,7 +248,6 @@ def marionette_captcha_model(images, placements: BayesianMarioNettePlacements,
             images = jnp.moveaxis(images, -1, -3)      # (B, C, H, W)
         prediction = jnp.moveaxis(prediction, -1, -3)  # (B, K, C, H, W)
         prediction = jnp.moveaxis(prediction, -4, -1)  # (B, C, H, W, K)
-        prediction = prediction[:, :-1, ...]
         B, C, H, W, K = prediction.shape
 
         # The coverage gives mixture weights, so normalize it.
