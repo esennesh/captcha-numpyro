@@ -216,7 +216,7 @@ def generate_marionette_captcha(placements: BayesianMarioNettePlacements,
         background = backgrounder() * color
     else:
         background = jnp.ones(canvas_shape[:-1] + (3,))
-        background_alpha = jnp.zeros(canvas_shape[:-1] + (1,)) + 1e-7
+        background_alpha = jnp.ones(canvas_shape[:-1] + (1,)) * 1 / (rgba.shape[-1] + 1)
         background = jnp.concatenate((background, background_alpha), axis=-1)
 
     prediction = jnp.concatenate((background, foreground), axis=-4)
