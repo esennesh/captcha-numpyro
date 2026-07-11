@@ -1,26 +1,42 @@
 """Spatial specialization of :class:`numpyro.distributions.MixtureSameFamily`.
 
 ``MixtureSameFamily`` mixes over the last *batch* dimension and treats each
-element as an independent draw. For a spatial tensor -- an image, a volume, a
-video -- we instead want an *independent per-element* (per-pixel/voxel) finite
-mixture whose spatial and channel dimensions are folded into the *event*, so
-that a whole tensor receives a single log-probability equal to the sum of the
-per-element mixture log-probabilities.
+remaining batch element as an independent draw. For a spatial tensor -- an image,
+a volume, a video -- we instead want an *independent per-pixel* finite mixture
+whose spatial dimensions are folded into the *event*, so that a whole tensor
+receives a single log-probability equal to the sum of the per-pixel mixture
+log-probabilities.
 
-This is the mixture analogue of writing ``dist.Normal(...).to_event(3)`` for a
-``(C, H, W)`` image likelihood: the assignment categorical fires independently
-at every location, but the resulting density is over the whole tensor.
+Crucially, the per-pixel assignment is drawn over the component distribution's
+*event* as a unit. For an RGB image that means the color channel lives in the
+component event, so a single categorical draw selects the whole RGB vector at a
+pixel. This keeps colors correlated within a pixel even when the mixing weights
+are soft/split -- unlike putting the channel in the mixture batch, which would
+draw an independent component per channel and produce saturated per-channel
+speckle wherever the weights are split.
 
-Concretely, for a ``K``-component mixture over a ``(C, H, W)`` image with batch
+This is the mixture analogue of writing ``dist.Normal(...).to_event(2)`` for an
+``(H, W, C)`` image likelihood: the assignment categorical fires independently at
+every pixel, but the resulting density is over the whole tensor.
+
+Concretely, for a ``K``-component mixture over an ``(H, W, C)`` image with batch
 size ``B`` you provide
 
-* a mixing ``Categorical`` with ``logits``/``probs`` of shape ``(B, C, H, W, K)``
+* a mixing ``Categorical`` with ``logits``/``probs`` of shape ``(B, H, W, K)``
   (the mixture axis is the last one, as usual), and
-* a component distribution whose ``batch_shape`` is ``(B, C, H, W, K)`` (e.g.
-  ``dist.Normal(loc, scale)`` with per-element, per-component parameters);
+* a component distribution whose ``batch_shape`` is ``(B, H, W, K)`` and whose
+  ``event_shape`` carries the per-pixel channel structure, e.g.
+  ``dist.Normal(loc, scale).to_event(1)`` with ``loc`` of shape
+  ``(B, H, W, K, C)`` -- ``batch_shape == (B, H, W, K)``, ``event_shape == (C,)``;
 
-and ``reinterpreted_batch_ndims=3`` folds ``(C, H, W)`` into the event, leaving
-``batch_shape == (B,)`` and ``event_shape == (C, H, W)``.
+and ``reinterpreted_batch_ndims=2`` folds ``(H, W)`` into the event, leaving
+``batch_shape == (B,)`` and ``event_shape == (H, W, C)``.
+
+Delegating to ``MixtureSameFamily`` inherits its numerically stable, linear-space
+``log_prob`` (finite gradients at exactly-zero mixing weights -- empty pixels --
+without any epsilon flooring). Vectorized (event-wrapped) components require the
+``esennesh/numpyro`` fork, whose ``MixtureSameFamily`` unwraps ``Independent``
+supports before checking for a parameter-free base.
 """
 
 from typing import Optional, Union
@@ -37,25 +53,27 @@ __all__ = ["SpatialMixtureSameFamily"]
 
 
 class SpatialMixtureSameFamily(Distribution):
-    """A per-element finite mixture over a spatial tensor.
+    """A per-pixel finite mixture over a spatial tensor.
 
     Wraps a :class:`~numpyro.distributions.MixtureSameFamily` (which performs an
     independent mixture at every element of its ``batch_shape``) and reinterprets
-    the trailing ``reinterpreted_batch_ndims`` batch dimensions -- the spatial and
-    channel axes -- as event dimensions. ``log_prob`` therefore sums the
-    per-element mixture log-probabilities over those axes.
+    the trailing ``reinterpreted_batch_ndims`` batch dimensions -- the spatial
+    axes -- as event dimensions. ``log_prob`` therefore sums the per-pixel mixture
+    log-probabilities over those axes. Each per-pixel assignment selects an entire
+    component *event* (e.g. the RGB vector), so channels stay correlated within a
+    pixel.
 
     :param mixing_distribution: A :class:`~numpyro.distributions.Categorical`
-        giving the per-element component weights. Its last dimension is the
-        mixture axis and its size is ``mixture_size``.
+        giving the per-pixel component weights. Its last dimension is the mixture
+        axis and its size is ``mixture_size``.
     :param component_distribution: A single vectorized
         :class:`~numpyro.distributions.Distribution` whose last batch dimension
         equals ``mixture_size``. The leading batch dimensions carry the spatial
-        and channel structure.
-    :param reinterpreted_batch_ndims: The number of trailing (spatial/channel)
-        batch dimensions of the underlying per-element mixture to fold into the
-        event. Defaults to *all* of them, i.e. every remaining batch dimension
-        becomes part of the event (mirroring ``to_event()`` with no argument).
+        structure; any ``event_shape`` (e.g. ``(C,)``) is the per-pixel event
+        selected as a unit by the assignment.
+    :param reinterpreted_batch_ndims: The number of trailing (spatial) batch
+        dimensions of the underlying per-pixel mixture to fold into the event.
+        Defaults to *all* of them (mirroring ``to_event()`` with no argument).
     """
 
     pytree_data_fields = ("_mixture",)
@@ -69,9 +87,9 @@ class SpatialMixtureSameFamily(Distribution):
         reinterpreted_batch_ndims: Optional[int] = None,
         validate_args: Optional[bool] = None,
     ):
-        # The inner mixture does the per-element work; its ``batch_shape`` holds
-        # the leading batch dims followed by the spatial/channel dims we fold in.
-        # It validates its own arguments (mixing family, mixture-size match)
+        # The inner mixture does the per-pixel work; its ``batch_shape`` holds the
+        # leading batch dims followed by the spatial dims we fold in. It validates
+        # its own arguments (mixing family, mixture-size match, component support)
         # regardless of ``validate_args``; sample validation is handled once, by
         # this outer distribution, against the reinterpreted support.
         mixture = MixtureSameFamily(
@@ -86,7 +104,7 @@ class SpatialMixtureSameFamily(Distribution):
             raise ValueError(
                 "reinterpreted_batch_ndims must be in [0, "
                 f"{n_batch}] (the number of batch dimensions of the underlying "
-                f"per-element mixture), but got {reinterpreted_batch_ndims}."
+                f"per-pixel mixture), but got {reinterpreted_batch_ndims}."
             )
         self.reinterpreted_batch_ndims = reinterpreted_batch_ndims
 
@@ -103,7 +121,7 @@ class SpatialMixtureSameFamily(Distribution):
 
     @property
     def mixture(self) -> MixtureSameFamily:
-        """The underlying per-element :class:`MixtureSameFamily`."""
+        """The underlying per-pixel :class:`MixtureSameFamily`."""
         return self._mixture
 
     @property
@@ -130,8 +148,7 @@ class SpatialMixtureSameFamily(Distribution):
 
     @property
     def has_rsample(self) -> bool:
-        # Inherited from the mixture, which marginalizes the (discrete)
-        # assignment and so is not reparameterizable.
+        # Inherited from the mixture, which samples the (discrete) assignment.
         return False
 
     # -- sampling / density ----------------------------------------------
@@ -143,11 +160,11 @@ class SpatialMixtureSameFamily(Distribution):
         return self._mixture.sample(key, sample_shape=sample_shape)
 
     def sample_with_intermediates(self, key: jax.Array, sample_shape: tuple = ()):
-        """Sample, additionally returning the per-element component indices.
+        """Sample, additionally returning the per-pixel component indices.
 
         The returned indices have the underlying mixture's shape
-        ``sample_shape + batch_shape + spatial_shape`` (one assignment per
-        element), *not* this distribution's ``batch_shape``.
+        ``sample_shape + batch_shape + spatial_shape`` (one assignment per pixel),
+        *not* this distribution's ``batch_shape``.
         """
         return self._mixture.sample_with_intermediates(
             key, sample_shape=sample_shape
@@ -155,7 +172,7 @@ class SpatialMixtureSameFamily(Distribution):
 
     @validate_sample
     def log_prob(self, value):
-        # Per-element mixture log-probs, then sum over the folded-in dims.
+        # Per-pixel mixture log-probs, then sum over the folded-in spatial dims.
         elementwise = self._mixture.log_prob(value)
         return sum_rightmost(elementwise, self.reinterpreted_batch_ndims)
 
