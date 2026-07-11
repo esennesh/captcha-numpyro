@@ -218,7 +218,13 @@ def generate_marionette_captcha(placements: BayesianMarioNettePlacements,
 
     prediction = jnp.concatenate((background, foreground), axis=-4)
 
-    transmittance = jnp.prod(1. - coverage, axis=-4, keepdims=True)
+    # ``coverage`` is a soft count of overlapping placements and can exceed 1, so
+    # the background "survival" weight -- the probability that no glyph covers the
+    # pixel -- is the Beer-Lambert / Poisson zero-count term exp(-sum coverage).
+    # This stays in (0, 1] by construction (never negative, unlike prod(1 -
+    # coverage) once a count exceeds 1), agrees with the product form to first
+    # order, and keeps the mixture weights a valid non-negative simplex.
+    transmittance = jnp.exp(-jnp.sum(coverage, axis=-4, keepdims=True))
     coverage = jnp.concatenate((transmittance, coverage), axis=-4)
     return prediction, coverage
 
@@ -236,27 +242,35 @@ def marionette_captcha_model(images, placements: BayesianMarioNettePlacements,
 
     if scale is None:
         scale = jnp.exp(numpyro.param("log_scale", jnp.zeros((1,))))
-    scale = jnp.broadcast_to(jnp.asarray(scale), (n_components,))
+    # Per-component scale, shaped to broadcast over the trailing channel axis of
+    # ``prediction`` (whose component axis is -2 and channel axis is -1).
+    scale = jnp.broadcast_to(jnp.asarray(scale), (n_components,))[:, jnp.newaxis]
 
     batch_size = images.shape[0] if images is not None else 1
     with numpyro.plate("batch", batch_size):
         prediction, coverage = generate_marionette_captcha(placements,
                                                            backgrounder)
-        coverage = jnp.moveaxis(coverage, -1, -3) # (B, K, 1, H, W)
-        coverage = jnp.moveaxis(coverage, -4, -1) # (B, 1, H, W, K)
-        if images is not None:
-            images = jnp.moveaxis(images, -1, -3)      # (B, C, H, W)
-        prediction = jnp.moveaxis(prediction, -1, -3)  # (B, K, C, H, W)
-        prediction = jnp.moveaxis(prediction, -4, -1)  # (B, C, H, W, K)
-        B, C, H, W, K = prediction.shape
+        # Keep everything in NHWC so the color channel is the *event* of the
+        # component distribution, not a batch dim of the mixture. If the channel
+        # stayed in the mixture batch, the assignment categorical would fire
+        # independently per channel and pick a different component for R, G and B
+        # at the same pixel -- producing saturated per-channel speckle wherever
+        # the coverage weights are split. Folding the channel into the component
+        # event makes a single per-pixel assignment select the whole RGB vector,
+        # so colors stay correlated within a pixel even when the latents are soft.
+        prediction = jnp.moveaxis(prediction, -4, -2)  # (B, H, W, K, C)
+        coverage = jnp.moveaxis(coverage[..., 0], -3, -1)  # (B, H, W, K)
 
-        # The coverage gives mixture weights, so normalize it.
+        # The coverage gives mixture weights, so normalize it to a simplex. Empty
+        # pixels legitimately place zero weight on glyph components; the mixture's
+        # linear-space log_prob handles zero weights exactly (finite gradients),
+        # so no epsilon floor is needed.
         coverage = coverage / coverage.sum(axis=-1, keepdims=True)
         likelihood = SpatialMixtureSameFamily(
-            dist.Categorical(probs=coverage),
-            dist.Normal(prediction, scale),
-            reinterpreted_batch_ndims=3,
+            dist.Categorical(probs=coverage),          # batch (B, H, W)
+            dist.Normal(prediction, scale).to_event(1),  # batch (B, H, W, K), event (C,)
+            reinterpreted_batch_ndims=2,               # fold (H, W); event -> (H, W, C)
         )
         if images is not None:
-            numpyro.deterministic("residual", images - likelihood.mean)
+            numpyro.deterministic("residual", (images - likelihood.mean) ** 2)
         return numpyro.sample("obs", likelihood, obs=images)
