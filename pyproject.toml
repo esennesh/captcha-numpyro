@@ -1,7 +1,7 @@
 [project]
-name = "numpyro-template"
+name = "captcha-numpyro"
 version = "0.2.0"
-description = "Template repository for deep probabilistic programming in Jax with numpyro"
+description = "Deep probabilistic program for solving captchas"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
