@@ -182,7 +182,10 @@ class MarioNettePlacer(nnx.Module):
         self.hidden_dim = hidden_dim
         self.kh = kh
         self.kw = kw
-        self.mark_temperature = nnx.Param(jnp.array(mark_temperature))
+        # Fixed hyperparameter, not a learnable parameter (see the note in
+        # BayesianMarioNettePlacements): learning the relaxation temperature
+        # lets the optimizer exploit the unbounded relaxed-density KL.
+        self.mark_temperature = mark_temperature
         self.shape_dict = shape_dict
         self.stride = stride
         self.switch_bias = switch_bias
@@ -198,7 +201,7 @@ class MarioNettePlacer(nnx.Module):
             nnx.leaky_relu,
             nnx.Conv(hidden_dim, 1, (1, 1), rngs=rngs)
         )
-        self.switch_temperature = nnx.Param(jnp.array(switch_temperature))
+        self.switch_temperature = switch_temperature
         self.width = (img_w - kw) // stride + 1
 
     @property

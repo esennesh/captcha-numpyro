@@ -104,10 +104,13 @@ class BayesianMarioNettePlacements(nnx.Module):
         self.alpha_sharpness = alpha_sharpness
         self.expected_switches = expected_switches
         self.height = (img_h - kh) // stride + 1
-        self.mark_temperature = nnx.Param(jnp.array(mark_temperature))
+        # Relaxation temperatures are fixed hyperparameters, not learnable
+        # parameters: a learnable temperature on the reparameterized relaxed
+        # ELBO lets the optimizer game the (unbounded) relaxed-density KL.
+        self.mark_temperature = mark_temperature
         self.shape_dict = shape_dict
         self.stride = stride
-        self.switch_temperature = nnx.Param(jnp.array(switch_temperature))
+        self.switch_temperature = switch_temperature
         self.width = (img_w - kw) // stride + 1
 
     @property
