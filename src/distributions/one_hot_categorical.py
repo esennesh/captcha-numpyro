@@ -243,13 +243,17 @@ class ConcreteLogits(Distribution):
 
     @validate_sample
     def log_prob(self, value):
-        # Clamp samples away from the simplex vertices before taking logs. The
-        # Concrete density diverges as any component -> 0, so peaked samples
-        # (which underflow to exactly 0 in float32) send ``log_prob`` to
-        # +/-1e7 and overflow the backward pass. ``finfo.tiny`` (~1e-38) is far
-        # too small a floor -- ``log(1e-38) ~ -87`` still blows up for hot
-        # logits -- so we clamp to a numerically comfortable ``1e-6``.
-        eps = 1e-6
+        # Clamp samples away from the simplex vertices before taking logs, only
+        # to stop components that underflow to exactly 0 in float32 from sending
+        # ``log(0) = -inf`` (and NaN gradients) through the reparameterized
+        # backward pass. The floor must stay *tiny*: at low temperature a good
+        # (confident) guide puts most components below the floor, and clamping
+        # them rewrites the density enough that ``E_q[log q - log p]`` stops
+        # being a valid (>= 0) KL and can run negative without bound. A ``1e-6``
+        # floor clamped ~80%+ of components at temperature 0.15 and drove the
+        # ELBO's KL term negative; ``1e-20`` keeps the density (and the KL)
+        # well-behaved at the temperatures we use while still avoiding log(0).
+        eps = 1e-20
         value = jnp.clip(value, eps, 1.0 - eps)
         logits = jnp.broadcast_to(self.logits, self.batch_shape + self.event_shape)
         temperature = jnp.broadcast_to(self.temperature, self.batch_shape)
