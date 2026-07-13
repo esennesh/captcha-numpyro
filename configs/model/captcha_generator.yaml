@@ -1,7 +1,7 @@
 defaults:
   - placements/shaper/shape_dict@placements.shape_dict: sandbox
 
-_target_: src.model.model.generate_marionette_captcha
+_target_: src.model.model.marionette_captcha_model
 _partial_: true
 backgrounder: null
 placements:

@@ -9,32 +9,17 @@ from numpyro.contrib.module import nnx_module
 from typing import Optional
 
 from src.data.dictionary import ShapeDictionary
-from src.distributions import ConcreteLogits
+from src.distributions import ConcreteLogits, SpatialMixtureSameFamily
 from src import utils
 
 
-def over(bg, fg):
-    """
-    Combines a foreground and background image layer.
-    Both inputs should have a shape of (H, W, 4) containing RGBA channels.
-    """
-    # Split RGB and Alpha channels
-    fg_rgb, fg_alpha = fg[..., :3], fg[..., 3:4]
-    bg_rgb, bg_alpha = bg[..., :3], bg[..., 3:4]
-
-    # Calculate the combined alpha channel
-    out_alpha = fg_alpha + bg_alpha * (1.0 - fg_alpha)
-
-    # Prevent division by zero if both alphas are 0
-    safe_alpha = jnp.where(out_alpha == 0.0, 1.0, out_alpha)
-
-    # Calculate the composited RGB colors
-    out_rgb = fg_rgb * fg_alpha + bg_rgb * bg_alpha * (1.0 - fg_alpha)
-    out_rgb = out_rgb / safe_alpha
-
-    # Combine back into RGBA and return
-    return jnp.concatenate([out_rgb, out_alpha], axis=-1)
-
+def screen_blend(layers, axis=0, logits=False):
+    if logits:
+        layers = jax.nn.sigmoid(layers)
+    p = 1.0 - jnp.prod(1.0 - layers, axis=axis)
+    if logits:
+        return jax.scipy.special.logit(p)
+    return p
 
 def _as_nhwc_dictionary(shapes: Array) -> Array:
     shapes = jnp.asarray(shapes)
@@ -51,7 +36,12 @@ def _as_nhwc_dictionary(shapes: Array) -> Array:
 
 
 def _render_dictionary_placements(activations: Array, shapes: Array,
-                                  stride: int) -> Array:
+                                              stride: int) -> Array:
+    """Render each feature's placements separately, ``(N, K, out_h, out_w, C)``.
+
+    This is the pre-reduction result of :func:`_render_dictionary_placements`:
+    the sum over the feature axis (axis 1) recovers the composited render.
+    """
     dictionary = _as_nhwc_dictionary(shapes)
 
     def render_one(activation, glyph):
@@ -65,10 +55,27 @@ def _render_dictionary_placements(activations: Array, shapes: Array,
             transpose_kernel=True,
         )
 
-    rendered = jax.vmap(render_one, in_axes=(1, 0), out_axes=1)(
+    return jnp.clip(jax.vmap(render_one, in_axes=(1, 0), out_axes=1)(
         activations, dictionary,
-    )
-    return jnp.clip(rendered.sum(axis=1), 0., None)
+    ), 0., None)
+
+def _dictionary_support_masks(shapes: Array, threshold: float = 0.0) -> Array:
+    """Per-glyph 0/1 support masks, shaped ``(K, kh, kw, 1)``.
+
+    A glyph "touches" a pixel wherever its alpha support exceeds ``threshold``.
+    The alpha source follows the same convention as
+    :meth:`BayesianMarioNettePlacements.render`: the explicit alpha channel for
+    RGBA glyphs, the sole channel for single-channel glyphs, and the per-pixel
+    channel max as a brightness proxy for RGB glyphs.
+    """
+    dictionary = _as_nhwc_dictionary(shapes)
+    if dictionary.shape[-1] == 4:
+        alpha = dictionary[..., 3:4]
+    elif dictionary.shape[-1] == 1:
+        alpha = dictionary
+    else:
+        alpha = dictionary.max(axis=-1, keepdims=True)
+    return (alpha > threshold).astype(dictionary.dtype)
 
 
 class BayesianMarioNettePlacements(nnx.Module):
@@ -97,19 +104,29 @@ class BayesianMarioNettePlacements(nnx.Module):
         self.alpha_sharpness = alpha_sharpness
         self.expected_switches = expected_switches
         self.height = (img_h - kh) // stride + 1
-        self.mark_temperature = nnx.Param(jnp.array(mark_temperature))
+        # Relaxation temperatures are fixed hyperparameters, not learnable
+        # parameters: a learnable temperature on the reparameterized relaxed
+        # ELBO lets the optimizer game the (unbounded) relaxed-density KL.
+        self.mark_temperature = mark_temperature
         self.shape_dict = shape_dict
         self.stride = stride
-        self.switch_temperature = nnx.Param(jnp.array(switch_temperature))
+        self.switch_temperature = switch_temperature
         self.width = (img_w - kw) // stride + 1
 
     @property
     def num_features(self) -> int:
         return self.shape_dict.shapes.shape[0]
 
-    def __call__(self, rngs=None):
-        del rngs
+    def sample_latents(self):
+        """Draw the per-anchor switch and glyph-identity latents.
 
+        Returns ``(z_switch, z_mark)`` with shapes ``(1, H, W)`` and
+        ``(1, H, W, K)`` (broadcast over any enclosing plate). These are the
+        ``numpyro.sample`` sites ``"z_switch"`` and ``"z_mark"`` that
+        :meth:`__call__` also draws; call this once and thread the results
+        through :meth:`render` and :meth:`glyph_coverage` so both consume the
+        same samples rather than re-sampling the sites.
+        """
         z_mark = numpyro.sample(
             "z_mark", ConcreteLogits(
                 logits=jnp.zeros((1, self.height, self.width,
@@ -126,37 +143,46 @@ class BayesianMarioNettePlacements(nnx.Module):
                 temperature=self.switch_temperature
             ).to_event(2)
         )
+        return z_switch, z_mark
 
+    def glyph_coverage(self, z_switch, z_mark, *, threshold: float = 0.0):
+        """Per-glyph soft coverage, shape ``(..., out_h, out_w, K)``.
+
+        Entry ``[..., i]`` is ``sum_j z_switch[j] * z_mark[j, i] * mask_i[p - j]``:
+        how much glyph ``i``, as placed by the active switches, covers each output
+        pixel. It reuses the exact placement geometry of :meth:`render` (anchored
+        ``conv_transpose`` at ``self.stride``) but renders each glyph's 0/1 support
+        mask instead of its intensity, so the value counts overlapping placements
+        rather than summing their ink.
+
+        Because ``z_switch``/``z_mark`` are relaxed (continuous in ``[0, 1]``) the
+        counts are soft, and they are differentiable in the latents.
+
+        :param z_switch: per-anchor switch activations, shape ``(..., H, W)``.
+        :param z_mark: per-anchor glyph identities, shape ``(..., H, W, K)``.
+        :param threshold: a glyph touches a pixel where its alpha support
+            exceeds this value.
+        :return: per-glyph coverage, shape ``(..., out_h, out_w, K)``.
+        """
+        masks = _dictionary_support_masks(self.shape_dict.shapes, threshold)
         activations = jnp.moveaxis(z_mark * z_switch[..., jnp.newaxis], -1, 1)
-        rendered = _render_dictionary_placements(
-            activations, self.shape_dict.shapes, self.stride,
-        )
-        # Pick the alpha source by inspecting the rendered output's channel
-        # layout: an RGBA dictionary carries an explicit alpha in the 4th
-        # channel; a single-channel dictionary uses its only channel; an RGB
-        # dictionary has no native alpha so we fall back to the channel max
-        # as a brightness proxy.
-        if rendered.shape[-1] == 1:
-            alpha_source = rendered
-            rgb_raw = rendered
-        elif rendered.shape[-1] == 4:
-            alpha_source = rendered[..., 3:4]
-            rgb_raw = rendered[..., :3]
-        else:  # 3
-            alpha_source = rendered.max(axis=-1, keepdims=True)
-            rgb_raw = rendered
+        per_feature = _render_dictionary_placements(activations, masks,
+                                                    self.stride)
+        return jnp.clip(per_feature, 0., None)  # (..., K, out_h, out_w, 1)
 
-        # Normalize RGB by the alpha source so the compositing colour is the
-        # intrinsic ink colour at each pixel (bounded to [0, 1]) rather than
-        # the raw sum over overlapping placements. Otherwise the alpha
-        # channel — which saturates via Beer-Lambert — reaches ~1 in regions
-        # where the linear RGB sum is still small, and Porter-Duff over
-        # paints a dark opaque fringe.
-        rgb = jnp.clip(rgb_raw / jnp.maximum(alpha_source, 1e-6), 0., 1.)
-        if rendered.shape[-1] == 1:
-            rgb = jnp.broadcast_to(rgb, rgb.shape[:-1] + (3,))
-        alpha = 1.0 - jnp.exp(-self.alpha_sharpness * alpha_source)
-        return jnp.concatenate((rgb, alpha), axis=-1)
+    def render(self, z_switch, z_mark):
+        """Composite the RGBA foreground implied by the given latents."""
+        activations = jnp.moveaxis(z_mark * z_switch[..., jnp.newaxis], -1, 1)
+        return _render_dictionary_placements(activations,
+                                             self.shape_dict.shapes,
+                                             self.stride)
+
+    def __call__(self, rngs=None):
+        del rngs
+        z_switch, z_mark = self.sample_latents()
+        rgba = self.render(z_switch, z_mark)
+        coverage = self.glyph_coverage(z_switch, z_mark)
+        return rgba, coverage
 
 class BackgroundDecoder(nnx.Module):
     def __init__(self, embedding_dim: int=50, height=60, hiddens=400, width=160,
@@ -181,28 +207,73 @@ def generate_marionette_captcha(placements: BayesianMarioNettePlacements,
                                 backgrounder: Optional[BackgroundDecoder]=None):
     rgb_prior = dist.Uniform(jnp.zeros((3,)), jnp.ones((3,)))
     color = numpyro.sample("color", rgb_prior.to_event(1))
-    color = color[:, jnp.newaxis, jnp.newaxis, :]
-    color = jnp.concatenate((color, jnp.ones(color.shape[:-1] + (1,))), axis=-1)
+    color = color[:, jnp.newaxis, jnp.newaxis, jnp.newaxis, :]
 
-    foreground = placements() * color
+    rgba, coverage = placements()
+    canvas_shape = list(rgba.shape)
+    canvas_shape[-4] = 1
+    canvas_shape = tuple(canvas_shape)
+    foreground = rgba[..., :-1] * color
     if backgrounder is not None:
         background = backgrounder() * color
     else:
-        background = jnp.ones_like(foreground)
+        background = jnp.ones(canvas_shape[:-1] + (3,))
 
-    return utils.soft_clamp(over(background, foreground)[..., :-1], 0., 1.)
+    prediction = jnp.concatenate((background, foreground), axis=-4)
+
+    # ``coverage`` is a soft count of overlapping placements and can exceed 1, so
+    # the background "survival" weight -- the probability that no glyph covers the
+    # pixel -- is the Beer-Lambert / Poisson zero-count term exp(-sum coverage).
+    # This stays in (0, 1] by construction (never negative, unlike prod(1 -
+    # coverage) once a count exceeds 1), agrees with the product form to first
+    # order, and keeps the mixture weights a valid non-negative simplex.
+    transmittance = jnp.exp(-jnp.sum(coverage, axis=-4, keepdims=True))
+    coverage = jnp.concatenate((transmittance, coverage), axis=-4)
+    return prediction, coverage
 
 def marionette_captcha_model(images, placements: BayesianMarioNettePlacements,
                              backgrounder: Optional[BackgroundDecoder]=None,
                              scale=None):
+    # One Gaussian mixture component per dictionary glyph, plus a background
+    # component (index 0); each carries its own learnable log-scale. Read the
+    # glyph count from the raw module before wrapping, since the nnx_module
+    # wrapper exposes only ``__call__``.
+    n_components = placements.num_features + 1
     placements = nnx_module("placements_p", placements)
     if backgrounder is not None:
         backgrounder = nnx_module("backgrounder_p", backgrounder)
+
     if scale is None:
-        scale = jnp.exp(numpyro.param("log_scale", jnp.zeros(())))
-    with numpyro.plate("batch", images.shape[0]):
-        prediction = generate_marionette_captcha(placements, backgrounder)
-        prediction = jnp.moveaxis(prediction, -1, -3)
-        images = jnp.moveaxis(images, -1, -3)
-        return numpyro.sample("obs", dist.Normal(prediction, scale).to_event(3),
-                              obs=images)
+        scale = jnp.exp(numpyro.param("log_scale", jnp.zeros((1,))))
+    # Per-component scale, shaped to broadcast over the trailing channel axis of
+    # ``prediction`` (whose component axis is -2 and channel axis is -1).
+    scale = jnp.broadcast_to(jnp.asarray(scale), (n_components,))[:, jnp.newaxis]
+
+    batch_size = images.shape[0] if images is not None else 1
+    with numpyro.plate("batch", batch_size):
+        prediction, coverage = generate_marionette_captcha(placements,
+                                                           backgrounder)
+        # Keep everything in NHWC so the color channel is the *event* of the
+        # component distribution, not a batch dim of the mixture. If the channel
+        # stayed in the mixture batch, the assignment categorical would fire
+        # independently per channel and pick a different component for R, G and B
+        # at the same pixel -- producing saturated per-channel speckle wherever
+        # the coverage weights are split. Folding the channel into the component
+        # event makes a single per-pixel assignment select the whole RGB vector,
+        # so colors stay correlated within a pixel even when the latents are soft.
+        prediction = jnp.moveaxis(prediction, -4, -2)  # (B, H, W, K, C)
+        coverage = jnp.moveaxis(coverage[..., 0], -3, -1)  # (B, H, W, K)
+
+        # The coverage gives mixture weights, so normalize it to a simplex. Empty
+        # pixels legitimately place zero weight on glyph components; the mixture's
+        # linear-space log_prob handles zero weights exactly (finite gradients),
+        # so no epsilon floor is needed.
+        coverage = coverage / coverage.sum(axis=-1, keepdims=True)
+        likelihood = SpatialMixtureSameFamily(
+            dist.Categorical(probs=coverage),          # batch (B, H, W)
+            dist.Normal(prediction, scale).to_event(1),  # batch (B, H, W, K), event (C,)
+            reinterpreted_batch_ndims=2,               # fold (H, W); event -> (H, W, C)
+        )
+        if images is not None:
+            numpyro.deterministic("residual", (images - likelihood.mean) ** 2)
+        return numpyro.sample("obs", likelihood, obs=images)

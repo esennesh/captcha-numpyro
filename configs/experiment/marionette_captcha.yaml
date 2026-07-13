@@ -4,6 +4,7 @@ defaults:
   - override /data: captcha
   - override /guide: marionette_captcha_encoder
   - override /learner: graphical
+  - override /learner/optim: clipped_adamw
   - override /model: marionette_captcha
 
 data:
@@ -16,15 +17,13 @@ guide:
     shape_dict: ${model.placements.shape_dict}
 
 learner:
-  optim:
-    learning_rate: 1e-4
   tracer:
     _target_: src.inference.tracer.ELBOTracer
-    num_particles: 16
+    num_particles: 4
 
 model:
   backgrounder: null
 
 trainer:
-  epochs: 1000
-  save_period: 250
+  epochs: 200
+  save_period: 200

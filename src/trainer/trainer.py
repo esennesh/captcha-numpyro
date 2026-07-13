@@ -72,15 +72,23 @@ class Trainer:
         if prefix != "":
             prefix += "/"
 
+        # ``image_shape`` is the canonical channel-first ``(C, H, W)``, but the
+        # model and dataloader now carry images channel-last (``..., H, W, C``).
+        # Match tensors against that channel-last layout and hand them to
+        # TensorBoard as NHWC so ``add_images`` doesn't misread H as the channel.
+        hwc_shape = None
+        if image_shape is not None:
+            assert len(image_shape) == 3
+            c, h, w = image_shape
+            hwc_shape = (h, w, c)
+
         for k, v in tensors.items():
             image_data = False
             v = np.asarray(v)
-            if image_shape is not None:
-                assert len(image_shape) == 3
-                if v.shape[-len(image_shape):] == image_shape:
-                    images = v.reshape(-1, *image_shape)
-                    self.writer.add_images(prefix + k, images)
-                    image_data = True
+            if hwc_shape is not None and v.shape[-3:] == hwc_shape:
+                images = v.reshape(-1, *hwc_shape)
+                self.writer.add_images(prefix + k, images, dataformats="NHWC")
+                image_data = True
             if not image_data:
                 self.writer.add_histogram(prefix + k, v, bins="auto")
 
