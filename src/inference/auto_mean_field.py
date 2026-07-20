@@ -36,18 +36,35 @@ class AutoMeanFieldProposal(AutoGuide):
                 for frame in site["cond_indep_stack"]:
                     stack.enter_context(plates[frame.name])
 
-                batch_shape = site["value"].shape[:-event_dim]
                 site_dist = site["fn"]
-                while hasattr(site_dist, "base_dist"):
+                # Unwrap only the shape-wrappers; descending into e.g. a
+                # TransformedDistribution's base would mirror a distribution
+                # with the wrong support (RelaxedBernoulli -> Logistic).
+                while isinstance(site_dist, (dist.ExpandedDistribution,
+                                             dist.Independent,
+                                             dist.MaskedDistribution)):
                     site_dist = site_dist.base_dist
+                # Dims of the site value the base distribution treats as
+                # batch: plate dims plus any dims folded away by to_event.
+                # Broadcasting every parameter to this shape (plus its own
+                # event dims) gives each batch element and each independent
+                # coordinate its own variational parameter.
+                value_ndim = site["value"].ndim
+                base_batch_shape = site["value"].shape[
+                    :value_ndim - site_dist.event_dim
+                ]
                 params = {}
                 for param, constraint in site_dist.arg_constraints.items():
                     if isinstance(constraint, dist.constraints._Dependent):
                         constraint = dist.constraints.real
                     transform = biject_to(constraint)
                     init_value = transform.inv(getattr(site_dist, param))
-                    if init_value.shape[:len(batch_shape)] != batch_shape:
-                        init_value = jax.lax.broadcast(init_value, batch_shape)
+                    event_shape = init_value.shape[
+                        init_value.ndim - constraint.event_dim:
+                    ] if constraint.event_dim else ()
+                    init_value = jnp.broadcast_to(
+                        init_value, base_batch_shape + event_shape
+                    )
                     params[param] = transform(numpyro.primitives.param(
                         "{}_{}_{}".format(name, self.prefix, param),
                         init_value=init_value
