@@ -392,16 +392,16 @@ class AdaptiveParticleTracer(ParticleTracer):
                 for name, site in guide_trace.items()
                 if site["type"] == "sample" and name not in graph_state
             })
-            graph_state.update({
-                name: trace_entry(site, 0., 0., False)
-                for name, site in model_trace.items()
-                if site["type"] == "deterministic"
-            })
-            graph_state.update({
-                name: trace_entry(site, 0., 0., False)
-                for name, site in guide_trace.items()
-                if site["type"] == "deterministic"
-            })
+            for source in (model_trace, guide_trace):
+                for name, site in source.items():
+                    if site["type"] != "deterministic" or name in graph_state:
+                        continue
+                    indep_shape = sum([(frame.size,) for frame
+                                       in site["cond_indep_stack"]], start=())
+                    graph_state[name] = trace_entry(site,
+                                                    jnp.zeros(indep_shape),
+                                                    jnp.zeros(indep_shape),
+                                                    False)
             mutables = {name: site["value"] for name, site in
                         model_trace.items() if site["type"] == "mutable"}
 
