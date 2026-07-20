@@ -212,7 +212,11 @@ class BackgroundDecoder(nnx.Module):
 
 def generate_marionette_captcha(placements: BayesianMarioNettePlacements,
                                 backgrounder: Optional[BackgroundDecoder]=None):
-    rgb_prior = dist.Uniform(jnp.zeros((3,)), jnp.ones((3,)))
+    # Beta(1, 1) is the uniform density on [0, 1], but unlike Uniform its
+    # parameters carry plain positive constraints and its support is fixed:
+    # a mean-field guide can mirror it with learnable concentrations without
+    # ever proposing colors outside the prior's support.
+    rgb_prior = dist.Beta(jnp.ones((3,)), jnp.ones((3,)))
     color = numpyro.sample("color", rgb_prior.to_event(1))
     color = color[:, jnp.newaxis, jnp.newaxis, jnp.newaxis, :]
 
