@@ -2,7 +2,7 @@
 
 defaults:
   - override /data: captcha
-  - override /guide: marionette_captcha_encoder
+  - override /guide: iterative_mean_field
   - override /learner: graphical
   - override /learner/optim: clipped_adamw
   - override /model: marionette_captcha
@@ -11,14 +11,9 @@ data:
   height: 80
   width: 80
 
-guide:
-  backgrounder: null
-  placements:
-    shape_dict: ${model.placements.shape_dict}
-
 learner:
   tracer:
-    _target_: src.inference.tracer.ELBOTracer
+    _target_: src.inference.tracer.AdaptiveElboTracer
     num_particles: 4
 
 model:
