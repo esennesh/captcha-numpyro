@@ -127,20 +127,27 @@ class BayesianMarioNettePlacements(nnx.Module):
         through :meth:`render` and :meth:`glyph_coverage` so both consume the
         same samples rather than re-sampling the sites.
         """
+        mark_temperature = numpyro.param("mark_temperature",
+                                         jnp.log(self.mark_temperature))
+        mark_temperature = jnp.exp(mark_temperature)
         z_mark = numpyro.sample(
             "z_mark", ConcreteLogits(
                 logits=jnp.zeros((1, self.height, self.width,
                                   len(self.shape_dict))),
-                temperature=self.mark_temperature
+                temperature=mark_temperature
             ).to_event(2)
         )
+
         expected_logit = math.log(self.expected_switches) -\
                          math.log(self.height * self.width -
                                   self.expected_switches)
+        switch_temperature = numpyro.param("switch_log_temperature",
+                                           jnp.log(self.switch_temperature))
+        switch_temperature = jnp.exp(switch_temperature)
         z_switch = numpyro.sample(
             "z_switch", dist.RelaxedBernoulli(
                 logits=jnp.ones((1, self.height, self.width)) * expected_logit,
-                temperature=self.switch_temperature
+                temperature=switch_temperature
             ).to_event(2)
         )
         return z_switch, z_mark

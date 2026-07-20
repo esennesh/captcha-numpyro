@@ -212,8 +212,10 @@ class MarioNettePlacer(nnx.Module):
         scores = _dictionary_conv_scores(images, self.shape_dict.shapes,
                                          self.stride)
         scores = _center_scores(scores)
-        mark_dist = Concrete(temperature=self.mark_temperature,
-                             logits=scores)
+        mark_temperature = numpyro.param("mark_temperature",
+                                         jnp.log(self.mark_temperature))
+        mark_temperature = jnp.exp(mark_temperature)
+        mark_dist = Concrete(temperature=mark_temperature, logits=scores)
         z_mark = numpyro.sample(
             "z_mark", mark_dist.to_event(2),
         )
@@ -229,9 +231,12 @@ class MarioNettePlacer(nnx.Module):
         switch_logits = (self.switch_predictor(scores) - uncertainty +
                          self.switch_bias).squeeze(-1)
         numpyro.deterministic("switch_logits", switch_logits)
+        switch_temperature = numpyro.param("switch_log_temperature",
+                                           jnp.log(self.switch_temperature))
+        switch_temperature = jnp.exp(switch_temperature)
         z_switch = numpyro.sample(
             "z_switch", dist.RelaxedBernoulli(
-                temperature=self.switch_temperature, logits=switch_logits,
+                temperature=switch_temperature, logits=switch_logits,
             ).to_event(2)
         )
 
