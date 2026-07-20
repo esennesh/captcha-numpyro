@@ -1,0 +1,31 @@
+_target_: src.inference.iterative.IterativeGuide
+_partial_: true
+guide:
+  _target_: src.inference.auto_mean_field.AutoMeanFieldProposal
+  _partial_: true
+# OptaxMinimiser does one loss+grad per iteration (no line-search loop),
+# giving XLA a much leaner graph than NonlinearCG. Termination is a Cauchy
+# criterion on successive iterates, so Adam needs a decaying learning rate:
+# constant-lr Adam takes ~lr-sized steps even at convergence and may never
+# fall under tolerance; the decay guarantees the solve terminates.
+solver:
+  _target_: optimistix.OptaxMinimiser
+  optim:
+    _target_: optax.adam
+    learning_rate:
+      # not optax.exponential_decay: its closure has an empty cell that
+      # crashes equinox's closure-to-pytree conversion in OptaxMinimiser
+      _target_: src.inference.iterative.exponential_decay
+      init_value: 0.1
+      transition_steps: 100
+      decay_rate: 0.5
+  rtol: 1e-3
+  atol: 1e-3
+max_steps: 100
+tracer:
+  _target_: src.inference.tracer.ParticleTracer
+  # beta scales the latent (KL) terms of the inner objective; 0 adapts the
+  # guide on reconstruction alone, which stays bounded where the relaxed
+  # densities' KL does not.
+  beta: 0.0
+  num_particles: 4
