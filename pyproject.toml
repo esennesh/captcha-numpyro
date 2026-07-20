@@ -33,5 +33,5 @@ dependencies = [
 [tool.uv]
 override-dependencies = ["pyyaml>=6.0"]
 
-[tools.uv.sources]
-numpyro = { git = "https://github.com/pyro-ppl/numpyro.git"}
+[tool.uv.sources]
+numpyro = {git = "https://github.com/esennesh/numpyro.git", branch = "develop"}
