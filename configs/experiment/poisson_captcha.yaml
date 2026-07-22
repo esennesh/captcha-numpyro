@@ -18,11 +18,6 @@ learner:
 
 model:
   backgrounder: null
-  # Pin the likelihood scale: learnable log_scale (init sigma=1) lets the
-  # model flatten the likelihood until background explains everything --
-  # a 10-epoch run collapsed exactly there (learned sigma 0.88, all-white
-  # reconstructions). Re-enable learning once the embeddings mean something.
-  scale: 0.1
 
 trainer:
   epochs: 10
