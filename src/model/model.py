@@ -239,16 +239,32 @@ class PoissonMarkedPlacements(nnx.Module):
         ``(..., H, W, K)``; their product is the per-(anchor, glyph) firing
         intensity that drives both rendering and coverage.
         """
+        # Learnable prior hyperparameters. The where-concentration is a full
+        # per-anchor vector, so the prior can learn a topographic placement
+        # preference; the mark-concentration is per-glyph, so it can learn
+        # dictionary usage frequencies (shared across anchors).
+        count_concentration = numpyro.param(
+            "count_concentration", jnp.asarray(self.count_concentration),
+            constraint=dist.constraints.positive
+        )
         z_rate = numpyro.sample("z_rate", dist.Gamma(
-            self.count_concentration,
-            self.count_concentration / self.expected_count,
+            count_concentration, count_concentration / self.expected_count,
         ))
-        concentration = jnp.full((self.height * self.width,),
-                                 self.where_concentration)
-        z_where = numpyro.sample("z_where", dist.Dirichlet(concentration))
-        marks = numpyro.sample("z_mark", dist.Dirichlet(jnp.full(
+        where_concentration = numpyro.param(
+            "where_concentration",
+            jnp.full((self.height * self.width,), self.where_concentration),
+            constraint=dist.constraints.positive
+        )
+        z_where = numpyro.sample("z_where",
+                                 dist.Dirichlet(where_concentration))
+        mark_concentration = numpyro.param(
+            "mark_concentration",
+            jnp.full((len(self.shape_dict),), self.mark_concentration),
+            constraint=dist.constraints.positive
+        )
+        marks = numpyro.sample("z_mark", dist.Dirichlet(jnp.broadcast_to(
+            mark_concentration,
             (1, self.height, self.width, len(self.shape_dict)),
-            self.mark_concentration,
         )).to_event(2))
         intensity = z_rate[..., jnp.newaxis] * z_where
         intensity = intensity.reshape(z_where.shape[:-1] +
