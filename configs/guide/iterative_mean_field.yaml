@@ -21,11 +21,11 @@ solver:
       decay_rate: 0.5
   rtol: 1e-3
   atol: 1e-3
-max_steps: 100
+max_steps: 50
 tracer:
   _target_: src.inference.tracer.ParticleTracer
   # beta scales the latent (KL) terms of the inner objective; 0 adapts the
   # guide on reconstruction alone, which stays bounded where the relaxed
   # densities' KL does not.
-  beta: 0.0
+  beta: 0.05
   num_particles: 4
