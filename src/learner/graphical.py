@@ -198,10 +198,14 @@ class GraphicalModelLearner(ParamLearner):
         metrics["kl"] = sum(~node["observed"] * (node["log_q"] - node["log_p"])
                             for node in state["trace"].values()).mean()
         metrics["log_Z"] = jax.nn.log_softmax(state["log_w"], axis=0).sum()
-        if "z_count" in state["trace"]:
-            metrics["z_count_total"] = state["trace"]["z_count"]["ev"].sum(
-                axis=(-3, -2, -1)
-            ).mean()
+        # Deterministic sites (log_p and log_q identically zero) with a
+        # scalar per-particle value are model-declared metrics.
+        for name, node in state["trace"].items():
+            if name in metrics or not ((node["log_p"] == 0.).all() and
+                                       (node["log_q"] == 0.).all()):
+                continue
+            if node["ev"].size == node["ev"].shape[0]:
+                metrics[name] = node["ev"].mean()
         if "log_w" in metrics and "ess" not in metrics:
             metrics["ess"] = jax.numpy.mean(
                 effective_sample_size(metrics["log_w"], normalized=True)
