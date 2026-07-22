@@ -191,6 +191,102 @@ class BayesianMarioNettePlacements(nnx.Module):
         coverage = self.glyph_coverage(z_switch, z_mark)
         return rgba, coverage
 
+class PoissonMarkedPlacements(nnx.Module):
+    """Marked-Poisson-process glyph placements, without relaxations.
+
+    Anchors compete to fire through a normalized intensity field: a total
+    firing mass ``z_rate ~ Gamma`` (whose prior mean is the expected glyph
+    count) is allocated across anchors by a sparse ``z_where ~ Dirichlet``,
+    giving per-anchor rates ``lambda_j = z_rate * z_where_j``. Glyph
+    identities compete within each patch through an explicit per-anchor mark
+    simplex ``z_mark[j] ~ Dirichlet(mark_concentration * ones(K))``, sparse
+    when ``mark_concentration < 1`` so marks genuinely compete to fire.
+
+    Discrete firing is never sampled. The per-(anchor, glyph) intensities
+    ``lambda_j * rho_jm`` are the sufficient statistics of the process:
+    by the marking and superposition theorems the pixelwise mixture
+    downstream is its exact marginalization, with mixture weights given by
+    the first-arrival race over intensities and the Beer-Lambert
+    ``exp(-coverage)`` background term equal to the Poisson void
+    probability. Every latent is Gamma/Dirichlet/Normal -- no temperatures,
+    parameter-free supports, valid KLs, and a safely mirrorable mean field.
+    """
+
+    def __init__(self, shape_dict: ShapeDictionary,
+                 count_concentration: float=2., expected_count: float=1.,
+                 img_h: int=60, img_w: int=160, kh: int=60, kw: int=60,
+                 mark_concentration: float=0.5, stride: int=1,
+                 where_concentration: float=0.5, *,
+                 rngs: Optional[nnx.Rngs]=None):
+        del rngs
+        self.count_concentration = count_concentration
+        self.expected_count = expected_count
+        self.height = (img_h - kh) // stride + 1
+        self.mark_concentration = mark_concentration
+        self.shape_dict = shape_dict
+        self.stride = stride
+        self.where_concentration = where_concentration
+        self.width = (img_w - kw) // stride + 1
+
+    @property
+    def num_features(self) -> int:
+        return self.shape_dict.shapes.shape[0]
+
+    def sample_latents(self):
+        """Draw the intensity field and mark simplices.
+
+        Returns ``(intensity, marks)`` with shapes ``(..., H, W)`` and
+        ``(..., H, W, K)``; their product is the per-(anchor, glyph) firing
+        intensity that drives both rendering and coverage.
+        """
+        z_rate = numpyro.sample("z_rate", dist.Gamma(
+            self.count_concentration,
+            self.count_concentration / self.expected_count,
+        ))
+        concentration = jnp.full((self.height * self.width,),
+                                 self.where_concentration)
+        z_where = numpyro.sample("z_where", dist.Dirichlet(concentration))
+        marks = numpyro.sample("z_mark", dist.Dirichlet(jnp.full(
+            (1, self.height, self.width, len(self.shape_dict)),
+            self.mark_concentration,
+        )).to_event(2))
+        intensity = z_rate[..., jnp.newaxis] * z_where
+        intensity = intensity.reshape(z_where.shape[:-1] +
+                                      (self.height, self.width))
+        return intensity, marks
+
+    def glyph_coverage(self, activations, *, threshold: float = 0.0):
+        """Intensity-weighted support coverage, ``(..., K, out_h, out_w, 1)``.
+
+        Entry ``[..., m, x, 1]`` is ``sum_j activations[j, m] * mask_m(x - j)``:
+        the total firing intensity claiming pixel ``x`` with glyph ``m``.
+        """
+        masks = _dictionary_support_masks(self.shape_dict.shapes, threshold)
+        per_feature = _render_dictionary_placements(activations, masks,
+                                                    self.stride)
+        return jnp.clip(per_feature, 0., None)
+
+    def render(self, activations, coverage):
+        """Intensity-weighted mean sprite appearance per glyph.
+
+        The raw render scales sprite ink with the (unbounded) intensity;
+        dividing by the identically-weighted support coverage makes the
+        mixture-component means scale-invariant in the intensities, leaving
+        the intensities to act only through the mixture weights.
+        """
+        ink = _render_dictionary_placements(activations,
+                                            self.shape_dict.shapes,
+                                            self.stride)
+        return jnp.clip(ink, 0., None) / jnp.clip(coverage, 1e-6, None)
+
+    def __call__(self, rngs=None):
+        del rngs
+        intensity, marks = self.sample_latents()
+        activations = jnp.moveaxis(marks * intensity[..., jnp.newaxis], -1, 1)
+        coverage = self.glyph_coverage(activations)
+        rgba = self.render(activations, coverage)
+        return rgba, coverage
+
 class BackgroundDecoder(nnx.Module):
     def __init__(self, embedding_dim: int=50, height=60, hiddens=400, width=160,
                  *, rngs: nnx.Rngs):

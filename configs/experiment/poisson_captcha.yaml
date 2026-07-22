@@ -1,0 +1,29 @@
+# @package _global_
+
+defaults:
+  - override /data: captcha
+  - override /guide: iterative_mean_field
+  - override /learner: graphical
+  - override /learner/optim: clipped_adamw
+  - override /model: poisson_captcha
+
+data:
+  height: 80
+  width: 80
+
+learner:
+  tracer:
+    _target_: src.inference.tracer.AdaptiveElboTracer
+    num_particles: 4
+
+model:
+  backgrounder: null
+  # Pin the likelihood scale: learnable log_scale (init sigma=1) lets the
+  # model flatten the likelihood until background explains everything --
+  # a 10-epoch run collapsed exactly there (learned sigma 0.88, all-white
+  # reconstructions). Re-enable learning once the embeddings mean something.
+  scale: 0.1
+
+trainer:
+  epochs: 10
+  save_period: 10

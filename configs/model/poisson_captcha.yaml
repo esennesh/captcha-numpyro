@@ -1,0 +1,24 @@
+defaults:
+  - placements/shaper/shape_dict@placements.shape_dict: sandbox
+
+_target_: src.model.model.marionette_captcha_model
+_partial_: true
+backgrounder: null
+placements:
+  _target_: src.model.model.PoissonMarkedPlacements
+  count_concentration: 2.0
+  expected_count: 2.0
+  img_h: 80
+  img_w: 80
+  kh: 38
+  kw: 26
+  # Sparse within-patch glyph competition: concentrations below 1 push each
+  # anchor's mark simplex toward committing to a single glyph.
+  mark_concentration: 0.5
+  rngs:
+    _target_: flax.nnx.Rngs
+    default: 5678
+  stride: 1
+  # Sparse allocation: concentrations well below 1 make anchors compete,
+  # concentrating the firing mass on a few winners.
+  where_concentration: 0.1
