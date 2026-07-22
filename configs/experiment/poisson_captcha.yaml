@@ -20,5 +20,5 @@ model:
   backgrounder: null
 
 trainer:
-  epochs: 10
-  save_period: 10
+  epochs: 50
+  save_period: 50
