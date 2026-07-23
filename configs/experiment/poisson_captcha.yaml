@@ -2,7 +2,7 @@
 
 defaults:
   - override /data: captcha
-  - override /guide: iterative_mean_field
+  - override /guide: conjugate_mean_field
   - override /learner: graphical
   - override /learner/optim: clipped_adamw
   - override /model: poisson_captcha
