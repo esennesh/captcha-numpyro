@@ -360,7 +360,12 @@ def marionette_captcha_model(images, placements: BayesianMarioNettePlacements,
         backgrounder = nnx_module("backgrounder_p", backgrounder)
 
     if scale is None:
-        scale = jnp.exp(numpyro.param("log_scale", jnp.zeros((1,))))
+        # Initialize sharp (sigma = 0.1, the regime where per-batch inference
+        # demonstrably works) rather than at sigma = 1, which is so forgiving
+        # that adaptation places no ink for the thousands of steps it takes
+        # the learned scale to crawl down.
+        scale = jnp.exp(numpyro.param("log_scale",
+                                      jnp.log(0.1) * jnp.ones((1,))))
     # Per-component scale, shaped to broadcast over the trailing channel axis of
     # ``prediction`` (whose component axis is -2 and channel axis is -1).
     scale = jnp.broadcast_to(jnp.asarray(scale), (n_components,))[:, jnp.newaxis]
