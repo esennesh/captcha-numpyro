@@ -2,7 +2,10 @@
 
 defaults:
   - override /data: captcha
-  - override /guide: conjugate_mean_field
+  # Placeholder guide until the model's next inference method lands: the
+  # mean-field mirror composes and traces, but per-batch adaptation is gone
+  # with the iterative guides.
+  - override /guide: auto_mean_field
   - override /learner: graphical
   - override /learner/optim: clipped_adamw
   - override /model: poisson_captcha
@@ -13,7 +16,7 @@ data:
 
 learner:
   tracer:
-    _target_: src.inference.tracer.AdaptiveElboTracer
+    _target_: src.inference.tracer.ELBOTracer
     num_particles: 4
 
 model:
