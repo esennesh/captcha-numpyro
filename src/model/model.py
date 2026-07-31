@@ -349,7 +349,7 @@ def generate_marionette_captcha(placements: BayesianMarioNettePlacements,
 
 def marionette_captcha_model(images, placements: BayesianMarioNettePlacements,
                              backgrounder: Optional[BackgroundDecoder]=None,
-                             scale=None):
+                             plot_mean=False, scale=None):
     # One Gaussian mixture component per dictionary glyph, plus a background
     # component (index 0); each carries its own learnable log-scale. Read the
     # glyph count from the raw module before wrapping, since the nnx_module
@@ -395,6 +395,15 @@ def marionette_captcha_model(images, placements: BayesianMarioNettePlacements,
             dist.Normal(prediction, scale).to_event(1),  # batch (B, H, W, K), event (C,)
             reinterpreted_batch_ndims=2,               # fold (H, W); event -> (H, W, C)
         )
+        # The coverage-weighted mixture mean is what the model "expects" the
+        # image to look like. A single ``obs`` draw is a per-pixel categorical
+        # over the background and the K glyph components, so it dithers even a
+        # firmly placed glyph (a pixel with unit coverage still picks the
+        # background with probability exp(-1) / (exp(-1) + 1)); plot this site
+        # rather than a sample to inspect the geometry.
+        mean = likelihood.mean
+        if plot_mean:
+            numpyro.deterministic("mean", mean)
         if images is not None:
-            numpyro.deterministic("residual", (images - likelihood.mean) ** 2)
+            numpyro.deterministic("residual", (images - mean) ** 2)
         return numpyro.sample("obs", likelihood, obs=images)
