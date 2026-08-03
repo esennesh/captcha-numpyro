@@ -1470,3 +1470,65 @@ rebuilding the learner's jitted step each time. Making it the shipped default me
 `eta` annealing into `GraphicalModelLearner` or the trainer, and costs 1.7x per step. It is now
 best on both criteria, so it is worth doing; `DoubleCVTracer` remains the correct default until
 then.
+
+---
+
+## 23. The dark fringe: two causes, and the smaller one was mine
+
+The trained reconstructions showed a dark outline around every glyph where the data
+has a clean anti-aliased edge. Decomposed at four overlapping spikes with a
+realistic ink colour, the edge error of 0.266 splits as:
+
+| cause | contribution |
+|---|---|
+| anti-aliasing applied twice, as opacity *and* as colour | 0.067 |
+| `A = 1 - exp(-n alpha)` exceeding the true coverage `alpha` | **0.199** |
+
+**The first is a bug, now fixed.** `_rgba_shape_transform` derives `alpha` as
+`file_alpha * max(RGB)` while leaving RGB untouched, so on a glyph's support
+`rgb.max(-1)` equals `alpha` exactly. Premultiplying by raw RGB and dividing back
+out as `tint = premult / depth` recovers that ramp *as the foreground colour*:
+`tint = 0.14` at edges against 0.996 at the core. `_ink_kernel` now premultiplies by
+unit hue, which puts the ramp in alpha alone. Worth 28% of E[MSE] at 800 steps
+(0.00407 -> 0.00292) and it lets the model raise `log_total_q` from 1.07 to 1.31,
+since there is no longer a dark fringe to pay for.
+
+**The second is structural**, and it is the larger share. `tau = n alpha` scales the
+entire ramp, so the count cannot saturate the core without over-opacifying the edge:
+
+| n | true `alpha` at edge | `A` | edge composite | correct |
+|---|---|---|---|---|
+| 1 | 0.155 | 0.140 | 0.888 | 0.876 |
+| 4 | 0.140 | 0.390 | 0.688 | 0.888 |
+
+At `n = 1` the edge is nearly exact and the core reaches only 0.63; at `n = 4` the
+core saturates and the edge darkens. The converged model runs at total rate 4.2, so
+it sits in the second regime. This also retires an idea from §12 from a new angle: a
+learnable gain would not have helped, because gain and count are the same knob.
+
+**The fix for it, not yet implemented.** Beer-Lambert is the wrong law for a *single*
+glyph's anti-aliasing: `1 - exp(-alpha)` maps a fully covered pixel to 0.632 rather
+than 1, which is exactly why `n > 1` is needed. Anti-aliasing is *coverage*, which
+composes as `1 - prod(1 - alpha_i) = 1 - exp(sum log(1 - alpha_i))`. So convolving
+**`-log(1 - alpha)`** in the depth channel instead of `alpha` makes
+`1 - exp(-tau)` exact alpha compositing: one stamp gives `A = alpha` precisely, `n`
+stamps give `1 - (1 - alpha)^n`, and `alpha = 1` gives `A = 1`. One convolution
+still, non-negativity still free (`-log(1-alpha) >= 0`), and §2's "counts add in
+log-transmittance" becomes literally true rather than a first-order approximation.
+
+It changes what `tau` means, so `ambient_depth`, `nu(tau) = 2.5 + 2.0 tau` and the
+converged `log_total_q` all need re-deriving, and it needs a retrain to evaluate.
+
+### Method note
+
+The first diagnosis of this attributed the whole fringe to the tint bug. That
+measurement used `color = 0`, where `tint * 0 = 0` and the tint term cannot
+influence the result at all -- the effect being diagnosed was invisible in the
+numbers used to diagnose it. Choosing a probe value that happens to annihilate the
+term under test is easy to do and hard to notice; the decomposition above uses
+`color = 0.2` instead.
+
+A prediction that has *not* been confirmed: `sigma_ink` was expected to fall after
+the fix, as independent evidence that it had been absorbing this systematic edge
+error as noise. At 800 steps it is identical across arms (0.0936 vs 0.0937), both
+still climbing from 0.04. Untested, not supported.
