@@ -78,6 +78,162 @@ def _dictionary_support_masks(shapes: Array, threshold: float = 0.0) -> Array:
     return (alpha > threshold).astype(dictionary.dtype)
 
 
+def _dictionary_alpha_rgb(shapes: Array) -> tuple[Array, Array]:
+    """Split a dictionary into ``(alpha, rgb)``, shaped ``(K, kh, kw, 1|3)``.
+
+    The alpha convention follows :func:`_dictionary_support_masks`: the explicit
+    alpha channel for RGBA glyphs, the sole channel for single-channel glyphs,
+    and the per-pixel channel max as a brightness proxy for RGB glyphs.
+    """
+    dictionary = _as_nhwc_dictionary(shapes)
+    if dictionary.shape[-1] == 4:
+        alpha, rgb = dictionary[..., 3:4], dictionary[..., :3]
+    elif dictionary.shape[-1] == 1:
+        alpha = dictionary
+        rgb = jnp.broadcast_to(dictionary, dictionary.shape[:-1] + (3,))
+    else:
+        alpha, rgb = dictionary.max(axis=-1, keepdims=True), dictionary
+    return alpha, rgb
+
+
+def _ink_kernel(shapes: Array) -> Array:
+    """The stamping kernel, shaped ``(kh, kw, 4, K)`` for ``conv_transpose``.
+
+    Channels 0:3 carry *premultiplied* colour ``alpha_k * rgb_k`` and channel 3
+    carries ``alpha_k`` alone, so a single transposed convolution of the count
+    field emits both the colour numerator and the optical depth that normalizes
+    it (see :meth:`PoissonConvPlacements.ink_field`).
+
+    The layout is HWIO as ``conv_transpose(..., transpose_kernel=True)`` wants
+    it: ``I`` is the deconvolution's *output* channels (the 4 ink channels) and
+    ``O`` its *input* channels (the ``K`` dictionary features).
+    """
+    alpha, rgb = _dictionary_alpha_rgb(shapes)
+    ink = jnp.concatenate((rgb * alpha, alpha), axis=-1)  # (K, kh, kw, 4)
+    return jnp.moveaxis(ink, 0, -1)
+
+
+def _stamp(counts: Array, kernel: Array) -> Array:
+    """Add ``counts[..., y, x, k]`` copies of glyph ``k`` *centred* at ``(y, x)``.
+
+    ``counts`` is ``(..., H, W, K)`` at image resolution and the result is
+    ``(..., H, W, C)``: the count field and the image it renders are the same
+    grid, so a translation of one is a translation of the other. That is the
+    equivariance ``poisson_hesc.py`` checks, and §1 of
+    ``notes/poisson-convsc-design.md`` explains why the whole design rests on it.
+
+    Rather than trusting a padding mode to place an even-sized kernel, this
+    renders the full ``(H + kh - 1, W + kw - 1)`` support and crops explicitly.
+    The convention: a unit spike at ``(y, x)`` lays the glyph's ``(kh, kw)``
+    frame down with its top-left corner at ``(y - (kh-1)//2, x - (kw-1)//2)``,
+    unflipped. For an odd kernel dimension the frame centre is exactly ``y``;
+    for an even one -- as here, 38 x 26 -- the frame centre necessarily falls
+    between pixels, half a pixel past ``y``, since a box with an even side has
+    no centre pixel. Sub-pixel offsets (§6 of the design note) absorb that when
+    they land; nothing here depends on it, because *equivariance* holds exactly
+    either way and that is the property the design uses.
+    """
+    kh, kw = kernel.shape[:2]
+    height, width = counts.shape[-3:-1]
+    # conv_transpose wants exactly one batch dim; fold any particle/plate dims.
+    leading = counts.shape[:-3]
+    folded = counts.reshape((-1,) + counts.shape[-3:]).astype(kernel.dtype)
+    full = jax.lax.conv_transpose(
+        folded, kernel, (1, 1), "VALID",
+        dimension_numbers=("NHWC", "HWIO", "NHWC"), transpose_kernel=True,
+    )
+    top, left = (kh - 1) // 2, (kw - 1) // 2
+    cropped = full[:, top:top + height, left:left + width]
+    return cropped.reshape(leading + cropped.shape[1:])
+
+
+class PoissonConvPlacements(nnx.Module):
+    """Poisson convolutional sparse coding: integer counts stamped as opacity.
+
+    The latent is an integer activation field at *image* resolution,
+
+        a[k, y, x] ~ Poisson(rate),
+
+    where ``(y, x)`` is the pixel the glyph's centre lands on. Stamping it
+    through the dictionary gives the **optical depth**
+
+        tau(p) = sum_{k,y,x} a[k,y,x] * alpha_k(p - (y,x)),
+
+    a single transposed convolution, and the count enters the image through
+    ``tau`` and nowhere else: more spikes at a site mean a more opaque stamp,
+    saturating at ``1 - exp(-tau)``, never a different hue. Opacity is the one
+    quantity where "counts add" is meaningful -- alpha composes by addition in
+    log-transmittance, colour does not compose by addition at all.
+
+    Non-negativity of ``tau`` is free (counts are non-negative, alpha lies in
+    ``[0, 1]``), so no constraint is needed on the dictionary and glyphs cannot
+    cancel each other. That is what a Poisson rate downstream would require, and
+    it is why a learnable dictionary will need a non-negativity
+    reparameterization.
+
+    Unlike :class:`PoissonMarkedPlacements` there is no allocation simplex: an
+    explicit count per (glyph, location) leaves nothing to allocate, so both
+    Dirichlets -- and with them the unbounded sparse-simplex density and the
+    2364-deep stick-breaking recorded in ``notes/minsum-session-2026-07-29.md``
+    -- are gone. The firing rate is a plain learnable parameter rather than a
+    latent: with a single dictionary layer there is no second level of features
+    for a rate prior to be informative about, so being Bayesian about it would
+    only add an unidentified scalar and a KL term competing with the likelihood
+    over sparsity. That changes when a layer-1 rate field is predicted top-down.
+    """
+
+    def __init__(self, shape_dict: ShapeDictionary, expected_count: float=1.,
+                 img_h: int=80, img_w: int=80, *,
+                 rngs: Optional[nnx.Rngs]=None):
+        del rngs
+        self.expected_count = expected_count
+        self.height = img_h
+        self.shape_dict = shape_dict
+        self.width = img_w
+
+    @property
+    def num_features(self) -> int:
+        return self.shape_dict.shapes.shape[0]
+
+    @property
+    def num_sites(self) -> int:
+        return self.height * self.width * self.num_features
+
+    @property
+    def ink_kernel(self) -> Array:
+        return _ink_kernel(self.shape_dict.shapes)
+
+    def sample_counts(self):
+        """Draw the integer activation field, shape ``(1, H, W, K)``.
+
+        ``expected_count`` only *initializes* the rate, which then learns
+        freely. A scalar keeps the prior a homogeneous marked Poisson process
+        and so exactly translation-invariant; ``(K,)`` would still be safe (it
+        learns per-glyph frequency), but a per-site rate would destroy that
+        invariance and with it the equivariance :func:`_stamp` provides.
+        """
+        log_rate = numpyro.param(
+            "log_rate", jnp.log(self.expected_count / self.num_sites)
+        )
+        rate = jnp.broadcast_to(jnp.exp(log_rate),
+                                (1, self.height, self.width, self.num_features))
+        return numpyro.sample("a", dist.Poisson(rate).to_event(3))
+
+    def ink_field(self, counts) -> Array:
+        """Stamp the counts into an ``(..., H, W, 4)`` ink field.
+
+        Channels 0:3 hold premultiplied colour and channel 3 the optical depth.
+        This pair is the *only* interface the likelihood consumes, so warped or
+        genuinely deformable renderers (§6 of the design note) can replace this
+        method without anything downstream changing.
+        """
+        return jnp.clip(_stamp(counts, self.ink_kernel), 0., None)
+
+    def __call__(self, rngs=None):
+        del rngs
+        return self.ink_field(self.sample_counts())
+
+
 class BayesianMarioNettePlacements(nnx.Module):
     """Bayesian MarioNette-style glyph placements from dictionary matches.
 
@@ -407,3 +563,280 @@ def marionette_captcha_model(images, placements: BayesianMarioNettePlacements,
         if images is not None:
             numpyro.deterministic("residual", (images - mean) ** 2)
         return numpyro.sample("obs", likelihood, obs=images)
+
+def _ink_scale(opacity, schedule: str, sigma_bg: float, sigma_ink_init: float):
+    """Per-pixel Gaussian scale as a function of opacity ``A``.
+
+    Which *direction* ink should move the variance is an open empirical
+    question, so the map is pluggable:
+
+    ``endpoints``  ``(1 - A) sigma_bg^2 + A sigma_ink^2`` -- interpolates between
+        two scales, so the optimizer decides whether ink buys slack or steepness
+        rather than the config deciding in advance. Bounded at both ends. This is
+        also exactly the form the two-component mixture produces on its own.
+    ``affine``     ``sigma_bg^2 + k A``          -- slack where the ink is.
+    ``edge``       ``sigma_bg^2 + k A (1 - A)``  -- slack only at partial coverage.
+    ``inverse``    ``sigma_bg^2 + k / (A + eps)`` -- steepness where the ink is.
+        Singular at ``A = 0`` and assigns its *largest* variance to blank paper;
+        ``sigma_bg^2 + k (1 - A)`` is the bounded version of the same direction.
+
+    ``sigma_bg`` is a fixed constant, never learnable. The captcha backgrounds
+    are bit-identical to pure white in 95.3% of pixels, so a learnable
+    background scale has an unbounded optimum at zero and the optimizer will
+    find it.
+    """
+    variance_bg = sigma_bg ** 2
+    if schedule == "endpoints":
+        sigma_ink = jnp.exp(numpyro.param("log_sigma_ink",
+                                          jnp.log(sigma_ink_init)))
+        variance = (1. - opacity) * variance_bg + opacity * sigma_ink ** 2
+    elif schedule in ("affine", "edge", "inverse"):
+        coefficient = jnp.exp(numpyro.param(
+            "log_ink_variance", jnp.log(sigma_ink_init ** 2)
+        ))
+        if schedule == "affine":
+            variance = variance_bg + coefficient * opacity
+        elif schedule == "edge":
+            variance = variance_bg + coefficient * opacity * (1. - opacity)
+        else:
+            variance = variance_bg + coefficient / (opacity + 1e-3)
+    else:
+        raise ValueError(
+            f"Unknown ink variance schedule {schedule!r}; expected one of "
+            "'endpoints', 'affine', 'edge', 'inverse'."
+        )
+    return jnp.sqrt(variance)
+
+
+def _observation_df(opacity, observation_df, learn_df: bool=False,
+                    df_couples_to: str="opacity", depth=None):
+    """Per-pixel Student-t degrees of freedom, or ``None`` for a Normal.
+
+    ``observation_df`` accepts:
+
+    ``None``
+        Normal observations.
+    a scalar
+        a flat Student-t at that many degrees of freedom.
+    a pair ``(nu_bg, nu_ink)``
+        ``nu(A) = (1 - A) nu_bg + A nu_ink``, the same endpoint interpolation
+        :func:`_ink_scale` uses for the scale.
+
+    The pair form exists because ``nu`` is a statement about *uncertainty in the
+    scale*, and ours is wildly asymmetric. Student-t is a scale mixture of
+    normals, ``x | w ~ N(mu, sigma^2 / w)`` with ``w ~ Gamma(nu/2, nu/2)``, so
+    ``nu`` is an inverse measure of how heterogeneous the per-pixel noise scale
+    is believed to be -- equivalently, the conjugate Normal-Inverse-Gamma
+    posterior predictive is a Student-t whose df is the pseudo-count behind the
+    variance estimate. We effectively *know* ``sigma_bg`` (background residual is
+    exactly zero; 0.01 was picked for optimisation comfort against a 0.0011
+    quantization floor) and have never estimated ``sigma_ink`` at all. So heavy
+    tails belong where the scale is unknown -- ink, anti-aliased edges,
+    sub-pixel placement -- and near-Gaussian tails where it is known.
+
+    Interpolating the *excess* over 2 rather than ``nu`` itself keeps
+    ``nu > 2``, and with it a finite variance, by construction.
+
+    Coupling to opacity rather than to the spike count is deliberate. A
+    count-dependent ``nu`` would give the counts a second channel into the
+    likelihood through the log-normalizer -- violating the invariant of §2 that
+    counts reach the image only through optical depth -- and its incentive
+    points the wrong way: since ``-log p ~ ((nu+1)/2) log(r^2 / nu sigma^2)``
+    for a large residual, anything that raises ``nu`` raises the penalty, so a
+    model free to lower ``nu`` by *removing spikes* will do exactly that.
+    """
+    if observation_df is None:
+        return None
+    # Validate on the Python values: observation_df is a static config quantity,
+    # and comparing a traced array here would raise under jit.
+    if isinstance(observation_df, (int, float)):
+        raw = [float(observation_df)]
+    else:
+        raw = [float(v) for v in observation_df]
+    if len(raw) not in (1, 2):
+        raise ValueError("observation_df must be None, a scalar, or a "
+                         f"(nu_bg, nu_ink) pair; got {observation_df!r}")
+    if any(v <= 2. for v in raw):
+        raise ValueError("observation_df entries must exceed 2 for the "
+                         f"variance to be finite; got {observation_df!r}")
+    excess = jnp.asarray([v - 2. for v in raw])
+    if learn_df:
+        # Fixed by default, on the same reasoning as sigma_bg: anything the
+        # model can adjust to forgive its own errors, it eventually will.
+        excess = jnp.exp(numpyro.param("log_df_excess", jnp.log(excess)))
+    if excess.shape[0] == 1:
+        return 2. + jnp.broadcast_to(excess[0], opacity.shape)
+    if df_couples_to == "opacity":
+        return 2. + (1. - opacity) * excess[0] + opacity * excess[1]
+    if df_couples_to == "depth":
+        # nu = nu_0 + kappa * tau, the pair read as (nu_0, kappa). Unlike the
+        # opacity form this does not saturate: a pixel under many overlapping
+        # stamps keeps gaining degrees of freedom, which is the literal reading
+        # of "df counts the observations behind this pixel".
+        if depth is None:
+            raise ValueError("df_couples_to='depth' needs the optical depth")
+        return 2. + excess[0] + excess[1] * depth
+    raise ValueError(f"df_couples_to must be 'opacity' or 'depth', got "
+                     f"{df_couples_to!r}")
+
+
+def generate_poisson_convsc(placements, backgrounder: Optional[BackgroundDecoder]=None,
+                            ambient_depth: float=1e-4):
+    """Composite the ink field over the background into ``(foreground, background, opacity)``.
+
+    Returns per-pixel foreground colour, background colour and opacity
+    ``A = 1 - exp(-tau)``, all ``(..., H, W, ·)``. Both likelihoods in
+    :func:`poisson_convsc_model` are built from exactly this triple.
+
+    ``ambient_depth`` is a small optical-depth floor added before computing the
+    opacity -- the same device as the ``EPS`` added to ``ahat0`` in
+    ``poisson_hesc.py``. It matters more than its size suggests, for two
+    reasons.
+
+    Numerically, it keeps the mixture weight on the foreground component
+    strictly positive. ``MixtureSameFamily.log_prob`` stabilises by shifting
+    with ``m = max_k log p_k(x)`` taken over *all* components, including
+    zero-weight ones; at an inkless pixel whose data looks like ink, the
+    zero-weight foreground attains that max and the weighted background term
+    underflows to zero, giving ``log 0 = -inf``. A positive floor removes the
+    ``-inf`` that ``notes/minsum-session-2026-07-29.md`` Finding 3 records as
+    fatal to the objective.
+
+    Modelling-wise, it caps the cost of an unexplained ink pixel at roughly
+    ``-log(ambient_depth)`` nats rather than letting the confident background
+    component charge a quadratic ``(x - 1)^2 / 2 sigma_bg^2``. The gradient in
+    the opacity is then ``~1/A``, which is large exactly where ink is missing:
+    a strong, bounded signal to place a glyph rather than an enormous one.
+    """
+    # Beta(1, 1) is the uniform density on [0, 1], but unlike Uniform its
+    # parameters carry plain positive constraints and its support is fixed, so a
+    # mean-field guide can mirror it without proposing colours off-support.
+    color = numpyro.sample("color", dist.Beta(jnp.ones((3,)),
+                                              jnp.ones((3,))).to_event(1))
+    color = color[..., jnp.newaxis, jnp.newaxis, :]
+
+    ink = placements()
+    depth = ink[..., 3:]
+    # Premultiplied colour divided by optical depth is the depth-weighted mean
+    # ink colour. A Poisson process has no depth ordering -- its points are
+    # exchangeable -- so a weighted average is the right answer here, not an
+    # ordered "over". With a white dictionary this is identically 1.
+    #
+    # Where there is no ink the ratio is 0/0 and the mean ink colour is simply
+    # undefined; fall back to 1, so the foreground component reads "if this
+    # pixel were ink, it would be this image's ink colour". Falling back to 0
+    # (black) instead would make the foreground hypothesis wrong in a way that
+    # depends on the glyph dictionary rather than on the image.
+    tint = jnp.where(depth > 1e-6, ink[..., :3] / jnp.clip(depth, 1e-6, None),
+                     1.)
+    foreground = tint * color
+
+    if backgrounder is not None:
+        background = backgrounder()
+    else:
+        background = jnp.ones(depth.shape[:-1] + (1,))
+    background = jnp.broadcast_to(background, foreground.shape)
+
+    # Beer-Lambert: 1 - exp(-tau) is the probability that at least one glyph
+    # covers the pixel, i.e. one minus the Poisson void probability. It is the
+    # only channel through which the counts reach the image.
+    opacity = -jnp.expm1(-(depth + ambient_depth))
+    return foreground, background, opacity, depth
+
+
+def poisson_convsc_model(images, placements: PoissonConvPlacements,
+                         backgrounder: Optional[BackgroundDecoder]=None,
+                         ambient_depth: float=1e-4,
+                         df_couples_to: str="opacity",
+                         learn_df: bool=False,
+                         likelihood: str="blend",
+                         observation_df=None,
+                         plot_mean: bool=False,
+                         sigma_bg: float=0.01, sigma_ink_init: float=0.04,
+                         variance_schedule: str="endpoints"):
+    """Poisson convolutional sparse coding over the captcha dictionary.
+
+    Two likelihoods, both reading only the ink field and both with the same
+    mean, selected by ``likelihood``:
+
+    ``"mixture"``
+        A two-component per-pixel mixture, background and foreground, with
+        weights ``(1 - A, A)``. Those already sum to one -- ``1 - A = exp(-tau)``
+        *is* the void probability -- so unlike the 37-component version in
+        :func:`marionette_captcha_model` they need no renormalization.
+    ``"blend"`` (default)
+        One composited layer, ``A * fg + (1 - A) * bg``, whose per-pixel scale
+        comes from :func:`_ink_scale`.
+
+    **The blend is the default because the mixture cannot represent this data.**
+    The mixture's gradient properties are genuinely better -- its derivative in
+    ``A`` is ``r_fg / A - r_bg / (1 - A)``, a ratio of posterior
+    responsibilities that survives vanishing foreground/background contrast
+    where the blend's ``(x - mean)(fg - bg) / sigma^2`` does not -- but a
+    two-component mixture places no probability mass *between* its components,
+    and 95.1% of this dataset's ink pixels are intermediate, anti-aliased
+    values. A half-covered pixel scores ``log p = -116`` under the mixture
+    against ``+7.9`` under the blend, so the ELBO correctly concludes that
+    placing a glyph is harmful. Use ``"mixture"`` only for near-binary coverage.
+
+    ``observation_df`` selects the tail -- ``None`` for a Normal, a scalar for a
+    flat Student-t, or a ``(nu_bg, nu_ink)`` pair to interpolate the degrees of
+    freedom with opacity exactly as the scale is interpolated (see
+    :func:`_observation_df`). ``learn_df`` makes the endpoints learnable.
+    Either way the scale is rescaled so it still means a standard deviation and
+    only the tail changes. This matters
+    because the Normal's penalty is quadratic and unbounded: with
+    ``sigma_bg = 0.01`` a blank render costs on the order of ``1e6`` nats, which
+    makes the ELBO optimise *miss-avoidance* rather than render accuracy and
+    pushes the firing rate above where reconstruction is best. A Student-t's
+    penalty grows logarithmically in the residual, so a missed glyph is
+    expensive without being catastrophic.
+    """
+    placements = nnx_module("placements_p", placements)
+    if backgrounder is not None:
+        backgrounder = nnx_module("backgrounder_p", backgrounder)
+
+    batch_size = images.shape[0] if images is not None else 1
+    with numpyro.plate("batch", batch_size):
+        foreground, background, opacity, depth = generate_poisson_convsc(
+            placements, backgrounder, ambient_depth
+        )
+        if likelihood == "mixture":
+            sigma_ink = jnp.exp(numpyro.param("log_sigma_ink",
+                                              jnp.log(sigma_ink_init)))
+            scales = jnp.stack((jnp.asarray(sigma_bg), sigma_ink))[:, jnp.newaxis]
+            weights = jnp.concatenate((1. - opacity, opacity), axis=-1)
+            means = jnp.stack((background, foreground), axis=-2)
+            observation = SpatialMixtureSameFamily(
+                dist.Categorical(probs=weights),             # batch (B, H, W)
+                dist.Normal(means, scales).to_event(1),      # batch (B, H, W, 2)
+                reinterpreted_batch_ndims=2,                 # fold (H, W)
+            )
+        elif likelihood == "blend":
+            mean = opacity * foreground + (1. - opacity) * background
+            scale = _ink_scale(opacity, variance_schedule, sigma_bg,
+                               sigma_ink_init)
+            df = _observation_df(opacity, observation_df, learn_df,
+                                 df_couples_to, depth)
+            if df is None:
+                observation = dist.Normal(mean, scale).to_event(3)
+            else:
+                # StudentT's variance is scale^2 * df/(df - 2), so rescale to
+                # keep `scale` meaning a standard deviation: the whole
+                # ink-dependent variance schedule then transfers unchanged and
+                # only the *tail* differs. (The cost is that a heavier tail
+                # narrows the core at fixed variance; dropping this factor would
+                # instead preserve the core and inflate the variance.)
+                observation = dist.StudentT(
+                    df, mean, scale * jnp.sqrt((df - 2.) / df)
+                ).to_event(3)
+        else:
+            raise ValueError(f"Unknown likelihood {likelihood!r}; expected "
+                             "'mixture' or 'blend'.")
+
+        mean = observation.mean
+        if plot_mean:
+            numpyro.deterministic("mean", mean)
+        if images is not None:
+            numpyro.deterministic("residual", (images - mean) ** 2)
+        return numpyro.sample("obs", observation, obs=images)
