@@ -43,6 +43,31 @@ def trace_entry(site: Dict, log_p, log_q, observed):
         "ev": expected_value(site),
     }
 
+class posterior_mean(numpyro.primitives.Messenger):
+    """Replace every unobserved sample site's value with its distribution mean.
+
+    :class:`DoubleCVTracer` needs ``E_q[z]`` for each latent as the expansion
+    point of its control variate, and needs it generically -- without knowing
+    which family each site belongs to. Setting ``msg["value"]`` during
+    ``process_message`` short-circuits the draw exactly as ``substitute`` does,
+    so no randomness is consumed and the returned values stay differentiable in
+    the guide's parameters (which is what makes the ``CV1`` term a gradient
+    rather than a constant).
+
+    The site distribution must define ``.mean``, and its ``log_prob`` must
+    extend smoothly to that mean even when the support is discrete -- for
+    ``Poisson`` the mean is the rate and ``log_prob`` is
+    ``value * log(rate) - rate - gammaln(value + 1)``, which is defined for any
+    non-negative real.
+    """
+
+    def process_message(self, msg):
+        if msg["type"] != "sample" or msg.get("is_observed", False):
+            return
+        if msg["value"] is None:
+            msg["value"] = msg["fn"].mean
+
+
 class VariationalMixin(ABC):
     def log_weights(self, traces, mutables):
         raise NotImplementedError
@@ -439,6 +464,8 @@ class DoubleCVTracer(ParticleTracer):
     guide params (true for the graphical monad; batchvi keeps them elsewhere).
     """
     def __init__(self, *args, online=False, **kwargs):
+        self._guide_deps, self._model_deps = None, None
+        self._guide_properties, self._model_properties = {}, {}
         self._online = online
         super().__init__(*args, **kwargs)
 
@@ -450,17 +477,68 @@ class DoubleCVTracer(ParticleTracer):
         return {n: s["value"] for n, s in gtr.items()
                 if s["type"] == "sample" and not s.get("is_observed", False)}
 
+    def setup(self, guide_deps, model_deps, guide_trace, model_trace):
+        # Needed to tell reparameterized sites from the rest: the control
+        # variate applies only to the latter. A reparameterized site already
+        # carries a pathwise gradient through its sampled value, so running it
+        # through CV1 as well would count that gradient twice.
+        self._guide_deps, self._model_deps = guide_deps, model_deps
+        for name, site in guide_trace.items():
+            if site["type"] != "sample":
+                continue
+            self._guide_properties[name] = {
+                "cond_indep_stack": site["cond_indep_stack"],
+                "reparameterized": site["fn"].has_rsample,
+            }
+
+    def _cost_weight(self, name, traces):
+        """Per-cost weight: 1.0, or the observed mask when ``_online`` is set.
+
+        ``site["observed"]`` returns from the particle vmap with shape
+        ``(num_particles,)`` while ``log_p`` is ``(num_particles, batch)``, so
+        multiplying them directly only broadcasts when those two happen to be
+        equal -- and silently aligns the *batch* axis against the particle mask
+        when they are. Since ``not self._online`` makes the mask identically
+        True, the honest form is a scalar.
+        """
+        if not self._online:
+            return 1.
+        raise NotImplementedError(
+            "DoubleCVTracer(online=True) needs the observed mask broadcast "
+            "against costs of two different ranks -- (particles, batch) for the "
+            "particle traces and (batch,) for the expansion point in elbo_at. "
+            "Untested; use online=False."
+        )
+
     def loss(self, rng_key, param_map, particle_params, model, guide,
              *args, **kwargs):
         sg = jax.lax.stop_gradient
         # 1. K particles from the parent sampler
         traces, mutables = self(rng_key, param_map, particle_params, model,
                                 guide, *args, **kwargs)
-        logp_total = sum(site[1] * (site[3] | (not self._online)) for site in
-                         traces.values())    # (K, B)
-        logq_total = sum(site[2] * (site[3] | (not self._online)) for site in
-                         traces.values())    # (K, B)
+        # `observed` arrives from the particle vmap with shape (particles,)
+        # while the costs are (particles, batch). Broadcast it exactly as
+        # ParticleTracer.loss does, since downstream consumers -- notably
+        # GraphicalModelLearner._step_telemetry -- multiply the two directly.
+        for name, site in traces.items():
+            traces[name] = site | {
+                "observed": broadcast_observed(site["observed"],
+                                               site["log_p"].shape)
+            }
+        weight = {n: self._cost_weight(n, traces) for n in traces}
+        logp_total = sum(site["log_p"] * weight[name]
+                         for name, site in traces.items())       # (K, B)
+        logq_total = sum(site["log_q"] * weight[name]
+                         for name, site in traces.items())       # (K, B)
         f = logp_total - logq_total                              # (K, B)
+
+        nonreparam = [name for name, props in self._guide_properties.items()
+                      if not props["reparameterized"] and name in traces]
+        if not nonreparam:
+            # Everything reparameterizes; the plain pathwise ELBO is exact.
+            return -f.mean(axis=0).sum(), {"log_w": f.sum(axis=-1),
+                                           "mutables": mutables,
+                                           "trace": traces}
 
         # 2. variational means E_q[z] for every guide latent (live in phi)
         means = self._guide_means(rng_key, param_map, guide, args, kwargs)
@@ -469,36 +547,60 @@ class DoubleCVTracer(ParticleTracer):
 
         # 3. ELBO integrand and its z-gradient AT the means (Eq. 7)
         def elbo_at(values):
-            m_lp, _ = compute_log_probs(model, args, kwargs,
-                                        {**frozen, **values})
-            q_lp, _ = compute_log_probs(guide, args, kwargs,
-                                        {**frozen, **values})
-            fbar = sum(v * (traces[k][3] | (not self._online)) for k, v in
-                       m_lp.items()) -\
-                   sum(q_lp[k] * (traces[k][3] | (not self._online)) for k in
-                       values)  # (B,)
+            # The expansion point E_q[z] is deliberately OFF the support of a
+            # discrete latent -- that is the whole idea, since the control
+            # variate needs grad_z of a smooth extension of the integrand.
+            # numpyro validates samples by default here, and its
+            # `validate_sample` decorator masks out-of-support values to -inf,
+            # whose gradient is identically 0: the control variate silently
+            # becomes a no-op and the loss goes NaN. Switched off for this
+            # evaluation only, which recovers the intended smooth density --
+            # for Poisson, `v log(rate) - rate - gammaln(v + 1)`.
+            with numpyro.validation_enabled(False):
+                m_lp, _ = compute_log_probs(model, args, kwargs,
+                                            {**frozen, **values},
+                                            sum_log_prob=False)
+                q_lp, _ = compute_log_probs(guide, args, kwargs,
+                                            {**frozen, **values},
+                                            sum_log_prob=False)
+            fbar = sum(v * self._cost_weight(k, traces)
+                       for k, v in m_lp.items())                 # (B,)
+            fbar = fbar - sum(q_lp[k] * self._cost_weight(k, traces)
+                              for k in values if k in q_lp)
             return fbar.sum(), fbar
-        g, fbar = jax.grad(elbo_at, has_aux=True)(zbar)          # g: {n: (B, D)}
-        g = {k: sg(v) for k, v in g.items()}
+        g, fbar = jax.grad(elbo_at, has_aux=True)(zbar)
+        # Restrict the control variate to the non-reparameterized latents.
+        g = {k: sg(v) for k, v in g.items() if k in nonreparam}
         fbar = sg(fbar)                                          # (B,)
 
-        # 4. linear surrogate f~(z) and its (small) remainder
-        ftilde = fbar[None]                                      # (1, B) -> (K, B)
+        # 4. linear surrogate f~(z) and its (small) remainder. Each latent's
+        #    value is (K, B) + event_shape, so the inner product runs over
+        #    every axis past the particle and batch dims -- for the count field
+        #    that is (H, W, K_glyphs), not just a trailing feature axis.
+        ftilde = jnp.broadcast_to(fbar[None], f.shape)           # (K, B)
         for name, gz in g.items():
-            zk = traces[name][0]                                 # (K, B, D)
-            ftilde = ftilde + jnp.sum(gz[None] * (zk - zbar[name][None]),
-                                      axis=-1)
+            delta = traces[name]["value"] - zbar[name][None]
+            axes = tuple(range(2, delta.ndim))
+            term = gz[None] * delta
+            ftilde = ftilde + (term.sum(axis=axes) if axes else term)
         remainder = f - ftilde                                   # (K, B)
-        K = remainder.shape[0]
-        baseline = (remainder.sum(0, keepdims=True) - remainder) / (K - 1)
+        num_particles = remainder.shape[0]
+        baseline = ((remainder.sum(0, keepdims=True) - remainder) /
+                    max(num_particles - 1, 1))
         advantage = sg(remainder - baseline)                     # (K, B)
 
         # 5. surrogate: theta + value pathwise (entropy detached in phi);
-        #    CV2 REINFORCE on the remainder; CV1 exact grad_phi E_q[f~]
-        #    = g . grad_phi E_q[z]  (value 0, gradient is the reparam-like term)
-        cv2 = logq_total * advantage                             # (K, B)
-        cv1 = sum(jnp.sum(g[k] * (means[k] - sg(means[k])), axis=-1)
-                  for k in g)                                    # (B,)
+        #    CV2 REINFORCE on the remainder, scored only by the latents that
+        #    actually need it; CV1 exact grad_phi E_q[f~] = g . grad_phi E_q[z]
+        #    (value 0, gradient is the reparam-like term)
+        score = sum(traces[name]["log_q"] for name in nonreparam)
+        cv2 = score * advantage                                  # (K, B)
+        cv1 = 0.
+        for name, gz in g.items():
+            residual = means[name] - sg(means[name])             # 0, with grad
+            axes = tuple(range(1, residual.ndim))
+            term = gz * residual
+            cv1 = cv1 + (term.sum(axis=axes) if axes else term)  # (B,)
         elbo = (logp_total - sg(logq_total)) + (cv2 - sg(cv2))   # (K, B)
         loss = -(elbo.mean(axis=0) + cv1).sum()
 
