@@ -55,24 +55,13 @@ def _alpha_kernel(shapes: Array) -> Array:
 
 
 def _matched_filter(evidence: Array, kernel: Array) -> Array:
-    """Correlate ``evidence`` against each glyph on the generative stamp's grid.
+    """The adjoint of :func:`src.model.model._stamp`.
 
     ``score[q, k] = <evidence, glyph_k centred at q>``, at image resolution and
-    on exactly the grid :func:`src.model.model._stamp` uses. The shared geometry
-    is the point: a peak at ``(k, y, x)`` is a direct statement about the latent
-    site of the same name, where a correlation on any other grid would need its
-    own alignment argument.
-
-    This is called with the glyphs' raw ``alpha`` (see
-    :func:`_alpha_kernel`), which makes it the exact adjoint of a *coverage*
-    stamp. ``_stamp`` itself convolves ``-log(1 - alpha)`` so that the
-    downstream ``1 - exp(-tau)`` is exact alpha compositing, so the two are no
-    longer adjoint in the strict sense -- identical convolution structure and
-    crop, different radial weighting. Coverage is the better detection statistic
-    anyway, since image ink *is* a coverage fraction: on this dataset the argmax
-    of the score field recovers the correct glyph identity 100% of the time.
-    Switch this kernel to ``-log(1 - alpha)`` if exact adjointness is ever
-    wanted for its own sake.
+    on exactly the grid the generative stamp uses. Being the adjoint is the
+    whole point: ``Phi^T x`` is the matched filter *for this decoder*, so a peak
+    at ``(k, y, x)`` is a direct statement about the latent site of the same
+    name. A correlation on any other grid would need its own alignment argument.
 
     This is also the first step of every convolutional sparse coding algorithm
     -- matching pursuit and ISTA both begin by correlating the residual with the
