@@ -109,7 +109,29 @@ def _ink_kernel(shapes: Array) -> Array:
     ``O`` its *input* channels (the ``K`` dictionary features).
     """
     alpha, rgb = _dictionary_alpha_rgb(shapes)
-    ink = jnp.concatenate((rgb * alpha, alpha), axis=-1)  # (K, kh, kw, 4)
+    # Premultiply by the glyph's *hue*, not its raw RGB. `_rgba_shape_transform`
+    # derives alpha as ``file_alpha * max(RGB)`` while leaving RGB untouched, so
+    # on a glyph's support ``rgb.max(-1)`` equals ``alpha`` exactly: the
+    # anti-alias ramp is present in both channels. Premultiplying by raw RGB and
+    # then dividing back out (``tint = premult / depth`` in
+    # :func:`generate_poisson_convsc`) recovers that ramp *as the foreground
+    # colour*, so the anti-aliasing gets applied twice -- once as opacity and
+    # once as colour. Measured on glyph 'A', edge pixels came out at
+    # ``tint = 0.14`` against 0.996 at the core, i.e. the foreground was
+    # 0.14 * color rather than color.
+    #
+    # Invisible for a single stamp (0.015 too light at the edge) but severe once
+    # opacity accumulates: at four overlapping spikes the composite landed at
+    # 0.610 where a correct alpha-composite gives 0.860 -- a dark fringe around
+    # every glyph, and the converged model runs at a total rate near 4.
+    #
+    # Normalizing to unit hue puts the ramp in alpha alone, so
+    # ``1 - exp(-tau)`` applies it exactly once. A white mask gives hue == 1 and
+    # ``fg == color``; a genuinely coloured anti-aliased glyph gives its pure
+    # chromaticity, with the ramp still entirely in alpha.
+    peak = rgb.max(axis=-1, keepdims=True)
+    hue = jnp.where(peak > 0., rgb / jnp.clip(peak, 1e-6, None), 1.)
+    ink = jnp.concatenate((hue * alpha, alpha), axis=-1)  # (K, kh, kw, 4)
     return jnp.moveaxis(ink, 0, -1)
 
 
