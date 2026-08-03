@@ -5,5 +5,5 @@ transform2:
   _target_: optax.apply_if_finite
   inner:
     _target_: optax.adamw
-    learning_rate: 1e-4
+    learning_rate: 1e-3
   max_consecutive_errors: 5
