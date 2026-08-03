@@ -1,0 +1,102 @@
+defaults:
+  - placements/shaper/shape_dict@placements.shape_dict: sandbox
+
+_target_: src.model.model.poisson_convsc_model
+_partial_: true
+backgrounder: null
+
+# Single composited layer under a Gaussian: mean = A*fg + (1-A)*bg.
+#
+# The two-component mixture was the default until measurement killed it. Its
+# gradient properties are genuinely better (a responsibility ratio that survives
+# low fg/bg contrast), but a 2-component mixture puts NO probability mass
+# between its components, and 95.1% of this dataset's ink pixels are exactly
+# such intermediate, anti-aliased values (see section 0 of the design note). A
+# half-covered pixel scores log p = -116 under the mixture against +7.9 under
+# the blend, so the ELBO correctly concluded that placing a glyph is harmful and
+# every gradient estimator we tried faithfully reported that. See section 15.
+#
+# Switch to "mixture" only for data whose coverage is near-binary.
+likelihood: blend
+
+# Only consulted when likelihood == "blend"; under the mixture the ink-dependent
+# variance is derived rather than scheduled. See _ink_scale for the menu.
+variance_schedule: endpoints
+
+# FIXED, never learnable. The captcha backgrounds are bit-identical to pure
+# white in 95.3% of all pixels, so the residual background variance is exactly
+# zero and a learnable background scale has an unbounded optimum at 0 -- the
+# optimizer will find it and the likelihood will diverge. 0.01 is ~2.5x the
+# 8-bit quantization floor of 1/(255*sqrt(12)) = 0.0011: loose enough not to
+# detonate on early misplacements, tight enough that blank canvas is not free.
+sigma_bg: 0.01
+
+# Initial foreground scale, learned from here.
+sigma_ink_init: 0.04
+
+# Observation tail. null -> Normal; a number -> Student-t with that many degrees
+# of freedom, rescaled so sigma_bg/sigma_ink keep their meaning as standard
+# deviations and only the tail changes.
+#
+# Why this exists: the Normal's penalty is quadratic and unbounded, so at
+# sigma_bg = 0.01 a blank render costs ~1e6 nats. Section 17 measured the
+# consequence -- the ELBO buys insurance against blank renders at the price of
+# over-inking, peaking at log_total_q = 1.74 (peak lambda 5.7, A = 0.997, fully
+# opaque) while reconstruction is best at 1.0-1.3, on data whose ink is 95%
+# INTERMEDIATE coverage. A Student-t penalty grows logarithmically in the
+# residual instead: a missed glyph stays expensive without being catastrophic.
+#
+# df = 3 keeps the variance finite (needs df > 2) while being decidedly
+# heavy-tailed. Fixed rather than learnable, like sigma_bg: a learnable df has
+# an incentive to run to heavy tails simply to forgive its own errors.
+# (nu_0, kappa) with df_couples_to: depth, i.e. nu(tau) = 2.5 + 2.0 * tau.
+#
+# Degrees of freedom rise with the alpha-weighted spike count touching the
+# pixel -- literally "df = the number of observations behind this estimate",
+# which is where the frequentist reading of df comes from. Few spikes touching
+# a pixel means an uncertain prediction and a fat tail; many spikes means a
+# well-determined one and a near-Normal.
+#
+# It matters most where the model is WRONG: a pixel the model left blank but
+# the data inked has tau ~ 0, so it gets the fattest tail and its (large)
+# residual is forgiven. Coupling the other way -- fat tails on ink, which is
+# where sigma is least known -- puts the forgiving tail exactly where the
+# outliers are not, and section 20 measured that failing.
+#
+# Section 21 swept this: it is the only family that lands the ELBO peak exactly
+# on the reconstruction optimum. Strength matters more than which variable you
+# couple to; too aggressive (nu -> 30) overshoots. A flat scalar (e.g. 3.0)
+# remains a solid fallback with slightly tighter standard errors.
+observation_df: [2.5, 4.0]
+
+# How a (nu_0, nu_1) PAIR in observation_df is read. Ignored for a scalar.
+#   opacity: nu(A)   = (1-A) nu_0 + A nu_1        -- saturates with A
+#   depth:   nu(tau) = nu_0 + kappa tau, pair = (nu_0, kappa) -- unbounded, the
+#            literal "df counts the observations behind this pixel" reading,
+#            since tau is the spike count weighted by glyph alpha.
+df_couples_to: depth
+
+# Make the degrees of freedom learnable. Off by default. nu is better
+# identified here than it usually is -- the Normal beats the t at small
+# residuals (-3.2 vs -2.8 nats at r = 0.01) while the t beats it enormously at
+# large ones (11.5 vs 1246 at r = 0.5), and 95% of pixels sit at near-zero
+# residual, so mode sharpness and tail forgiveness give an interior optimum.
+learn_df: false
+
+# Optical-depth floor, the analogue of poisson_hesc.py's EPS. Keeps the
+# foreground mixture weight strictly positive, which both removes a -inf in
+# MixtureSameFamily's log_prob and caps the cost of an unexplained ink pixel at
+# ~-log(ambient_depth) nats instead of a quadratic blow-up. See
+# generate_poisson_convsc.
+ambient_depth: 1.0e-4
+
+placements:
+  _target_: src.model.model.PoissonConvPlacements
+  # Initializes log_rate only; the rate then learns freely. Every image in the
+  # sandbox dataset carries exactly one character.
+  expected_count: 1.0
+  img_h: 80
+  img_w: 80
+  rngs:
+    _target_: flax.nnx.Rngs
+    default: 5678
