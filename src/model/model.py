@@ -131,7 +131,30 @@ def _ink_kernel(shapes: Array) -> Array:
     # chromaticity, with the ramp still entirely in alpha.
     peak = rgb.max(axis=-1, keepdims=True)
     hue = jnp.where(peak > 0., rgb / jnp.clip(peak, 1e-6, None), 1.)
-    ink = jnp.concatenate((hue * alpha, alpha), axis=-1)  # (K, kh, kw, 4)
+
+    # Optical depth is -log(1 - alpha), not alpha. Beer-Lambert is the right law
+    # for *superposing independent absorbers* but the wrong one for a single
+    # glyph's own anti-aliasing, which is coverage: 1 - exp(-alpha) maps a fully
+    # covered pixel to 0.632 rather than 1, which is the only reason more than
+    # one spike per site was ever needed. Coverage composes as
+    #
+    #     1 - prod_i (1 - alpha_i) = 1 - exp(sum_i log(1 - alpha_i)),
+    #
+    # so convolving -log(1 - alpha) makes the downstream 1 - exp(-tau) *exact*
+    # alpha compositing: one stamp gives A = alpha precisely, n stamps give
+    # 1 - (1 - alpha)^n, and alpha = 1 gives A = 1. Still one convolution, still
+    # non-negative since -log(1 - alpha) >= 0 on [0, 1), and §2's "counts add in
+    # log-transmittance" becomes literally true rather than a first-order
+    # approximation.
+    #
+    # This is what lets a count saturate the core without over-opacifying the
+    # edge -- the failure §23 measured, where tau = n * alpha scaled the whole
+    # ramp uniformly and cost 0.199 of edge error at four spikes.
+    #
+    # alpha is clipped below 1 because -log(0) diverges; 1 - 1e-3 caps a single
+    # stamp at A = 0.999 and its per-stamp depth at 6.9.
+    depth = -jnp.log1p(-jnp.clip(alpha, 0., 1. - 1e-3))
+    ink = jnp.concatenate((hue * depth, depth), axis=-1)  # (K, kh, kw, 4)
     return jnp.moveaxis(ink, 0, -1)
 
 
