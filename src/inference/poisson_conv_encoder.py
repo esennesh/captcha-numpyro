@@ -3,7 +3,13 @@
 ``poisson_convsc_model`` puts an integer activation field ``a[k, y, x]`` at
 *image* resolution, so the proposal over it is an ordinary image-to-image
 network: a stack of dilated convolutions from ``(B, H, W, 3)`` to
-``(B, H, W, K)`` log-rates, plus a pooled head for the global ink colour.
+``(B, H, W, K)`` log-rates, plus a head for the global ink colour.
+
+Both heads read the *image* for their location and the backbone only for a
+residual -- the rate head through a matched filter, the colour head through a
+coverage-weighted average. That is not a stylistic choice in either case: see
+:class:`PoissonRateHead` on the cold start and :class:`InkColorFinder` on the
+colour signal the normalized feature stack does not carry.
 
 That is the payoff of anchoring the generative model at image resolution. The
 MarioNette guide in :mod:`src.inference.captcha_encoder` has to spend a
@@ -43,8 +49,7 @@ import numpyro.distributions as dist
 from numpyro.contrib.module import nnx_module
 
 from src.data.dictionary import ShapeDictionary
-from src.inference.captcha_encoder import (MarioNetteColorFinder,
-                                           _valid_num_groups)
+from src.inference.captcha_encoder import _valid_num_groups
 from src.model.model import _dictionary_alpha_rgb
 
 
@@ -231,9 +236,168 @@ class PoissonRateHead(nnx.Module):
         return numpyro.sample("a", dist.Poisson(jnp.exp(log_rate)).to_event(3))
 
 
+class InkColorFinder(nnx.Module):
+    """Amortized ``q(color)``, located by a closed-form estimate off the image.
+
+    Same division of labour as :class:`PoissonRateHead`: a statistic computed
+    directly from the pixels sets the location, and the backbone features supply
+    only a residual.
+
+    This replaces :class:`~src.inference.captcha_encoder.MarioNetteColorFinder`,
+    which reads the colour out of ``backbone(x).mean(axis=(1, 2))`` alone. That
+    head is not *incapable* -- on the 2026-08-03 run it recovered the ink colour
+    to 0.027 mean absolute error, against a per-channel spread of 0.20-0.24, so
+    it was very nearly right. It is **fragile**, and on the 2026-08-04 run it
+    collapsed: ``E_q[color] = (0.522, 0.531, 0.517)`` for every image, identical
+    to five decimals across twelve held-out images and bit-identical across six
+    synthetic recolourings of one. Reconstructions came out grey, measured chroma
+    0.02 against 0.39-0.69 in the data, with identification and placement
+    perfect.
+
+    The trigger was elsewhere: the rate ran to 5.3 effective spikes per glyph,
+    painting fringe pixels at ``A = 0.94`` against a true 0.408, and
+    ``sigma_ink`` inflated to 0.200 -- at which point the colour term stopped
+    paying. That inflation is *caused* by the grey rather than causing it: with
+    the colour pinned to this head's own output the profiled optimum for
+    ``sigma_ink`` is 0.187, and with the colour correct it is 0.006. But the
+    collapse was available *because* of how this head
+    reads its input, and it is not recoverable by training: a least-squares probe
+    from those 64 pooled numbers to the true ink colour, fit on 150 images and
+    scored on 70, gets held-out ``R^2 = (-0.27, -0.76, -0.28)`` on the collapsed
+    backbone -- worse than predicting the dataset mean, so the constant really
+    was its optimum once it got there. Two properties make it a one-way door:
+
+    * ``_valid_num_groups(32, 32) == 32``, so the backbone's first ``GroupNorm``
+      is instance norm. A first-layer map is ``a * mask + b`` with the colour
+      amplitude in ``a``; normalizing per channel over space returns
+      ``sign(a) * (mask - mean) / std(mask)``, independent of ``|a|`` and ``b``.
+      Cross-channel amplitude ratios are hue, and only their signs survive.
+      Measured over the six recolourings, pooled-feature spread falls from 0.0127
+      at the input to 0.0015 after the stack; with the norms removed it rises to
+      0.119 instead. Colour reaches the head as a ~1% perturbation on features
+      whose job is something else.
+    * Nothing pushes back hard enough to climb out. :meth:`PoissonRateHead.scores`
+      uses deliberately colour-invariant evidence, so the backbone's one strong
+      gradient wants colour invariance. Adam's second moments on the collapsed run
+      put the gradient RMS at 9.1 on the rate head against 8.5e-3 on this head's
+      input layer -- three orders of magnitude, and ``clip_by_global_norm``
+      preserves the ratio.
+
+    Reading the colour off the pixels removes the failure mode rather than
+    re-tuning around it: the estimate below is exact to 0.002 with no fitting at
+    all, so there is no amortization gap left to collapse. Features are kept as an
+    input because a zero-initialised residual can only help, and because glyph
+    overlap is the one thing the closed form cannot see.
+    """
+
+    def __init__(self, backbone_channels: int=64,
+                 concentration_init: float=100., core_sharpness: float=8.,
+                 hidden_dim: int=128, max_log_concentration: float=11.5,
+                 min_concentration: float=1e-3,
+                 min_log_concentration: float=-2.3, prior_count: float=1e-2,
+                 *, rngs: nnx.Rngs):
+        self.concentration_init = concentration_init
+        self.core_sharpness = core_sharpness
+        self.max_log_concentration = max_log_concentration
+        self.min_concentration = min_concentration
+        self.min_log_concentration = min_log_concentration
+        self.prior_count = prior_count
+        # Zero-initialised output, so at step 0 the guide *is* the closed-form
+        # estimator at concentration_init and everything learned is a
+        # correction -- the same cold-start argument PoissonRateHead makes for
+        # its matched filter.
+        self.head = nnx.Sequential(
+            nnx.Linear(backbone_channels + 4, hidden_dim, rngs=rngs), nnx.relu,
+            nnx.Linear(hidden_dim, 4, kernel_init=nnx.initializers.zeros_init(),
+                       bias_init=nnx.initializers.zeros_init(), rngs=rngs),
+        )
+
+    def estimate(self, images: Float[Array, "B H W 3"]
+                 ) -> Tuple[Float[Array, "B 3"], Float[Array, "B 1"]]:
+        """Closed-form ink colour and ink mass, ``(B, 3)`` and ``(B, 1)``.
+
+        Inverting the model's own compositing over a white background: with
+        ``x_c = A c_c + (1 - A)``, a pixel reports the ink colour undiluted
+        exactly where ``A = 1``, so the estimator is the image averaged with
+        weights ``A_hat ** core_sharpness``, where ``A_hat = max_c (1 - x_c)``
+        proxies the coverage. Raising it to a power concentrates the average on
+        the glyph cores, which is where the colour is least diluted by paper.
+
+        ``A_hat`` underestimates ``A`` by ``1 - min_c c_c``, so a per-pixel
+        inversion ``1 - (1 - x_c) / A_hat`` would drive every colour to full
+        saturation -- grey ink would come out black. Weighting instead of
+        dividing avoids that: as ``core_sharpness`` grows the weight concentrates
+        on the fully covered pixels, where no correction is needed at all.
+
+        The one assumption is that glyph cores reach ``A = 1``. Note that
+        ``max_p A_hat`` is *not* a test of it -- it maxes out at
+        ``1 - min_c c_c``, so its dataset median of 0.808 says the inks are not
+        pure primaries, not that coverage is partial. The check that matters is
+        the fit itself: 0.002 mean absolute error against the core-pixel colour
+        over 88 images, which an unmet assumption would not survive. The white
+        background it also assumes is the same one
+        :meth:`PoissonRateHead.scores` already relies on.
+
+        A ``prior_count`` of paper at colour 0.5 is mixed in so the ratio stays
+        defined when a captcha carries no ink and the colour is genuinely
+        unidentified -- the estimate falls back to the prior mean, with the
+        concentration head free to go broad. This is defensive rather than
+        load-bearing on *this* dataset, where all 5000 images carry ink and only
+        0.2% peak below coverage 0.3, but a blank canvas is exactly the input a
+        ratio estimator has to survive.
+
+        Every operation is a weighted sum over pixels, so this is exactly as
+        translation-equivariant as the rest of the guide.
+        """
+        coverage = (1. - images).max(axis=-1, keepdims=True)
+        weight = coverage ** self.core_sharpness
+        mass = weight.sum(axis=(1, 2))                            # (B, 1)
+        color = ((weight * images).sum(axis=(1, 2)) + 0.5 * self.prior_count) / (
+            mass + self.prior_count
+        )
+        return color, mass
+
+    def __call__(self, features: Float[Array, "B H W C_feat"],
+                 images: Float[Array, "B H W 3"]) -> Float[Array, "B 3"]:
+        estimate, mass = self.estimate(images)
+        # The ink mass and the estimate are handed to the head explicitly: both
+        # are absolute per-image scales, which is the class of statistic the
+        # GroupNorm stack destroys, so pooled features cannot supply them. The
+        # mass is what tells the head whether to be confident at all.
+        summary = jnp.concatenate(
+            (features.mean(axis=(1, 2)), estimate,
+             jnp.log(mass + self.prior_count)), axis=-1,
+        )
+        correction = self.head(summary)
+
+        # Parameterized as (mean, concentration) rather than (c1, c0) so the
+        # closed form lands on the mean alone and the residual is a logit shift.
+        mean = jax.nn.sigmoid(
+            jax.scipy.special.logit(jnp.clip(estimate, 1e-4, 1. - 1e-4))
+            + correction[..., :3]
+        )
+        # Clipped for the same reason PoissonRateHead clips its log-rate: only to
+        # bound the tails. exp(11.5) = 99k caps the posterior sd at ~0.0016, and
+        # exp(-2.3) = 0.1 floors it at a Beta more spread out than uniform.
+        log_concentration = jnp.clip(
+            numpyro.param("log_color_concentration_q",
+                          jnp.log(jnp.asarray(self.concentration_init)))
+            + correction[..., 3:],
+            self.min_log_concentration, self.max_log_concentration,
+        )
+        concentration = jnp.exp(log_concentration)
+        numpyro.deterministic("color_estimate_q", estimate)
+        return numpyro.sample(
+            "color",
+            dist.Beta(mean * concentration + self.min_concentration,
+                      (1. - mean) * concentration + self.min_concentration
+                      ).to_event(1),
+        )
+
+
 def poisson_convsc_guide(images, backbone: PoissonConvBackbone,
                          placements: PoissonRateHead,
-                         color_finder: MarioNetteColorFinder,
+                         color_finder: InkColorFinder,
                          backgrounder: Optional[nnx.Module]=None):
     """Guide mirroring :func:`src.model.model.poisson_convsc_model`.
 
@@ -249,7 +413,7 @@ def poisson_convsc_guide(images, backbone: PoissonConvBackbone,
 
     with numpyro.plate("batch", images.shape[0]):
         features = backbone(images)
-        color_finder(features)
+        color_finder(features, images)
         if backgrounder is not None:
             backgrounder(features)
         placements(features, images)

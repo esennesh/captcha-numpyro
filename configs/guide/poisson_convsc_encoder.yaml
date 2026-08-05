@@ -1,0 +1,76 @@
+defaults:
+  - /model/placements/shaper/shape_dict@placements.shape_dict: sandbox
+
+_target_: src.inference.poisson_conv_encoder.poisson_convsc_guide
+_partial_: true
+backgrounder: null
+backbone:
+  _target_: src.inference.poisson_conv_encoder.PoissonConvBackbone
+  # Dilation, not downsampling: a stride-1 SAME stack keeps the proposal
+  # translation-equivariant like the prior, and keeps the rate field on exactly
+  # the image grid. 3x3 kernels at these dilations see 1 + 2*(1+2+4+8+16) = 63
+  # pixels per axis, which covers the 38x26 glyph frame a rate for glyph k at
+  # pixel p has to look at before it can say anything about whole characters.
+  hidden_dims: [32, 64, 64, 64, 64]
+  dilations: [1, 2, 4, 8, 16]
+  rngs:
+    _target_: flax.nnx.Rngs
+    default: 3456
+color_finder:
+  # NOT MarioNetteColorFinder, which reads the colour out of mean-pooled backbone
+  # features alone. That head was right to 0.027 on the 2026-08-03 run and
+  # collapsed to a constant grey for every image on 2026-08-04, once the rate blew
+  # up and the colour term stopped paying; on the collapsed backbone the held-out
+  # R^2 for decoding the ink colour from those pooled features is negative, so it
+  # cannot train its way back out. See InkColorFinder's docstring.
+  _target_: src.inference.poisson_conv_encoder.InkColorFinder
+  backbone_channels: 64
+  # Sharpness of the coverage weighting that locates the colour. Weight is
+  # A_hat ** this, so at 8 a pixel at 0.9 of peak coverage counts 0.43 as much as
+  # the peak and one at 0.5 counts 0.004: effectively an average over the glyph
+  # cores, where A ~ 1 and the ink colour is undiluted. Higher is less biased by
+  # anti-aliased fringe and noisier; lower washes the colour toward paper.
+  core_sharpness: 8.0
+  # Initial Beta concentration c1 + c0, i.e. the starting confidence. The true
+  # posterior over a global colour given the ~500 ink pixels of one captcha is
+  # genuinely tight -- sd ~ sigma_ink / sqrt(n) puts c1 + c0 in the hundreds, and
+  # the two trained runs landed at 394 and 584 -- but this only initializes, and the
+  # head predicts a per-image correction so a captcha that pins no colour can go
+  # broad. Starting an order of magnitude *below* the converged value is
+  # deliberate: overconfidence early is the expensive direction, since the KL
+  # penalises a sharp q sitting in the wrong place.
+  concentration_init: 100.0
+  rngs:
+    _target_: flax.nnx.Rngs
+    default: 5678
+placements:
+  _target_: src.inference.poisson_conv_encoder.PoissonRateHead
+  backbone_channels: 64
+  # Initializes log_total_q, the total rate mass the softmax allocates across
+  # all H*W*K sites. Deliberately NOT the model's prior expected_count of 1.0:
+  # this is the posterior's starting point, and the posterior is concentrated.
+  #
+  # log_total_q has to travel in absolute terms (the prior rate 4.3e-6 and the
+  # peak posterior rate are orders of magnitude apart, bridged by this one
+  # number), and Adam moves any single coordinate by at most ~lr per step, so
+  # starting far away wastes the whole run. The nonzero KL at initialisation is
+  # correct, not a defect: the posterior really is concentrated.
+  #
+  # exp(1.0) = 2.72, placing log_total_q at the ELBO optimum of +1.00 measured
+  # under the CURRENT objective (blend + StudentT nu(tau) = 2.5 + 2.0 tau).
+  # This value moved once already -- it was 4.5 for an optimum of +1.5 under the
+  # Normal tail -- so re-derive it from a sweep whenever the likelihood or the
+  # data changes. It is approximate in any case: the sweep grid resolves to
+  # ~0.2, and DSGD converges to 1.05-1.10 rather than exactly 1.00.
+  expected_count: 2.72
+  # Temperature on the standardized matched-filter scores, in units of standard
+  # deviations of the score field. Measured on this dataset the true site sits
+  # ~11.7 sd above the field mean, and gain 2.0 puts ~0.66 expected spikes on it
+  # with 90% of the mass in 2 sites -- concentrated enough that RLOO gets
+  # samples worth ranking. Learnable.
+  match_gain: 2.0
+  img_h: 80
+  img_w: 80
+  rngs:
+    _target_: flax.nnx.Rngs
+    default: 9012
