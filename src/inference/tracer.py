@@ -540,6 +540,21 @@ class DoubleCVTracer(ParticleTracer):
                                            "mutables": mutables,
                                            "trace": traces}
 
+        # Detaching log q is correct for a score-function site and wrong for a
+        # reparameterized one, so split the two halves and treat them differently
+        # in step 5. `ELBOTracer.log_weights` makes the same distinction site by
+        # site (tracer.py:214); this is the same rule, summed. Sites the guide
+        # never sampled -- `obs`, deterministics -- carry log_q = 0 and so fall
+        # harmlessly into the detached half.
+        pathwise = {name for name, props in self._guide_properties.items()
+                    if props["reparameterized"]}
+        logq_pathwise = sum(site["log_q"] * weight[name]
+                            for name, site in traces.items()
+                            if name in pathwise)                 # (K, B) or 0
+        logq_score = sum(site["log_q"] * weight[name]
+                         for name, site in traces.items()
+                         if name not in pathwise)                # (K, B) or 0
+
         # 2. variational means E_q[z] for every guide latent (live in phi)
         means = self._guide_means(rng_key, param_map, guide, args, kwargs)
         zbar = {k: sg(v) for k, v in means.items()}              # detached refs
@@ -589,10 +604,10 @@ class DoubleCVTracer(ParticleTracer):
                     max(num_particles - 1, 1))
         advantage = sg(remainder - baseline)                     # (K, B)
 
-        # 5. surrogate: theta + value pathwise (entropy detached in phi);
-        #    CV2 REINFORCE on the remainder, scored only by the latents that
-        #    actually need it; CV1 exact grad_phi E_q[f~] = g . grad_phi E_q[z]
-        #    (value 0, gradient is the reparam-like term)
+        # 5. surrogate: theta + value pathwise; CV2 REINFORCE on the remainder,
+        #    scored only by the latents that actually need it; CV1 exact
+        #    grad_phi E_q[f~] = g . grad_phi E_q[z] (value 0, gradient is the
+        #    reparam-like term)
         score = sum(traces[name]["log_q"] for name in nonreparam)
         cv2 = score * advantage                                  # (K, B)
         cv1 = 0.
@@ -601,7 +616,26 @@ class DoubleCVTracer(ParticleTracer):
             axes = tuple(range(1, residual.ndim))
             term = gz * residual
             cv1 = cv1 + (term.sum(axis=axes) if axes else term)  # (B,)
-        elbo = (logp_total - sg(logq_total)) + (cv2 - sg(cv2))   # (K, B)
+        # Only the score-function half of log q is detached. For those sites the
+        # explicit-parameter term E_q[grad_phi log q(z; phi)] is identically zero
+        # -- it is grad_phi of the normalization -- so dropping it is unbiased and
+        # sheds variance, and CV2's REINFORCE term already carries the whole
+        # integrand, entropy included.
+        #
+        # A reparameterized site is different: log q depends on phi through the
+        # sampled *value* as well, and that pathwise piece is the entropy
+        # gradient. It has nonzero expectation and must be kept. Detaching it
+        # deletes the only term rewarding a broad q, so a reparameterized site
+        # collapses to a point mass at the mode of log p -- measured on
+        # `color` (Beta, has_rsample) in the 2026-08-04 run, which converged to
+        # concentrations summing to 586 while sitting at the prior mean.
+        #
+        # Keeping log q live here is the plain pathwise gradient. Sticking the
+        # landing -- detaching only phi inside log q, keeping the value -- would
+        # cut variance further, but it needs a second guide pass per particle to
+        # recompute log q at frozen parameters, so it is not free.
+        elbo = ((logp_total - logq_pathwise - sg(logq_score))
+                + (cv2 - sg(cv2)))                               # (K, B)
         loss = -(elbo.mean(axis=0) + cv1).sum()
 
         return loss, {"log_w": f.sum(axis=-1), "mutables": mutables,
