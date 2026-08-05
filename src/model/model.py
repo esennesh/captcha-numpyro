@@ -667,28 +667,36 @@ def _observation_df(opacity, observation_df, learn_df: bool=False,
         ``nu(A) = (1 - A) nu_bg + A nu_ink``, the same endpoint interpolation
         :func:`_ink_scale` uses for the scale.
 
-    The pair form exists because ``nu`` is a statement about *uncertainty in the
-    scale*, and ours is wildly asymmetric. Student-t is a scale mixture of
-    normals, ``x | w ~ N(mu, sigma^2 / w)`` with ``w ~ Gamma(nu/2, nu/2)``, so
-    ``nu`` is an inverse measure of how heterogeneous the per-pixel noise scale
-    is believed to be -- equivalently, the conjugate Normal-Inverse-Gamma
-    posterior predictive is a Student-t whose df is the pseudo-count behind the
-    variance estimate. We effectively *know* ``sigma_bg`` (background residual is
-    exactly zero; 0.01 was picked for optimisation comfort against a 0.0011
-    quantization floor) and have never estimated ``sigma_ink`` at all. So heavy
-    tails belong where the scale is unknown -- ink, anti-aliased edges,
-    sub-pixel placement -- and near-Gaussian tails where it is known.
+    The pair form was motivated by ``nu`` as a statement about *uncertainty in
+    the scale*: Student-t is a scale mixture of normals,
+    ``x | w ~ N(mu, sigma^2 / w)`` with ``w ~ Gamma(nu/2, nu/2)``, so ``nu``
+    measures how heterogeneous the per-pixel noise scale is believed to be. Since
+    ``sigma_bg`` is effectively known and ``sigma_ink`` was never estimated, heavy
+    tails looked like they belonged on ink.
+
+    **That argument is wrong and §20 measured it wrong.** The catastrophic
+    residuals are not ink pixels whose scale is poorly known; they are pixels
+    where the model placed *no* ink and the data has ink. Those have ``A ~ 0``, so
+    a schedule with heavy tails on ink hands them the *light* tail -- the
+    forgiving tail lands exactly where the outliers are not. §21 reversed it:
+    ``nu`` should **rise** with coverage, fat-tailed on blank paper and
+    near-Normal on opaque ink, which is what ``[3.0, 10.0]`` now expresses.
 
     Interpolating the *excess* over 2 rather than ``nu`` itself keeps
-    ``nu > 2``, and with it a finite variance, by construction.
+    ``nu > 2``, and with it a finite variance, by construction. Note this applies
+    to *both* entries, so a ``depth`` pair reads as ``(nu_0, kappa + 2)``:
+    ``[2.5, 4.0]`` is ``nu = 2.5 + 2.0 tau``.
 
-    Coupling to opacity rather than to the spike count is deliberate. A
-    count-dependent ``nu`` would give the counts a second channel into the
-    likelihood through the log-normalizer -- violating the invariant of §2 that
-    counts reach the image only through optical depth -- and its incentive
-    points the wrong way: since ``-log p ~ ((nu+1)/2) log(r^2 / nu sigma^2)``
-    for a large residual, anything that raises ``nu`` raises the penalty, so a
-    model free to lower ``nu`` by *removing spikes* will do exactly that.
+    An earlier version of this docstring argued that coupling to the spike count
+    was unsound, on the grounds that ``-log p ~ ((nu+1)/2) log(r^2/nu sigma^2)``
+    at large residual, so raising ``nu`` raises the penalty and a model free to
+    lower ``nu`` by removing spikes would do so. The premise is the wrong limit:
+    95% of these pixels sit at *near-zero* residual, where the Normal beats the t
+    (-3.2 against -2.8 nats at ``r = 0.01``), so a higher ``nu`` is a *reward*.
+    The concern about counts reaching the likelihood through the log-normalizer as
+    well as through ``tau`` is real, though, and it is one reason §24 prefers the
+    opacity coupling -- ``A`` is a bounded function of ``tau``, so the second
+    channel saturates instead of growing without limit.
     """
     if observation_df is None:
         return None

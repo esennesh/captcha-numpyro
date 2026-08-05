@@ -56,13 +56,35 @@ placements:
   # starting far away wastes the whole run. The nonzero KL at initialisation is
   # correct, not a defect: the posterior really is concentrated.
   #
-  # exp(1.0) = 2.72, placing log_total_q at the ELBO optimum of +1.00 measured
-  # under the CURRENT objective (blend + StudentT nu(tau) = 2.5 + 2.0 tau).
-  # This value moved once already -- it was 4.5 for an optimum of +1.5 under the
-  # Normal tail -- so re-derive it from a sweep whenever the likelihood or the
-  # data changes. It is approximate in any case: the sweep grid resolves to
-  # ~0.2, and DSGD converges to 1.05-1.10 rather than exactly 1.00.
-  expected_count: 2.72
+  # exp(1.386) = 4.0: TWO expected spikes on each of the image's TWO glyphs.
+  #
+  # Re-derived in section 24 and then corrected in section 25, which is the
+  # version that matters. At a FIXED count, one spike per glyph is clearly best
+  # (E[MSE] 0.00037 at n=1 against 0.00088 at n=2) because since c1b95bf a single
+  # spike composites a glyph exactly. But the ELBO takes an EXPECTATION over
+  # q(a) = Poisson, and at lambda = 1 a Poisson puts 0.368 on n = 0, so 60% of
+  # samples miss at least one of the two glyphs. E_q[log p] therefore peaks at
+  # lambda = 2 per glyph, not 1:
+  #
+  #   lambda/glyph      0.5     1.0     1.5     2.0     2.5     3.0     5.3
+  #   E_q[log p]      62771   66970   68630   68989   68719   68179   65611
+  #   P(miss a glyph)  .845    .600    .396    .252    .157    .097    .010
+  #
+  # The extra spike is buying reliability of PRESENCE, not opacity, and it is
+  # bought at the cost of over-inking whenever the draw exceeds one. That tension
+  # is a property of the Poisson proposal rather than of any setting here; see
+  # section 25.
+  #
+  # Reading this number: it is the total rate summed over all H*W*K sites, so it
+  # is spikes per IMAGE, not per glyph. That distinction is easy to lose, and it
+  # only reduces to "spikes per glyph x glyphs" because the learned allocation is
+  # very nearly a delta -- measured, 97% of the mass lands within 1px of a correct
+  # site and 2 sites hold 90% of it. The 2026-08-04 run's log_total_q = 2.39 was
+  # therefore 5.3 spikes per glyph, not 11.
+  #
+  # Still only an initialization: the total learns freely, and the sweep grid is
+  # coarse. Re-derive whenever the likelihood, the renderer or the data changes.
+  expected_count: 4.0
   # Temperature on the standardized matched-filter scores, in units of standard
   # deviations of the score field. Measured on this dataset the true site sits
   # ~11.7 sd above the field mean, and gain 2.0 puts ~0.66 expected spikes on it

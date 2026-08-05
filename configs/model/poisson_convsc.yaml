@@ -32,7 +32,16 @@ variance_schedule: endpoints
 sigma_bg: 0.01
 
 # Initial foreground scale, learned from here.
-sigma_ink_init: 0.04
+#
+# Re-derived in section 24 after c1b95bf. With exact alpha compositing, a correct
+# colour and one spike per glyph, an oracle sweep over 96 images profiles the
+# optimum at 0.006 and measures the residual sd at inked pixels at 0.0102 -- so
+# 0.04 was ~5x high, and it lands next to sigma_bg because there is no systematic
+# edge error left for it to absorb. The 2026-08-04 run's converged 0.200 was not
+# evidence against this: pinning the colour to the grey that run proposed moves
+# the profiled optimum to 0.187, i.e. sigma_ink inflation was a symptom of the
+# colour collapse, not a measurement of ink noise.
+sigma_ink_init: 0.01
 
 # Observation tail. null -> Normal; a number -> Student-t with that many degrees
 # of freedom, rescaled so sigma_bg/sigma_ink keep their meaning as standard
@@ -49,32 +58,47 @@ sigma_ink_init: 0.04
 # df = 3 keeps the variance finite (needs df > 2) while being decidedly
 # heavy-tailed. Fixed rather than learnable, like sigma_bg: a learnable df has
 # an incentive to run to heavy tails simply to forgive its own errors.
-# (nu_0, kappa) with df_couples_to: depth, i.e. nu(tau) = 2.5 + 2.0 * tau.
 #
-# Degrees of freedom rise with the alpha-weighted spike count touching the
-# pixel -- literally "df = the number of observations behind this estimate",
-# which is where the frequentist reading of df comes from. Few spikes touching
-# a pixel means an uncertain prediction and a fat tail; many spikes means a
-# well-determined one and a near-Normal.
+# (nu_bg, nu_ink) with df_couples_to: opacity, i.e. nu(A) = 3 on blank paper
+# rising to 10 on opaque ink.
+#
+# Degrees of freedom rise with coverage: a pixel with little ink over it is an
+# uncertain prediction and gets a fat tail, an opaque one is well determined and
+# gets a near-Normal.
 #
 # It matters most where the model is WRONG: a pixel the model left blank but
-# the data inked has tau ~ 0, so it gets the fattest tail and its (large)
+# the data inked has A ~ 0, so it gets the fattest tail and its (large)
 # residual is forgiven. Coupling the other way -- fat tails on ink, which is
 # where sigma is least known -- puts the forgiving tail exactly where the
 # outliers are not, and section 20 measured that failing.
 #
-# Section 21 swept this: it is the only family that lands the ELBO peak exactly
-# on the reconstruction optimum. Strength matters more than which variable you
-# couple to; too aggressive (nu -> 30) overshoots. A flat scalar (e.g. 3.0)
-# remains a solid fallback with slightly tighter standard errors.
-observation_df: [2.5, 4.0]
+# Section 21 swept this and found nu(A) 3 -> 10 CO-EQUAL BEST with
+# nu(tau) = 2.5 + 2.0 tau: both land the ELBO peak exactly on the reconstruction
+# optimum, since tau and A are monotonically related and the choice between them
+# mostly rescales the strength. Too aggressive (nu -> 30) overshoots; a flat
+# scalar (e.g. 3.0) remains a solid fallback with tighter standard errors.
+#
+# Section 24 breaks that tie in favour of opacity, because c1b95bf changed what
+# tau means. Depth per fully-covered stamp went 1.0 -> 6.908, which multiplied nu
+# at a glyph core by 3.6 (4.5 -> 16.3 at one spike) with no config change at all.
+# And tau = -log(1 - A) is now UNBOUNDED, so a depth-coupled schedule's strength
+# depends on the 1 - 1e-3 alpha clip in _ink_kernel -- an implementation detail no
+# one would think to re-derive against. Coupling to A is bounded by construction
+# and scale-free in tau, so it survives the next change to the depth convention.
+# The equivalent depth setting, if that coupling is ever wanted back, is
+# [2.5, 2.29]: kappa = 2.0 rescaled by 0.999 / 6.908.
+observation_df: [3.0, 10.0]
 
 # How a (nu_0, nu_1) PAIR in observation_df is read. Ignored for a scalar.
+# NOTE both entries interpolate the *excess over 2*, so a depth pair reads as
+# (nu_0, kappa + 2) -- [2.5, 4.0] is nu = 2.5 + 2.0 tau, not 2.5 + 4.0 tau.
 #   opacity: nu(A)   = (1-A) nu_0 + A nu_1        -- saturates with A
-#   depth:   nu(tau) = nu_0 + kappa tau, pair = (nu_0, kappa) -- unbounded, the
-#            literal "df counts the observations behind this pixel" reading,
-#            since tau is the spike count weighted by glyph alpha.
-df_couples_to: depth
+#   depth:   nu(tau) = nu_0 + kappa tau, pair = (nu_0, kappa + 2) -- unbounded,
+#            the literal "df counts the observations behind this pixel" reading,
+#            since tau WAS the alpha-weighted spike count. Since c1b95bf it is
+#            -log(1 - A) instead, which is no longer a count and no longer
+#            bounded; see section 24.
+df_couples_to: opacity
 
 # Make the degrees of freedom learnable. Off by default. nu is better
 # identified here than it usually is -- the Normal beats the t at small
@@ -88,13 +112,21 @@ learn_df: false
 # MixtureSameFamily's log_prob and caps the cost of an unexplained ink pixel at
 # ~-log(ambient_depth) nats instead of a quadratic blow-up. See
 # generate_poisson_convsc.
+#
+# UNCHANGED by c1b95bf, deliberately, and section 24 says why: this is a floor at
+# tau = 0, and zero spikes is zero depth under either convention. A_min stays
+# 1 - exp(-1e-4) = 1e-4 and the cost cap stays 9.21 nats. It is the one quantity
+# in tau units that did NOT need re-deriving.
 ambient_depth: 1.0e-4
 
 placements:
   _target_: src.model.model.PoissonConvPlacements
-  # Initializes log_rate only; the rate then learns freely. Every image in the
-  # sandbox dataset carries exactly one character.
-  expected_count: 1.0
+  # Initializes log_rate only; the rate then learns freely. Sandbox captchas carry
+  # TWO characters each -- every filename has two, and every render shows two --
+  # and the ELBO wants ~2 expected spikes on each, because a Poisson at lambda = 1
+  # renders nothing 37% of the time. The previous 1.0 predated both facts. Mirror
+  # of the guide's PoissonRateHead.expected_count; see sections 24 and 25.
+  expected_count: 4.0
   img_h: 80
   img_w: 80
   rngs:
