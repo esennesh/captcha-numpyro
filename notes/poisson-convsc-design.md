@@ -1519,6 +1519,12 @@ log-transmittance" becomes literally true rather than a first-order approximatio
 It changes what `tau` means, so `ambient_depth`, `nu(tau) = 2.5 + 2.0 tau` and the
 converged `log_total_q` all need re-deriving, and it needs a retrain to evaluate.
 
+**Done in §24, which corrects this paragraph on two counts.** `ambient_depth` did
+*not* need re-deriving — it is a floor at `tau = 0`, and zero spikes is zero depth
+under either convention. And `sigma_ink_init`, which is not listed here, needed it
+most: 0.04 -> 0.01. The retrain is also where the prediction two paragraphs below
+finally resolved, in the direction predicted.
+
 ### Method note
 
 The first diagnosis of this attributed the whole fringe to the tint bug. That
@@ -1532,3 +1538,272 @@ A prediction that has *not* been confirmed: `sigma_ink` was expected to fall aft
 the fix, as independent evidence that it had been absorbing this systematic edge
 error as noise. At 800 steps it is identical across arms (0.0936 vs 0.0937), both
 still climbing from 0.04. Untested, not supported.
+
+---
+
+## 24. Re-deriving tau, and the colour bistability it exposed
+
+§23 closed by saying `ambient_depth`, `nu(tau)` and the converged `log_total_q` all
+needed re-deriving after c1b95bf, and that it needed a retrain to evaluate. The retrain
+(`2026-08-04_00-05-57`) came back with **perfect glyph identification and placement and
+a uniform grey ink colour** — reconstruction chroma 0.02 against 0.39–0.69 in the data.
+This section re-derives the three quantities and, on the way, explains the grey.
+
+Two of the three needed changing. One did not, and one was never wrong in the first
+place.
+
+### `observation_df` was never mis-set; `nu` still moved 3.6x
+
+`_observation_df` interpolates the **excess over 2** for *both* entries, so a `depth`
+pair reads `(nu_0, kappa + 2)`. `observation_df: [2.5, 4.0]` therefore is
+`nu = 2.5 + 2.0 tau` — exactly §21's measured default. There was no drift, and the
+config comment agreed with the value all along. (Read it as `2.5 + 4.0 tau`, as I first
+did, and every number downstream comes out wrong.)
+
+What *did* change is `tau`. Depth per fully-covered stamp went `1.0 -> 6.908`, so at one
+spike on one glyph:
+
+| | nu at a glyph core |
+|---|---|
+| pre-c1b95bf, `2.5 + 2.0 * 0.999` | 4.5 |
+| post-c1b95bf, `2.5 + 2.0 * 6.908` | 16.3 |
+
+3.6x more Normal than the schedule was tuned for, with no config change. Worse,
+`tau = -log(1 - A)` is now unbounded, so a depth-coupled schedule's strength depends on
+the `1 - 1e-3` alpha clip inside `_ink_kernel` — an implementation detail nobody would
+think to re-derive against.
+
+**Decision: `df_couples_to: opacity`, `observation_df: [3.0, 10.0]`.** §21 measured
+`nu(A) 3 -> 10` as co-equal best with `2.5 + 2.0 tau` (both landed the ELBO peak exactly
+on the reconstruction optimum) and observed that `tau` and `A` are monotonically related
+so the choice mostly rescales strength. That tie is now broken by invariance: `A` is
+bounded and its schedule is scale-free in `tau`, so it survives the next change to the
+depth convention. The equivalent depth setting, if wanted back, is `[2.5, 2.29]`.
+
+### `ambient_depth` did not need re-deriving
+
+The blanket claim in §23 was wrong about this one. `ambient_depth` is a floor at
+`tau = 0`, and zero spikes is zero depth under either convention, so `A_min` stays
+`1 - exp(-1e-4) = 1e-4` and the cost cap on an unexplained ink pixel stays 9.21 nats.
+Unchanged in meaning *and* value. Worth stating explicitly, because "everything in tau
+units is suspect" is the kind of heuristic that generates busywork.
+
+### The rate: 2.72 -> 2.0, and how to read `log_total_q`
+
+Method is §21's, with an oracle placement so opacity is the only thing moving: true
+glyph identity from the filename, matched-filter argmax location, closed-form ink
+colour, `sigma_ink` profiled out at every point since it is learnable. 96 images.
+(Rendering places the kernel directly at the oracle sites rather than running
+`conv_transpose` over 230,400 sites; the two agree bit-for-bit.)
+
+| spikes/glyph | 1 | 2 | 3 | 4 | 6 | blank |
+|---|---|---|---|---|---|---|
+| E[MSE] | **0.000370** | 0.000880 | 0.001567 | 0.002141 | 0.002952 | 0.026426 |
+| mean `A` on true ink | 0.792 | 0.863 | 0.899 | 0.921 | 0.946 | — |
+
+One spike wins by 2.4x, which is the whole point of c1b95bf: `A = alpha` exactly, at
+core and fringe alike. `expected_count: 2.72` is a leftover from the renderer where a
+single stamp reached only `A = 0.63`.
+
+**`log_total_q` is spikes per IMAGE, not per glyph.** It is the total rate summed over
+all `H*W*K` sites, and it reduces to "spikes per glyph x glyphs" only because the
+learned allocation is very nearly a delta. Measured on both checkpoints:
+
+| | `log_total_q` | mass within 1px of a correct site | sites holding 90% | spikes/glyph |
+|---|---|---|---|---|
+| 2026-08-03 | 1.434 | 101.7% | 1 | 2.13 |
+| 2026-08-04 | 2.393 | 97.2% | 2 | **5.32** |
+
+So the 08-04 run was at 5.3 spikes per glyph — fringe pixels at `A = 0.938` against a
+true 0.408 — not the 11 a naive reading of `exp(2.393)` gives. Sandbox captchas carry
+**two** glyphs, not one; the model config's `expected_count: 1.0` and its comment
+("exactly one character") were both wrong, independently of any of this.
+
+**Target: 2.0 on both sides** (`log_total_q = 0.693`) — **superseded by §25, which
+corrects this to 4.0.** The sweep above holds the count *fixed*; the ELBO takes an
+expectation over `q(a)`, and a Poisson at `lambda = 1` renders nothing 37% of the time.
+
+### `sigma_ink_init`: 0.04 -> 0.01
+
+With a correct colour at one spike per glyph, the profiled optimum is **0.006** and the
+residual sd at inked pixels is **0.0102**. So 0.04 was ~5x high. It lands next to
+`sigma_bg = 0.01` because exact compositing leaves no systematic edge error for it to
+absorb — which *is* the confirmation §23 predicted and could not find at 800 steps.
+
+The 08-04 run's converged 0.200 is not evidence against this. Pinning the colour to the
+grey that run proposed moves the profiled optimum to **0.187**. `sigma_ink` inflation was
+a symptom of the colour collapse, not a measurement of ink noise.
+
+### What the sweep did NOT find, and the colour
+
+The working hypothesis going in was that a mis-scaled `nu(tau)` rewarded over-inking:
+`nu` rises with `tau`, 95% of pixels sit at near-zero residual where higher `nu` scores
+better, so spikes buy density. **The sweep refutes it.** All eight tail schedules put the
+likelihood optimum at one spike per glyph, by thousands of nats, *including* with the
+colour pinned to grey:
+
+```
+                        n=1       n=2       n=3       n=4       n=6
+depth (2.5, 4.0)       +0.0   -5063.4   -5811.9   -6154.7   -6488.1
+opacity (3.0, 10.0)    +0.0   -4798.5   -5563.6   -5918.4   -6260.9
+flat 3.0               +0.0   -4664.6   -5406.3   -5739.4   -6053.8
+```
+
+So 5.3 spikes/glyph is **not the likelihood's preference** and the tau recalibration does
+not explain it. That is a smaller fix than §23 implied, and it leaves the over-inking
+attributable to the guide side — estimator or KL — not the objective.
+
+The colour, though, is now fully diagnosed, and it is not an amortization *ceiling*:
+
+| mean-pooled backbone features -> true ink colour | held-out `R^2` |
+|---|---|
+| untrained, random init | 0.86 / 0.67 / 0.41 |
+| 2026-08-03 | **0.993 / 0.994 / 0.993** |
+| 2026-08-04 | **-0.32 / -0.36 / -0.36** |
+
+The colour is present at initialization. The 08-03 run *sharpened* it and read the ink
+colour to 0.027 mean absolute error. The 08-04 run *destroyed* it, ending **below random
+init** — a trained invariance, not a missing capacity. Same architecture, same data,
+opposite outcomes: a bistability.
+
+Two properties make one of those basins absorbing. `_valid_num_groups(32, 32) == 32`, so
+the backbone's first `GroupNorm` is instance norm: a first-layer map is `a * mask + b`
+with the colour amplitude in `a`, and normalizing per channel over space returns
+`sign(a) * (mask - mean) / std(mask)`, independent of `|a|` and `b`. Cross-channel
+amplitude ratios *are* hue, and only their signs survive. And `PoissonRateHead.scores`
+uses deliberately colour-invariant evidence, so the shared backbone's one strong gradient
+wants colour invariance — Adam's second moments put the gradient RMS at 9.1 on the rate
+head against 8.5e-3 on the colour head's input layer, and `clip_by_global_norm` preserves
+the ratio. Once the features go, the head can only emit the dataset marginal, and the
+grey it emitted (0.522, 0.531, 0.517) is exactly that.
+
+**Fix: `InkColorFinder`**, which takes the colour off that competition entirely. `A_hat =
+max_c (1 - x_c)`, weight `A_hat ** 8`, average the image under it — the coverage-weighted
+mean, which reports the ink colour undiluted at pixels where `A = 1`. Exact to **0.002**
+with no fitting, `R^2 = 0.9998`, and it recovers grey and black ink correctly, which a
+per-pixel inversion `1 - (1 - x_c)/A_hat` would drive to full saturation. The learned
+part is a zero-initialised logit residual plus a per-image concentration, so step 0 *is*
+the closed form. Same division of labour `PoissonRateHead` already uses for placement:
+the statistic comes from the pixels, the network corrects it.
+
+### Also fixed: `DoubleCVTracer` deleted the entropy gradient
+
+`elbo = (logp_total - sg(logq_total)) + (cv2 - sg(cv2))` detached `log q` for *every*
+site. That is right for a score-function site — `E_q[grad_phi log q]` is identically zero,
+so dropping it is unbiased and sheds variance, and CV2 already carries the whole
+integrand. It is wrong for a reparameterized one, where `log q` also depends on `phi`
+through the sampled *value*, and that pathwise piece is the entropy gradient.
+`ELBOTracer.log_weights` had always made the distinction site by site; `DoubleCVTracer`
+did not.
+
+Checked against a 200k-sample reference on a Beta + Poisson toy:
+
+| | `d(ELBO)/d log_a` | `d log_b` |
+|---|---|---|
+| reference | -0.3140 | +0.5083 |
+| old (log q fully detached) | **+0.1730** | +0.2742 |
+| fixed | -0.3324 | +0.5626 |
+
+A **sign error** on the concentration: the old estimator pushed `q` sharper when the ELBO
+wanted it broader. That explains the *confidence* of the colour collapse (`c1 + c0 = 586`,
+pinned at the prior mean) but not its location, and note it cannot be the trigger for the
+regression — the tracer was identical in both runs, and the 08-03 colour was fine.
+
+### Method notes
+
+Two probes in this work were wrong in the way §23's method note warns about, both by
+using `1 - max_c x_c` where coverage is `max_c (1 - x_c)`. The first reported that 27% of
+the dataset carries no ink (it is ~0%; all 5000 images have ink). The second built
+synthetic recolourings whose "cores" were only half covered, which annihilated the very
+assumption under test and made a correct estimator look 0.43 off. `max_p A_hat` is *not*
+a test of `A = 1` either — it maxes out at `1 - min_c c_c`, so its dataset median of
+0.808 says the inks are not pure primaries, not that coverage is partial.
+
+The general lesson is the same one §23 recorded, and it keeps recurring: when a probe
+disagrees with a derivation, suspect the probe's construction before the code.
+
+---
+
+## 25. A Poisson cannot say "exactly one stamp", and what that costs
+
+Prompted by an observation on the retrained notebook: in 5 of 30 validation images the
+two glyphs appear to have *slightly different colours*, even though `color` is a single
+global latent per image and the data's two glyphs are bit-identical in colour (measured:
+per-glyph colour difference is exactly 0.000 in all 30).
+
+**It is not a colour difference.** Under the blend, `1 - x = A (1 - c)`, so two glyphs of
+the same colour at different opacity give *parallel* absorption vectors. Measured on the
+five affected figures:
+
+| fig | cos angle between the glyphs' absorption | hue err g1 | hue err g2 | A(g1) | A(g2) | ratio |
+|---|---|---|---|---|---|---|
+| 00 | 1.00000 | 1.54° | 1.52° | 0.691 | 0.921 | 1.334 |
+| 01 | 1.00000 | 0.08° | 0.00° | 0.890 | 0.667 | 0.749 |
+| 11 | 0.99999 | 1.24° | 1.35° | 0.688 | 0.914 | 1.327 |
+| 17 | 0.99999 | 1.62° | 1.34° | 0.676 | 0.899 | 1.328 |
+| 28 | 1.00000 | 0.66° | 0.71° | 0.681 | 0.907 | 1.333 |
+
+Identical hue to five decimal places, and each glyph within 1.6° of the *true* ink colour.
+The whole effect is opacity, and the ratio is **4/3** (or its reciprocal) in every case.
+Four particles, `predictions["obs"]["ev"].mean(axis=0)`: one glyph received a spike in all
+four draws and the other in three. Desaturating toward white by 25% reads as a paler
+colour, so the perception is correct and its cause is not.
+
+### The structural part
+
+`q(a)` is a product of Poissons, and
+
+```
+max_lambda P(n = 1) = 1/e = 0.368,   at lambda = 1
+```
+
+A Poisson **cannot** concentrate on one. So per-glyph opacity variance is irreducible in
+this parameterization, not an artifact of undertraining. Worse, it interacts with c1b95bf:
+
+```
+E_n[A] = 1 - E[exp(-n d)] = 1 - exp(-lambda (1 - e^-d)) = 1 - exp(-lambda alpha)
+```
+
+which is **exactly the pre-c1b95bf saturation curve** with `lambda` in place of `n`. The
+exact-compositing property survives a fixed `n = 1` and is given back in expectation: the
+`lambda` solving `E[A] = alpha` is 6.91 at a core and 1.28 at a fringe, so no single rate
+works. §23's structural failure returns, one level up.
+
+### Consequence for the rate: 2.0 -> 4.0
+
+§24 derived `expected_count: 2.0` from a fixed-count sweep. That is the wrong functional.
+Marginalising the count over the oracle placement, 64 images, recalibrated tail:
+
+| lambda/glyph | 0.5 | 1.0 | 1.5 | **2.0** | 2.5 | 3.0 | 4.0 | 5.3 | 7.0 |
+|---|---|---|---|---|---|---|---|---|---|
+| `E_q[log p]` | 62771 | 66970 | 68630 | **68989** | 68719 | 68179 | 66944 | 65611 | 64462 |
+| MSE, per sample | .01570 | .00977 | .00631 | .00433 | .00323 | .00266 | **.00233** | .00252 | .00294 |
+| MSE of `E[image]` | .00953 | .00357 | .00148 | .00089 | **.00087** | .00106 | .00158 | .00221 | .00282 |
+| P(miss a glyph) | .845 | .600 | .396 | .252 | .157 | .097 | .036 | .010 | .002 |
+
+`E_q[log p]` peaks at `lambda = 2` per glyph, so **4.0 total**. The second spike buys
+reliability of *presence*, not opacity: at `lambda = 1`, 60% of samples miss at least one
+glyph, and a missed glyph is expensive even with the fat background tail. It is paid for
+by over-inking whenever the draw exceeds one — the two failure modes are traded against
+each other and cannot both be avoided.
+
+This also substantially closes the gap §24 left open. The 2026-08-04 run's 5.3
+spikes/glyph is not 5x the optimum, it is ~2.5x, and note that 4.0 total is essentially
+the 2026-08-03 run's converged 4.2. What looked like a mystery was mostly my having
+derived the target from the wrong functional.
+
+### What would actually fix it
+
+The proposal need not be Poisson — `q` is free, only the model's prior is Poisson. A
+Bernoulli or Binomial proposal over `{0, 1}` (or a small truncated count) would put ~1.0
+on `n = 1`, removing the opacity variance, keeping `A = alpha` exact per sample, and
+paying only a bounded KL against the Poisson prior. `ELBOTracer` already routes
+non-reparameterized sites through its score-function surrogate, so nothing downstream
+changes. Untested, and it is the obvious next experiment.
+
+Two smaller notes. The `1 - e^-1` presence problem is also an argument for the sub-pixel
+offsets of §6: part of what extra spikes are currently buying is coverage of placement
+uncertainty. And for reading reconstructions, `ev.mean(axis=0)` blends across posterior
+count draws, so a genuinely uncertain glyph renders pale rather than sometimes-absent —
+plotting a single particle, or the per-particle spread, shows what the posterior actually
+believes.
