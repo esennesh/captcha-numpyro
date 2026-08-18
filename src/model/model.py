@@ -63,10 +63,9 @@ def _dictionary_support_masks(shapes: Array, threshold: float = 0.0) -> Array:
     """Per-glyph 0/1 support masks, shaped ``(K, kh, kw, 1)``.
 
     A glyph "touches" a pixel wherever its alpha support exceeds ``threshold``.
-    The alpha source follows the same convention as
-    :meth:`BayesianMarioNettePlacements.render`: the explicit alpha channel for
-    RGBA glyphs, the sole channel for single-channel glyphs, and the per-pixel
-    channel max as a brightness proxy for RGB glyphs.
+    The alpha source comes from the explicit alpha channel for RGBA glyphs, the
+    sole channel for single-channel glyphs, and the per-pixel channel max as a
+    brightness proxy for RGB glyphs.
     """
     dictionary = _as_nhwc_dictionary(shapes)
     if dictionary.shape[-1] == 4:
@@ -493,8 +492,7 @@ def poisson_convsc_model(images, placements: PoissonConvPlacements,
     ``"mixture"``
         A two-component per-pixel mixture, background and foreground, with
         weights ``(1 - A, A)``. Those already sum to one -- ``1 - A = exp(-tau)``
-        *is* the void probability -- so unlike the 37-component version in
-        :func:`marionette_captcha_model` they need no renormalization.
+        *is* the void probability -- they need no renormalization.
     ``"blend"`` (default)
         One composited layer, ``A * fg + (1 - A) * bg``, whose per-pixel scale
         comes from :func:`_ink_scale`.
