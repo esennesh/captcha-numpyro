@@ -215,16 +215,6 @@ class PoissonConvPlacements(nnx.Module):
     cancel each other. That is what a Poisson rate downstream would require, and
     it is why a learnable dictionary will need a non-negativity
     reparameterization.
-
-    Unlike :class:`PoissonMarkedPlacements` there is no allocation simplex: an
-    explicit count per (glyph, location) leaves nothing to allocate, so both
-    Dirichlets -- and with them the unbounded sparse-simplex density and the
-    2364-deep stick-breaking recorded in ``notes/minsum-session-2026-07-29.md``
-    -- are gone. The firing rate is a plain learnable parameter rather than a
-    latent: with a single dictionary layer there is no second level of features
-    for a rate prior to be informative about, so being Bayesian about it would
-    only add an unidentified scalar and a KL term competing with the likelihood
-    over sparsity. That changes when a layer-1 rate field is predicted top-down.
     """
 
     def __init__(self, shape_dict: ShapeDictionary, expected_count: float=1.,
