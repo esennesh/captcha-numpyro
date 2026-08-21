@@ -42,15 +42,274 @@ supports before checking for a parameter-free base.
 from typing import Optional, Union
 
 import jax
+import jax.numpy as jnp
+import numpy as np
+from jax.typing import ArrayLike
+from jaxtyping import Array, Float, Int
 
 from numpyro.distributions import constraints
 from numpyro.distributions.discrete import CategoricalLogits, CategoricalProbs
 from numpyro.distributions.distribution import Distribution
 from numpyro.distributions.mixtures import MixtureSameFamily
-from numpyro.distributions.util import sum_rightmost, validate_sample
+from numpyro.distributions.util import (lazy_property, promote_shapes,
+                                        sum_rightmost, validate_sample)
+from numpyro.util import is_prng_key
 
-__all__ = ["SpatialMixtureSameFamily"]
+from . import layers
+import src.utils as utils
 
+__all__ = ["CompleteGaussianMrf", "PartitionedGaussianMrf",
+           "SpatialMixtureSameFamily"]
+
+
+def _apply_precision(v, tau, kv, kh):
+    """Apply the GMRF precision to ``v``, batching over leading dimensions.
+
+    ``v`` is ``(*batch, H, W, C)``, ``tau`` is ``(*batch, H, W)``, ``kv`` is
+    ``(*batch, H-1, W)`` and ``kh`` is ``(*batch, H, W-1)``. Every index below
+    counts from the RIGHT, so any number of leading batch axes ride along.
+    """
+    tau, kv, kh = tau[..., None], kv[..., None], kh[..., None]
+    fv = kv * (v[..., 1:, :, :] - v[..., :-1, :, :])
+    fh = kh * (v[..., :, 1:, :] - v[..., :, :-1, :])
+    zv = jnp.zeros_like(fv[..., :1, :, :])
+    zh = jnp.zeros_like(fh[..., :, :1, :])
+    lap = (jnp.concatenate((zv, fv), axis=-3)
+           - jnp.concatenate((fv, zv), axis=-3)
+           + jnp.concatenate((zh, fh), axis=-2)
+           - jnp.concatenate((fh, zh), axis=-2))
+    return tau * v + lap
+
+def _quadratic_form(v, tau, kv, kh):
+    """``v' Q v``, reduced over the event dimensions only, so the batch stays."""
+    return jnp.sum(v * _apply_precision(v, tau, kv, kh), axis=(-3, -2, -1))
+
+def _logdet_scan(tau, kv, kh):
+    """``log det Q`` for ONE unbatched field, by block Cholesky as a scan.
+
+    Ordered row by row, ``Q`` is block tridiagonal with ``H`` diagonal blocks of
+    size ``W x W`` and sub-diagonal blocks that are themselves diagonal, because
+    pixel ``(y, x)`` couples only to ``(y+1, x)``. Block Cholesky is then a
+    recursion whose every step has the same shape, so it is a ``lax.scan``:
+
+        C_1 = chol(A_11);  C_i = chol(A_ii - B_i B_i'),  B_i = A_i,i-1 C_i-1^-T
+
+    This is EXACT, not an approximation, and its cost is ``H * W^3`` flops. The
+    sparsity pattern never enters, because a deleted edge is a zero weight and
+    the pattern is the lattice whatever the render does.
+    """
+    diag = tau
+    diag = diag.at[:-1, :].add(kv).at[1:, :].add(kv)
+    diag = diag.at[:, :-1].add(kh).at[:, 1:].add(kh)
+    A = jax.vmap(jnp.diag)(diag)
+    A = A + jax.vmap(lambda o: jnp.diag(o, 1) + jnp.diag(o, -1))(-kh)
+    A_sub = jax.vmap(jnp.diag)(-kv)
+
+    C0 = jnp.linalg.cholesky(A[0])
+
+    def step(C_prev, inputs):
+        A_ii, A_sub_i = inputs
+        B = jax.scipy.linalg.solve_triangular(C_prev, A_sub_i.T, lower=True).T
+        C = jnp.linalg.cholesky(A_ii - B @ B.T)
+        return C, jnp.sum(jnp.log(jnp.diag(C)))
+
+    _, logs = jax.lax.scan(step, C0, (A[1:], A_sub))
+    return 2.0 * (jnp.sum(jnp.log(jnp.diag(C0))) + jnp.sum(logs))
+
+def _batched(fn, n):
+    """Wrap ``fn`` in ``n`` nested vmaps, one per batch dimension."""
+    for _ in range(n):
+        fn = jax.vmap(fn)
+    return fn
+
+class PartitionedGaussianMrf(Distribution):
+    """A Gaussian Markov random field whose graph comes from a region labelling.
+
+        x ~ N(loc, Q^-1),   Q = diag(element_precision) + bond_precision * L
+
+    ``L`` is the Laplacian of the four-neighbour lattice, restricted to the
+    edges that survive: an edge whose two pixels carry different region counts
+    is deleted. ``Q`` is then block diagonal, one block per region, and the
+    density factorizes into one independent Gaussian per region rather than
+    mixing over them.
+
+    Shapes. One *event* is a whole ``(H, W, C)`` tensor, and every leading
+    dimension batches. So ``batch_shape`` is broadcast from the leading axes of
+    the layer's image, of ``element_precision`` and of ``bond_precision``, and
+    ``event_shape`` is always the trailing three axes of the image.
+
+    :param loc: a :class:`~src.distributions.layers.Layer`. Its composited image
+        is the mean and its count field supplies the graph.
+    :param element_precision: ``(*batch, H, W)``, the diagonal of ``Q``.
+    :param bond_precision: ``(*batch,)``, one edge weight per batch element.
+    :param cg_iters: conjugate-gradient steps used by :meth:`sample`.
+    """
+
+    arg_constraints = {
+        "bond_precision": constraints.greater_than(0.),
+        "element_precision": constraints.greater_than(0.),
+        "loc": constraints.real,
+    }
+    pytree_data_fields = ("_layer", "bond_precision", "element_precision", "loc")
+    pytree_aux_fields = ("cg_iters",)
+    reparametrized_params = ["bond_precision", "element_precision", "loc"]
+    support = constraints.independent(constraints.real, 3)
+
+    def __init__(self, loc: layers.Layer,
+                 element_precision: Float[Array, "*batch H W"],
+                 bond_precision: Float[Array, "*batch"], *,
+                 cg_iters: int = 300, validate_args: Optional[bool] = None):
+        self._layer = loc
+        image = loc.over_background()
+        if jnp.ndim(image) < 3:
+            raise ValueError("loc of PartitionedGaussianMrf needs at least "
+                             f"(H, W, C) dimensions, got {jnp.shape(image)}")
+
+        element_precision = jnp.asarray(element_precision)
+        bond_precision = jnp.asarray(bond_precision)
+
+        # The event is the trailing (H, W, C); everything to the left batches.
+        event_shape = jnp.shape(image)[-3:]
+        batch_shape = jax.lax.broadcast_shapes(
+            jnp.shape(image)[:-3],
+            jnp.shape(element_precision)[:-2],
+            jnp.shape(bond_precision),
+        )
+        self.loc = jnp.broadcast_to(image, batch_shape + event_shape)
+        self.element_precision = jnp.broadcast_to(
+            element_precision, batch_shape + event_shape[:2]
+        )
+        self.bond_precision = jnp.broadcast_to(bond_precision, batch_shape)
+        self.cg_iters = cg_iters
+
+        super().__init__(batch_shape=batch_shape, event_shape=event_shape,
+                         validate_args=validate_args)
+
+    # -- density ---------------------------------------------------------
+
+    def logdet_precision(self, method: str = "scan"):
+        """``log det Q`` over the WHOLE event, shaped like ``batch_shape``.
+
+        The channels share one precision and are independent given it, so the
+        event's log-determinant is the channel count times a single channel's.
+        :attr:`precision_matrix` is the one-channel ``(H*W, H*W)`` block.
+
+        ``"scan"`` is exact and has fixed shapes, so it never retraces when the
+        render changes. ``"dense"`` is the same number by a dense factorization
+        and exists to check the first.
+        """
+        if method == "dense":
+            per_channel = jnp.linalg.slogdet(self.precision_matrix)[1]
+        elif method == "scan":
+            tau, (kv, kh) = self.precision_parameters
+            per_channel = _batched(_logdet_scan, len(self.batch_shape))(tau, kv,
+                                                                        kh)
+        else:
+            raise NotImplementedError(
+                f"Unknown log-determinant method {method!r}; expected 'scan' or "
+                "'dense'."
+            )
+        return self.event_shape[-1] * per_channel
+
+    @validate_sample
+    def log_prob(self, value: ArrayLike) -> Array:
+        residual = value - self.loc
+        tau, (kv, kh) = self.precision_parameters
+        event_size = int(np.prod(self.event_shape))
+        return 0.5 * (self.logdet_precision() -
+                      event_size * jnp.log(2 * jnp.pi) -
+                      _quadratic_form(residual, tau, kv, kh))
+
+    @lazy_property
+    def precision_parameters(self):
+        """``(tau, (kv, kh))``, all broadcast to the full batch shape."""
+        mask_v, mask_h = self._layer.edge_masks
+        weight = self.bond_precision[..., None, None]
+        h, w = self.event_shape[:2]
+        kv = jnp.broadcast_to(mask_v * weight, self.batch_shape + (h - 1, w))
+        kh = jnp.broadcast_to(mask_h * weight, self.batch_shape + (h, w - 1))
+        return self.element_precision, (kv, kh)
+
+    @lazy_property
+    def precision_matrix(self):
+        """``Q`` as a dense ``(*batch, H*W, H*W)``. For checking only."""
+        h, w = self.event_shape[:2]
+        tau, (kv, kh) = self.precision_parameters
+        basis = jnp.eye(h * w).reshape(h * w, h, w, 1)
+
+        def one(t, a, b):
+            return jax.vmap(
+                lambda e: _apply_precision(e, t, a, b)[..., 0].ravel()
+            )(basis)
+
+        return _batched(one, len(self.batch_shape))(tau, kv, kh)
+
+    # -- sampling --------------------------------------------------------
+
+    def sample(self, key: Array, sample_shape: tuple = ()) -> Array:
+        """Draw ``x ~ N(loc, Q^-1)`` with no factorization anywhere.
+
+        ``eta ~ N(0, Q)`` is built from ``Q``'s own factor sum -- one standard
+        normal per pixel and one per surviving edge -- and then ``Q x = eta`` is
+        solved by conjugate gradients. A draw is linear in those normals, which
+        is what makes ``loc``, ``element_precision`` and ``bond_precision``
+        reparametrized.
+        """
+        assert is_prng_key(key)
+        tau, (kv, kh) = self.precision_parameters
+        h, w = self.event_shape[:2]
+        lead = tuple(sample_shape) + self.batch_shape
+        total = max(1, int(np.prod(lead)))
+        cg_iters = self.cg_iters
+
+        def flat(x, shape):
+            return jnp.broadcast_to(x, lead + shape).reshape((total,) + shape)
+
+        def one(subkey, loc, t, a, b):
+            k0, kv_key, kh_key = jax.random.split(subkey, 3)
+            channels = loc.shape[-1]
+            sv = jnp.sqrt(a)[..., None] * jax.random.normal(
+                kv_key, a.shape + (channels,))
+            sh = jnp.sqrt(b)[..., None] * jax.random.normal(
+                kh_key, b.shape + (channels,))
+            eta = jnp.sqrt(t)[..., None] * jax.random.normal(
+                k0, t.shape + (channels,))
+            zv = jnp.zeros_like(sv[:1])
+            zh = jnp.zeros_like(sh[:, :1])
+            eta = (eta + jnp.concatenate((sv, zv), axis=0)
+                       - jnp.concatenate((zv, sv), axis=0)
+                       + jnp.concatenate((sh, zh), axis=1)
+                       - jnp.concatenate((zh, sh), axis=1))
+            solved = utils.cg_solve(
+                lambda v: _apply_precision(v, t, a, b), eta, iters=cg_iters
+            )
+            return loc + solved
+
+        draws = jax.vmap(one)(jax.random.split(key, total),
+                             flat(self.loc, self.event_shape),
+                             flat(tau, (h, w)),
+                             flat(kv, (h - 1, w)),
+                             flat(kh, (h, w - 1)))
+        return draws.reshape(lead + self.event_shape)
+
+    # -- moments ---------------------------------------------------------
+
+    def marginal_std(self, key, draws=48):
+        # Empirical, from actual draws. Honest and slow.
+        xs = self.sample(key, (draws,))
+        return xs.std(axis=0)
+
+    @property
+    def mean(self) -> ArrayLike:
+        return jnp.broadcast_to(self.loc, self.shape())
+
+def CompleteGaussianMrf(loc: Float[Array, "*batch H W C"],
+                        element_precision: Float[Array, "*batch H W"],
+                        bond_precision: Float[Array, "*batch"], *,
+                        cg_iters: int=300, validate_args: Optional[bool]=None):
+    return PartitionedGaussianMrf(layers.Layer.straight(loc), element_precision,
+                                  bond_precision, cg_iters=cg_iters,
+                                  validate_args=validate_args)
 
 class SpatialMixtureSameFamily(Distribution):
     """A per-pixel finite mixture over a spatial tensor.
