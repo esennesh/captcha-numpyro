@@ -26,6 +26,26 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 log = logging.LoggerAdapter(logger=logging.getLogger(__name__))
 
+def cg_solve(matvec, b, iters=300, tol=1e-16):
+    # Fixed trip count, gated so an exactly-converged iterate freezes.
+    x = jnp.zeros_like(b)
+    r = b - matvec(x)
+    p, rs = r, jnp.vdot(r, r)
+
+    def step(carry, _):
+        x, r, p, rs = carry
+        live = rs > tol
+        Ap = matvec(p)
+        denom = jnp.where(live, jnp.vdot(p, Ap), 1.0)
+        alpha = jnp.where(live, rs / denom, 0.0)
+        x, r = x + alpha * p, r - alpha * Ap
+        rs2 = jnp.vdot(r, r)
+        beta = jnp.where(live, rs2 / jnp.where(live, rs, 1.0), 0.0)
+        return (x, r, r + beta * p, rs2), rs2
+
+    (x, _, _, _), _ = jax.lax.scan(step, (x, r, p, rs), None, length=iters)
+    return x
+
 def effective_sample_size(log_weights, normalized: bool=False, axis: int=0):
     log_total_weight = jax.nn.logsumexp(log_weights, axis=axis)
     log_total_squared_weight = jax.nn.logsumexp(2 * log_weights, axis=axis)
