@@ -58,8 +58,8 @@ from numpyro.util import is_prng_key
 from . import layers
 import src.utils as utils
 
-__all__ = ["CompleteGaussianMrf", "PartitionedGaussianMrf",
-           "SpatialMixtureSameFamily"]
+__all__ = ["CompleteGaussianMrf", "LocallyScaledGaussianMrf",
+           "PartitionedGaussianMrf", "SpatialMixtureSameFamily"]
 
 
 def _apply_precision(v, tau, kv, kh):
@@ -310,6 +310,62 @@ def CompleteGaussianMrf(loc: Float[Array, "*batch H W C"],
     return PartitionedGaussianMrf(layers.Layer.straight(loc), element_precision,
                                   bond_precision, cg_iters=cg_iters,
                                   validate_args=validate_args)
+
+class LocallyScaledGaussianMrf(Distribution):
+    """A diagonal local-precision transform of a partitioned Gaussian MRF.
+
+    For ``D = diag(sqrt(local_precision))`` and base spatial precision ``Q``,
+    the conditional precision is ``D Q D`` independently in every channel.
+    Density evaluation and sampling are change-of-variable transforms of
+    :class:`PartitionedGaussianMrf`, so neither operation materializes ``Q``.
+    """
+
+    arg_constraints = {
+        "local_precision": constraints.greater_than(0.)
+    }
+    pytree_data_fields = ("base", "local_precision")
+    support = constraints.independent(constraints.real, 3)
+
+    def __init__(self, loc, element_precision, bond_precision, local_precision,
+                 *, cg_iters=300, validate_args=None):
+        base = PartitionedGaussianMrf(
+            loc, element_precision, bond_precision, cg_iters=cg_iters,
+            validate_args=validate_args
+        )
+        local_precision = jnp.asarray(local_precision)
+        batch_shape = jax.lax.broadcast_shapes(
+            base.batch_shape, local_precision.shape[:-2]
+        )
+        self.base = base.expand(batch_shape)
+        self.local_precision = jnp.broadcast_to(
+            local_precision, batch_shape + base.event_shape[:-1]
+        )
+
+        super().__init__(batch_shape=batch_shape,
+                         event_shape=base.event_shape,
+                         validate_args=validate_args)
+
+    @validate_sample
+    def log_prob(self, value: ArrayLike) -> Array:
+        loc = self.mean
+
+        residual = value - loc
+        scaled = loc + jnp.sqrt(self.local_precision)[..., None] * residual
+
+        log_jacobian = (
+            0.5 * self.event_shape[-1]
+            * jnp.log(self.local_precision).sum(axis=(-2, -1))
+        )
+
+        return self.base.log_prob(scaled) + log_jacobian
+
+    @property
+    def mean(self) -> ArrayLike:
+        return self.base.mean
+
+    def sample(self, key: Array, sample_shape: tuple = ()) -> Array:
+        residual = self.base.sample(key, sample_shape=sample_shape) - self.mean
+        return self.mean + residual / jnp.sqrt(self.local_precision)[..., None]
 
 class SpatialMixtureSameFamily(Distribution):
     """A per-pixel finite mixture over a spatial tensor.
