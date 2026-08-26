@@ -1,66 +1,23 @@
-# Numpyro Template Project
-Numpyro deep probabilistic programming made easi**er**.
+# Parsing CAPTCHA Images with a Robust Probabilistic Generative Model
 
-<!-- @import "[TOC]" {cmd="toc" depthFrom=1 depthTo=6 orderedList=false} -->
-
-<!-- code_chunk_output -->
-
-* [Numpyro Template Project](#numpyro-template-project)
-	* [Requirements](#requirements)
-	* [Features](#features)
-	* [Folder Structure](#folder-structure)
-	* [License](#license)
-	* [Acknowledgements](#acknowledgements)
-
-<!-- /code_chunk_output -->
-
-## Requirements
-* Python >= 3.5 (3.6 recommended)
-* numpyro >= 0.18.0
-* tqdm (Optional for `test.py`)
-* tensorboard >= 1.14 (see [Tensorboard Visualization](#tensorboard-visualization))
-
-## Features
-* Clear folder structure which is suitable for configurable probabilistic programming projects.
-* `.yaml` config file support for convenient parameter tuning.
-* Customizable command line options for more convenient parameter tuning.
-* Checkpoint saving and resuming.
-* Abstract base classes for faster development:
-  * `Trainer` handles training process logging and more.
-  * `DataModule` handles data shuffling and validation data splitting.
-  * `ParaMonad` handles checkpoint saving/resuming, updating of mutable parameters, and JAX RNG keys.
-
-## Folder Structure
-  ```
-  numpyro_template/
-  │
-  ├── train.py - main script to start training
-  ├── test.py - evaluation of trained model
-  │
-  ├── configs/ - Hydra configuration files for , models, guides, parametric monads, and trainers
-  │   ├── data/ - data-module configurations
-  │   ├── guide/ - variational guide program or sampler configurations
-  │   ├── model/ - generative model program configurations
-  │   ├── monad/ - state monad configurations for RNG keys, mutable parameters and optimizer states, etc.
-  |   └── trainer/ - trainer class configurations
-  │
-  ├── data/ - default directory for storing input data
-  │
-  ├── notebooks/ - Jupyter notebooks showing off results
-  │   └── vae.ipynb - an example with a trained Variational Autoencoder
-  |
-  ├── src/ - core source code in Python
-  │   ├── data/ - data modules and the core `DataModule` class
-  │   ├── logger/ - logger source
-  │   ├── model/ - model source code in Numpyro
-  │   ├── trainer/ - source code to `ParaMonad`, `Trainer`, and their subclasses
-  |   └── utils/ - small utility functions
-      ├── util.py
-      └── ...  
-  ```
-
-## License
-This project is licensed under the MIT License. See  LICENSE for more details
-
-## Acknowledgements
-This project is inspired by the project [Tensorflow-Project-Template](https://github.com/MrGemy95/Tensorflow-Project-Template) by [Mahmoud Gemy](https://github.com/MrGemy95)
+Despite significant progress, contemporary visual foundation models require
+training on order-of-millions of data points in order to successfully parse
+images into objects, clutter, and background. Dedicated small-data models, on
+the other hand, can parse crowded scenes at inference time, after learning from
+as few as 10 or 20 labelled object exemplars, but these tend to require either
+simplifying assumptions that leave them unable to generate novel data exemplars
+or expensive, unstable training of deep neural networks on large data sets.
+We present a simple generative model of CAPTCHA images, based on convolutional
+sparse coding in the visual cortex, capable of parsing objects from clutter and
+background in images, without training corpora or neural networks. We
+demonstrate the performance of our model on a body of images generated de novo
+from an open-source Python captcha library, inverting our generative model by
+maximum-a-posteriori (MAP) estimation. We exploit the MAP estimates to
+initialize a variational inference procedure, enabling us to learn the free
+parameters endowing the model with robustness to visual style by maximizing a
+lower bound on the data log-likelihood and thus acquire visual style; after
+training, our model can simulate new image instances in the acquired style, an
+advance on the major previous generative probabilistic model for CAPTCHA-parsing.
+We document the inductive biases and modeling assumptions enabling small-data
+learning in our setting and draw an analogy between visual attention and our
+model's mechanism for robustness to unmodelled visual clutter and backgrounds.
