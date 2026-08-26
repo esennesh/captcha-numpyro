@@ -59,7 +59,8 @@ from . import layers
 import src.utils as utils
 
 __all__ = ["CompleteGaussianMrf", "LocallyScaledGaussianMrf",
-           "PartitionedGaussianMrf", "SpatialMixtureSameFamily"]
+           "PartitionedGaussianMrf", "SecondOrderGaussianMrf",
+           "SpatialMixtureSameFamily"]
 
 
 def _apply_precision(v, tau, kv, kh):
@@ -366,6 +367,283 @@ class LocallyScaledGaussianMrf(Distribution):
     def sample(self, key: Array, sample_shape: tuple = ()) -> Array:
         residual = self.base.sample(key, sample_shape=sample_shape) - self.mean
         return self.mean + residual / jnp.sqrt(self.local_precision)[..., None]
+
+class SecondOrderGaussianMrf(Distribution):
+    r"""A proper second-difference GMRF, factorized through a sparse operator.
+
+    Let ``A = diag(element_precision) + bond_precision * L``, where ``L`` is
+    the four-neighbour graph Laplacian after applying any supplied edge masks.
+    This distribution is
+
+    .. math::
+
+        x \sim \mathcal N(\mu, Q^{-1}), \qquad Q = A^\mathsf{T}A.
+
+    Consequently, its quadratic term is ``||A (x - loc)||^2``. Because ``L``
+    is a second-difference operator, this penalizes curvature; the resulting
+    precision contains an ``L^2`` term and has a graph-distance-two stencil.
+
+    The factorization is also generative and normalized. Sampling draws white
+    noise ``epsilon`` and solves ``A (x - loc) = epsilon``; the log density uses
+    ``log det(Q) = 2 log det(A)``. Neither operation materializes ``Q``.
+
+    Shapes follow :class:`PartitionedGaussianMrf`: leading dimensions batch,
+    and the trailing ``(H, W, C)`` dimensions form one event. Channels are
+    conditionally independent and share the same spatial operator.
+
+    :param loc: Mean field, shaped ``(*batch, H, W, C)``.
+    :param element_precision: Positive diagonal of ``A``, broadcastable to
+        ``(*batch, H, W)``.
+    :param bond_precision: Positive lattice-edge weight, broadcastable to
+        ``batch_shape``.
+    :param edge_masks: Optional ``(vertical, horizontal)`` masks with trailing
+        shapes ``(H-1, W)`` and ``(H, W-1)``. The default retains every edge.
+    :param cg_iters: Conjugate-gradient steps used by :meth:`sample`.
+    """
+
+    arg_constraints = {
+        "bond_precision": constraints.greater_than(0.),
+        "element_precision": constraints.greater_than(0.),
+        "loc": constraints.real,
+    }
+    pytree_data_fields = ("_mask_h", "_mask_v", "bond_precision",
+                          "element_precision", "loc")
+    pytree_aux_fields = ("cg_iters",)
+    reparametrized_params = [
+        "bond_precision", "element_precision", "loc"
+    ]
+    support = constraints.independent(constraints.real, 3)
+
+    def __init__(
+        self,
+        loc: Float[Array, "*batch H W C"],
+        element_precision: Float[Array, "*batch H W"],
+        bond_precision: Float[Array, "*batch"],
+        *,
+        cg_iters: int = 300,
+        edge_masks: tuple[ArrayLike, ArrayLike] | None = None,
+        validate_args: bool | None = None,
+    ):
+        bond_precision = jnp.asarray(bond_precision)
+        element_precision = jnp.asarray(element_precision)
+        loc = jnp.asarray(loc)
+        if jnp.ndim(loc) < 3:
+            raise ValueError(
+                "loc of SecondOrderGaussianMrf needs at least (H, W, C) "
+                f"dimensions, got {jnp.shape(loc)}"
+            )
+
+        event_shape = jnp.shape(loc)[-3:]
+        height, width = event_shape[:2]
+        if edge_masks is None:
+            mask_h = jnp.ones((height, width - 1), dtype=loc.dtype)
+            mask_v = jnp.ones((height - 1, width), dtype=loc.dtype)
+        else:
+            mask_v, mask_h = (jnp.asarray(mask) for mask in edge_masks)
+        if jnp.ndim(mask_h) < 2 or jnp.shape(mask_h)[-2:] != (
+            height, width - 1
+        ):
+            raise ValueError(
+                "horizontal edge mask needs trailing shape "
+                f"{(height, width - 1)}, got {jnp.shape(mask_h)}"
+            )
+        if jnp.ndim(mask_v) < 2 or jnp.shape(mask_v)[-2:] != (
+            height - 1, width
+        ):
+            raise ValueError(
+                "vertical edge mask needs trailing shape "
+                f"{(height - 1, width)}, got {jnp.shape(mask_v)}"
+            )
+
+        batch_shape = jax.lax.broadcast_shapes(
+            jnp.shape(bond_precision),
+            jnp.shape(element_precision)[:-2],
+            jnp.shape(loc)[:-3],
+            jnp.shape(mask_h)[:-2],
+            jnp.shape(mask_v)[:-2],
+        )
+        self._mask_h = jnp.broadcast_to(
+            mask_h, batch_shape + (height, width - 1)
+        )
+        self._mask_v = jnp.broadcast_to(
+            mask_v, batch_shape + (height - 1, width)
+        )
+        self.bond_precision = jnp.broadcast_to(bond_precision, batch_shape)
+        self.cg_iters = cg_iters
+        self.element_precision = jnp.broadcast_to(
+            element_precision, batch_shape + (height, width)
+        )
+        self.loc = jnp.broadcast_to(loc, batch_shape + event_shape)
+
+        super().__init__(
+            batch_shape=batch_shape,
+            event_shape=event_shape,
+            validate_args=validate_args,
+        )
+
+    @classmethod
+    def from_coverage(
+        cls,
+        coverage: ArrayLike,
+        element_precision: ArrayLike,
+        bond_precision: ArrayLike,
+        *,
+        cg_iters: int = 300,
+        channels: int = 1,
+        loc: ArrayLike | None = None,
+        threshold: float = layers.POTENTIAL_EDGE_ALPHA,
+        validate_args: bool | None = None,
+    ) -> "SecondOrderGaussianMrf":
+        """Build a support-restricted field from a raw alpha bitmap.
+
+        ``coverage`` has shape ``(*batch, H, W)``. Integer bitmaps, including
+        ordinary uint8 alpha channels, are normalized by their dtype maximum;
+        floating-point inputs are interpreted on ``[0, 1]``. A lattice bond is
+        retained only when both endpoint pixels satisfy
+        ``coverage >= threshold``. Uncovered pixels remain proper independent
+        Gaussian variables through the positive element term, but have no
+        smoothing bonds and cannot transmit texture across the glyph boundary.
+
+        When ``loc`` is omitted, the mean is zero with ``channels`` channels.
+        Supplying ``loc`` overrides that default and determines the event's
+        channel count.
+        """
+        coverage = jnp.asarray(coverage)
+        if jnp.ndim(coverage) < 2:
+            raise ValueError(
+                "coverage needs at least (H, W) dimensions, "
+                f"got {jnp.shape(coverage)}"
+            )
+        if jnp.issubdtype(coverage.dtype, jnp.integer):
+            coverage = coverage.astype(jnp.float32) / jnp.iinfo(
+                coverage.dtype
+            ).max
+        if loc is None:
+            if channels < 1:
+                raise ValueError(f"channels needs to be positive, got {channels}")
+            loc = jnp.zeros(
+                jnp.shape(coverage) + (channels,),
+                dtype=jnp.result_type(coverage.dtype, jnp.float32),
+            )
+        support = coverage >= threshold
+        mask_h = support[..., :, :-1] & support[..., :, 1:]
+        mask_v = support[..., :-1, :] & support[..., 1:, :]
+        return cls(
+            loc,
+            element_precision,
+            bond_precision,
+            cg_iters=cg_iters,
+            edge_masks=(mask_v, mask_h),
+            validate_args=validate_args,
+        )
+
+    def logdet_precision(self, method: str = "scan") -> Array:
+        """Return ``log det(A.T A)`` over every channel in the event."""
+        if method == "dense":
+            per_channel = 2.0 * jnp.linalg.slogdet(self.operator_matrix)[1]
+        elif method == "scan":
+            element, (vertical, horizontal) = self.operator_parameters
+            per_channel = 2.0 * _batched(
+                _logdet_scan, len(self.batch_shape)
+            )(element, vertical, horizontal)
+        else:
+            raise NotImplementedError(
+                f"Unknown log-determinant method {method!r}; expected 'scan' "
+                "or 'dense'."
+            )
+        return self.event_shape[-1] * per_channel
+
+    @validate_sample
+    def log_prob(self, value: ArrayLike) -> Array:
+        element, (vertical, horizontal) = self.operator_parameters
+        residual = value - self.loc
+        transformed = _apply_precision(
+            residual, element, vertical, horizontal
+        )
+        quadratic = jnp.sum(transformed**2, axis=(-3, -2, -1))
+        event_size = int(np.prod(self.event_shape))
+        return 0.5 * (
+            self.logdet_precision()
+            - event_size * jnp.log(2.0 * jnp.pi)
+            - quadratic
+        )
+
+    @property
+    def mean(self) -> ArrayLike:
+        return jnp.broadcast_to(self.loc, self.shape())
+
+    @lazy_property
+    def operator_matrix(self) -> Array:
+        """Dense one-channel ``A`` matrix, for diagnostics and tests only."""
+        element, (vertical, horizontal) = self.operator_parameters
+        height, width = self.event_shape[:2]
+        basis = jnp.eye(height * width).reshape(
+            height * width, height, width, 1
+        )
+
+        def one(diagonal, horizontal_bonds, vertical_bonds):
+            return jax.vmap(
+                lambda vector: _apply_precision(
+                    vector,
+                    diagonal,
+                    vertical_bonds,
+                    horizontal_bonds,
+                )[..., 0].ravel()
+            )(basis)
+
+        return _batched(one, len(self.batch_shape))(
+            element, horizontal, vertical
+        )
+
+    @lazy_property
+    def operator_parameters(self) -> tuple[Array, tuple[Array, Array]]:
+        """Return ``(element, (vertical, horizontal))`` parameters of ``A``."""
+        weight = self.bond_precision[..., None, None]
+        horizontal = self._mask_h * weight
+        vertical = self._mask_v * weight
+        return self.element_precision, (vertical, horizontal)
+
+    @lazy_property
+    def precision_matrix(self) -> Array:
+        """Dense one-channel ``Q = A.T A``, for diagnostics and tests only."""
+        operator_transpose = jnp.swapaxes(self.operator_matrix, -1, -2)
+        return operator_transpose @ self.operator_matrix
+
+    def sample(self, key: Array, sample_shape: tuple = ()) -> Array:
+        """Draw white noise and solve ``A (x - loc) = epsilon``."""
+        assert is_prng_key(key)
+        element, (vertical, horizontal) = self.operator_parameters
+        height, width = self.event_shape[:2]
+        lead = tuple(sample_shape) + self.batch_shape
+        total = max(1, int(np.prod(lead)))
+
+        def flat(value, shape):
+            return jnp.broadcast_to(value, lead + shape).reshape(
+                (total,) + shape
+            )
+
+        def one(subkey, loc, diagonal, horizontal_bonds, vertical_bonds):
+            noise = jax.random.normal(subkey, loc.shape)
+            residual = utils.cg_solve(
+                lambda value: _apply_precision(
+                    value,
+                    diagonal,
+                    vertical_bonds,
+                    horizontal_bonds,
+                ),
+                noise,
+                iters=self.cg_iters,
+            )
+            return loc + residual
+
+        draws = jax.vmap(one)(
+            jax.random.split(key, total),
+            flat(self.loc, self.event_shape),
+            flat(element, (height, width)),
+            flat(horizontal, (height, width - 1)),
+            flat(vertical, (height - 1, width)),
+        )
+        return draws.reshape(lead + self.event_shape)
 
 class SpatialMixtureSameFamily(Distribution):
     """A per-pixel finite mixture over a spatial tensor.
