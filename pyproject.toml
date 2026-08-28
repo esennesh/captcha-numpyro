@@ -36,3 +36,8 @@ override-dependencies = ["pyyaml>=6.0"]
 
 [tool.uv.sources]
 numpyro = {git = "https://github.com/esennesh/numpyro.git", branch = "feature/diagonalization_sgd"}
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

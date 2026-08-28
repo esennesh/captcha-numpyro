@@ -13,14 +13,6 @@ from src.distributions import ConcreteLogits, SpatialMixtureSameFamily
 from src import utils
 
 
-def screen_blend(layers, axis=0, logits=False):
-    if logits:
-        layers = jax.nn.sigmoid(layers)
-    p = 1.0 - jnp.prod(1.0 - layers, axis=axis)
-    if logits:
-        return jax.scipy.special.logit(p)
-    return p
-
 def _as_nhwc_dictionary(shapes: Array) -> Array:
     shapes = jnp.asarray(shapes)
     if shapes.ndim != 4:
@@ -34,30 +26,6 @@ def _as_nhwc_dictionary(shapes: Array) -> Array:
         f"(K, H, W, C) or (K, C, H, W), got {shapes.shape}"
     )
 
-
-def _render_dictionary_placements(activations: Array, shapes: Array,
-                                              stride: int) -> Array:
-    """Render each feature's placements separately, ``(N, K, out_h, out_w, C)``.
-
-    This is the pre-reduction result of :func:`_render_dictionary_placements`:
-    the sum over the feature axis (axis 1) recovers the composited render.
-    """
-    dictionary = _as_nhwc_dictionary(shapes)
-
-    def render_one(activation, glyph):
-        # With transpose_kernel=True the supplied kernel has the layout of the
-        # *forward* conv it transposes: HWIO with I = deconv-output channels
-        # (= dictionary channels C) and O = deconv-input channels (= 1 here).
-        kernel = glyph[..., jnp.newaxis]
-        return jax.lax.conv_transpose(
-            activation[..., jnp.newaxis], kernel, (stride, stride), "VALID",
-            dimension_numbers=("NHWC", "HWIO", "NHWC"),
-            transpose_kernel=True,
-        )
-
-    return jnp.clip(jax.vmap(render_one, in_axes=(1, 0), out_axes=1)(
-        activations, dictionary,
-    ), 0., None)
 
 def _dictionary_support_masks(shapes: Array, threshold: float = 0.0) -> Array:
     """Per-glyph 0/1 support masks, shaped ``(K, kh, kw, 1)``.
@@ -103,57 +71,26 @@ def _ink_kernel(shapes: Array) -> Array:
     field emits both the colour numerator and the optical depth that normalizes
     it (see :meth:`PoissonConvPlacements.ink_field`).
 
-    The layout is HWIO as ``conv_transpose(..., transpose_kernel=True)`` wants
-    it: ``I`` is the deconvolution's *output* channels (the 4 ink channels) and
-    ``O`` its *input* channels (the ``K`` dictionary features).
+    The layout is HWOI as ``conv_transpose(..., transpose_kernel=True)`` wants
+    it: ``O`` is the deconvolution's output channels (the 4 ink channels) and
+    ``I`` its input channels (the ``K`` dictionary features).
     """
     alpha, rgb = _dictionary_alpha_rgb(shapes)
-    # Premultiply by the glyph's *hue*, not its raw RGB. `_rgba_shape_transform`
-    # derives alpha as ``file_alpha * max(RGB)`` while leaving RGB untouched, so
-    # on a glyph's support ``rgb.max(-1)`` equals ``alpha`` exactly: the
-    # anti-alias ramp is present in both channels. Premultiplying by raw RGB and
-    # then dividing back out (``tint = premult / depth`` in
-    # :func:`generate_poisson_convsc`) recovers that ramp *as the foreground
-    # colour*, so the anti-aliasing gets applied twice -- once as opacity and
-    # once as colour. Measured on glyph 'A', edge pixels came out at
-    # ``tint = 0.14`` against 0.996 at the core, i.e. the foreground was
-    # 0.14 * color rather than color.
-    #
-    # Invisible for a single stamp (0.015 too light at the edge) but severe once
-    # opacity accumulates: at four overlapping spikes the composite landed at
-    # 0.610 where a correct alpha-composite gives 0.860 -- a dark fringe around
-    # every glyph, and the converged model runs at a total rate near 4.
-    #
-    # Normalizing to unit hue puts the ramp in alpha alone, so
-    # ``1 - exp(-tau)`` applies it exactly once. A white mask gives hue == 1 and
-    # ``fg == color``; a genuinely coloured anti-aliased glyph gives its pure
-    # chromaticity, with the ramp still entirely in alpha.
+    # Normalizing here takes us out of premultiplied alpha and gives us just the
+    # hue of the nonzero pixels, while preserving the information necessary for
+    # anti-aliasing edges and such later.
     peak = rgb.max(axis=-1, keepdims=True)
     hue = jnp.where(peak > 0., rgb / jnp.clip(peak, 1e-6, None), 1.)
 
-    # Optical depth is -log(1 - alpha), not alpha. Beer-Lambert is the right law
-    # for *superposing independent absorbers* but the wrong one for a single
-    # glyph's own anti-aliasing, which is coverage: 1 - exp(-alpha) maps a fully
-    # covered pixel to 0.632 rather than 1, which is the only reason more than
-    # one spike per site was ever needed. Coverage composes as
-    #
-    #     1 - prod_i (1 - alpha_i) = 1 - exp(sum_i log(1 - alpha_i)),
-    #
-    # so convolving -log(1 - alpha) makes the downstream 1 - exp(-tau) *exact*
-    # alpha compositing: one stamp gives A = alpha precisely, n stamps give
-    # 1 - (1 - alpha)^n, and alpha = 1 gives A = 1. Still one convolution, still
-    # non-negative since -log(1 - alpha) >= 0 on [0, 1), and §2's "counts add in
-    # log-transmittance" becomes literally true rather than a first-order
-    # approximation.
-    #
-    # This is what lets a count saturate the core without over-opacifying the
-    # edge -- the failure §23 measured, where tau = n * alpha scaled the whole
-    # ramp uniformly and cost 0.199 of edge error at four spikes.
-    #
-    # alpha is clipped below 1 because -log(0) diverges; 1 - 1e-3 caps a single
-    # stamp at A = 0.999 and its per-stamp depth at 6.9.
-    depth = -jnp.log1p(-jnp.clip(alpha, 0., 1. - 1e-3))
-    ink = jnp.concatenate((hue * depth, depth), axis=-1)  # (K, kh, kw, 4)
+    # We calculate the negative-log transmittance tau = -log(1 - α), because
+    # convolving will add it in the stamping process to recover alpha
+    # compositing when we combine the stamped layers. One stamp gives
+    # A = 1 - (1 - α)^1 = α; n stamps give 1 - (1 - α)^n; and α = 1 gives A = 1.
+    # This lets increasing spike-counts bring a glyph "closer" to the camera
+    # without over-opacifying anti-aliased shape edges. We clip α into
+    # [0., 0.999] for numerical stability at large values.
+    tau = -jnp.log1p(-jnp.clip(alpha, 0., 1. - 1e-3))
+    ink = jnp.concatenate((hue * tau, tau), axis=-1)  # (K, kh, kw, 4)
     return jnp.moveaxis(ink, 0, -1)
 
 
