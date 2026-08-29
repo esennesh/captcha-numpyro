@@ -15,6 +15,7 @@ rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 from src.data.dictionary import ShapeDictionary
 from src.distributions.spatial import SecondOrderGaussianMrf
 from src.model.diffeomorphism import (
+    boundary_taper,
     compose_displacements,
     coordinate_grid,
     diffeomorphic_warp,
@@ -26,15 +27,6 @@ from src.model.diffeomorphism import (
 BOND_PRECISION = 0.4
 COARSE_SHAPE = (7, 5)
 ELEMENT_PRECISION = 0.1
-
-
-def boundary_taper(shape, dtype):
-    """Return a sine window that fixes the velocity to zero on the boundary."""
-    grid = coordinate_grid(shape, dtype=dtype)
-    height, width = shape
-    x_taper = jnp.sin(jnp.pi * grid[..., 1] / (width - 1))
-    y_taper = jnp.sin(jnp.pi * grid[..., 0] / (height - 1))
-    return x_taper * y_taper
 
 
 def main(arguments):
@@ -56,7 +48,7 @@ def main(arguments):
     velocity = (
         arguments.velocity_scale
         * velocity
-        * boundary_taper(alpha.shape, velocity.dtype)[..., None]
+        * boundary_taper(alpha.shape, dtype=velocity.dtype)[..., None]
     )
     speed = jnp.linalg.norm(velocity, axis=-1)
 

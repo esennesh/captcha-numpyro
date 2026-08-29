@@ -11,15 +11,109 @@ import jax.numpy as jnp
 from jaxtyping import Array, Float
 
 __all__ = [
+    "affine_basis",
+    "affine_free_velocity",
     "bilinear_sample",
+    "boundary_taper",
     "compose_displacements",
     "coordinate_grid",
     "diffeomorphic_warp",
     "jacobian_determinant",
     "resize_velocity",
     "scaling_and_squaring",
+    "sparse_diffeomorphic_stamp",
     "warp_image",
 ]
+
+
+def affine_basis(
+    shape: tuple[int, int], *, dtype=jnp.float32
+) -> Float[Array, "H W 3"]:
+    """Return the normalized coordinate basis ``[1, y, x]``."""
+    grid = coordinate_grid(shape, dtype=dtype)
+    height, width = shape
+    x = 2.0 * grid[..., 1] / max(width - 1, 1) - 1.0
+    y = 2.0 * grid[..., 0] / max(height - 1, 1) - 1.0
+    return jnp.stack((jnp.ones_like(y), y, x), axis=-1)
+
+
+def affine_free_velocity(
+    velocity: Float[Array, "h w 2"],
+    covariance_solve,
+    shape: tuple[int, int],
+    *,
+    method: str = "cubic",
+    window: Float[Array, "H W"] | None = None,
+) -> Float[Array, "H W 2"]:
+    r"""Condition a coarse Gaussian velocity to have no affine image modes.
+
+    Let the raw coarse field be ``u ~ N(0, Q^-1)``, let ``R`` resize it to
+    ``shape``, let ``W`` be the optional image-space window, and let
+    ``B = [1, y, x]``.  The affine-free condition is
+
+    .. math::
+
+        B^\mathsf{T}WRu_\perp=0.
+
+    Defining the coarse constraint matrix ``C = R.T @ W @ B``, a draw from the
+    Gaussian conditional on this constraint is
+
+    .. math::
+
+        u_\perp = u - Q^{-1}C
+        (C^\mathsf{T}Q^{-1}C)^{-1}C^\mathsf{T}u.
+
+    ``covariance_solve`` must apply ``Q^-1`` on the coarse lattice; passing
+    :meth:`SecondOrderGaussianMrf.solve_precision` retains the GMRF covariance
+    geometry without materializing a dense precision.  The only dense solve
+    is three by three.  Both velocity channels use the same conditional map,
+    removing two translations and the four entries of a linear map.
+
+    Passing a window that vanishes at the image boundary additionally gives a
+    fixed boundary.  Resizing, conditioning, and windowing are linear, so the
+    result is a Gaussian field.  It is singular in ambient image coordinates,
+    as any Gaussian supported on an exactly constrained subspace must be.
+    """
+    if velocity.ndim != 3 or velocity.shape[-1] != 2:
+        raise ValueError(
+            "velocity needs shape (h, w, 2), "
+            f"got {velocity.shape}"
+        )
+    if window is not None and window.shape != shape:
+        raise ValueError(
+            "window and output need matching spatial shapes, "
+            f"got {window.shape} and {shape}"
+        )
+
+    basis = affine_basis(shape, dtype=velocity.dtype)
+    weights = (
+        jnp.ones(shape, dtype=velocity.dtype)
+        if window is None
+        else window.astype(velocity.dtype)
+    )
+    weighted_basis = weights[..., None] * basis
+
+    coarse_shape = velocity.shape[:2]
+
+    def resize_basis(field):
+        return jax.image.resize(field, (*shape, 3), method=method)
+
+    _, resize_transpose = jax.vjp(
+        resize_basis,
+        jnp.zeros((*coarse_shape, 3), dtype=velocity.dtype),
+    )
+    constraints = resize_transpose(weighted_basis)[0]
+    covariance_constraints = covariance_solve(constraints)
+    conditional_gram = jnp.einsum(
+        "hwk,hwl->kl", constraints, covariance_constraints
+    )
+    affine_coordinates = jnp.einsum("hwk,hwc->kc", constraints, velocity)
+    coefficients = jnp.linalg.solve(conditional_gram, affine_coordinates)
+    conditioned = velocity - jnp.einsum(
+        "hwk,kc->hwc", covariance_constraints, coefficients
+    )
+    resized = resize_velocity(conditioned, shape, method=method)
+    return weights[..., None] * resized
 
 
 def bilinear_sample(
@@ -65,6 +159,19 @@ def bilinear_sample(
         + field[y0, x1] * x_weight
     )
     return top * (1.0 - y_weight) + bottom * y_weight
+
+
+def boundary_taper(
+    shape: tuple[int, int], *, dtype=jnp.float32
+) -> Float[Array, "H W"]:
+    """Return a sine window that fixes a velocity to zero on the boundary."""
+    grid = coordinate_grid(shape, dtype=dtype)
+    height, width = shape
+    x_taper = jnp.sin(jnp.pi * grid[..., 1] / max(width - 1, 1))
+    y_taper = jnp.sin(jnp.pi * grid[..., 0] / max(height - 1, 1))
+    taper = x_taper * y_taper
+    taper = taper.at[0, :].set(0.0).at[-1, :].set(0.0)
+    return taper.at[:, 0].set(0.0).at[:, -1].set(0.0)
 
 
 def compose_displacements(
@@ -172,6 +279,96 @@ def scaling_and_squaring(
     for _ in range(squaring_steps):
         displacement = compose_displacements(displacement, displacement)
     return displacement
+
+
+def sparse_diffeomorphic_stamp(
+    amplitudes: Array,
+    centers: Array,
+    glyph_indices: Array,
+    ink_kernel: Float[Array, "Kh Kw C K"],
+    velocities: Float[Array, "N Kh Kw 2"],
+    *,
+    canvas_shape: tuple[int, int],
+    squaring_steps: int = 7,
+) -> Float[Array, "H W C"]:
+    r"""Warp and scatter-add a sparse list of glyph occurrences.
+
+    Occurrence ``i`` contributes
+
+    .. math::
+
+        a_i K_{k_i}\!\left(\exp(-v_i)(p-s_i)\right)
+
+    to the canvas.  ``centers`` are integer ``(y, x)`` image sites using the
+    same even-kernel convention as :func:`src.model.model._stamp`.  The ink
+    channels should be closeness-premultiplied so their sum has exactly the
+    optical-depth semantics of the convolutional renderer.
+    """
+    occurrence_count = amplitudes.shape[0]
+    if amplitudes.shape != (occurrence_count,):
+        raise ValueError(f"amplitudes need shape (N,), got {amplitudes.shape}")
+    if centers.shape != (occurrence_count, 2):
+        raise ValueError(f"centers need shape (N, 2), got {centers.shape}")
+    if glyph_indices.shape != (occurrence_count,):
+        raise ValueError(
+            f"glyph_indices need shape (N,), got {glyph_indices.shape}"
+        )
+    if ink_kernel.ndim != 4:
+        raise ValueError(
+            "ink_kernel needs shape (Kh, Kw, C, K), "
+            f"got {ink_kernel.shape}"
+        )
+    if not jnp.issubdtype(centers.dtype, jnp.integer):
+        raise ValueError(f"centers need an integer dtype, got {centers.dtype}")
+
+    kernel_height, kernel_width, channels = ink_kernel.shape[:3]
+    expected_velocity_shape = (
+        occurrence_count, kernel_height, kernel_width, 2
+    )
+    if velocities.shape != expected_velocity_shape:
+        raise ValueError(
+            f"velocities need shape {expected_velocity_shape}, "
+            f"got {velocities.shape}"
+        )
+
+    selected_kernels = jnp.moveaxis(
+        ink_kernel[..., glyph_indices], -1, 0
+    )
+    warped_kernels = jax.vmap(
+        lambda kernel, velocity: diffeomorphic_warp(
+            kernel, velocity, squaring_steps=squaring_steps
+        )
+    )(selected_kernels, velocities)
+    weighted_kernels = (
+        amplitudes.astype(ink_kernel.dtype)[:, None, None, None]
+        * warped_kernels
+    )
+
+    canvas_height, canvas_width = canvas_shape
+    x = (
+        centers[:, 1, None, None]
+        + jnp.arange(kernel_width)[None, None, :]
+        - (kernel_width - 1) // 2
+    )
+    x = jnp.broadcast_to(
+        x, (occurrence_count, kernel_height, kernel_width)
+    )
+    y = (
+        centers[:, 0, None, None]
+        + jnp.arange(kernel_height)[None, :, None]
+        - (kernel_height - 1) // 2
+    )
+    y = jnp.broadcast_to(
+        y, (occurrence_count, kernel_height, kernel_width)
+    )
+    valid = (x >= 0) & (x < canvas_width) & (y >= 0) & (y < canvas_height)
+    x = jnp.clip(x, 0, canvas_width - 1)
+    y = jnp.clip(y, 0, canvas_height - 1)
+
+    canvas = jnp.zeros(
+        (canvas_height, canvas_width, channels), dtype=ink_kernel.dtype
+    )
+    return canvas.at[y, x].add(weighted_kernels * valid[..., None])
 
 
 def warp_image(
