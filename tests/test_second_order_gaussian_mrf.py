@@ -162,6 +162,17 @@ def test_sampler_second_moment():
     assert abs(quadratic / dimension - 1.0) < 0.05
 
 
+def test_solve_precision_matches_a_dense_solve_for_multiple_right_hand_sides():
+    field = make_field(height=4, width=3, channels=2)
+    right_hand_side = jnp.linspace(-0.4, 0.7, 4 * 3 * 3).reshape(4, 3, 3)
+    actual = field.solve_precision(right_hand_side)
+    expected = np.linalg.solve(
+        np.asarray(field.precision_matrix),
+        np.asarray(right_hand_side).reshape(12, 3),
+    ).reshape(4, 3, 3)
+    assert np.allclose(actual, expected, atol=1e-10)
+
+
 def test_support_is_a_full_real_image_event():
     field = make_field()
     assert field.support.event_dim == 3

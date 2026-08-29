@@ -645,6 +645,66 @@ class SecondOrderGaussianMrf(Distribution):
         )
         return draws.reshape(lead + self.event_shape)
 
+    def solve_precision(self, value: ArrayLike) -> Array:
+        r"""Apply the covariance ``Q^{-1}`` to one or more right-hand sides.
+
+        The final axis of ``value`` holds an arbitrary number of right-hand
+        sides, while its preceding two axes must match the field lattice.  For
+        the symmetric operator ``A`` used by this class,
+
+        .. math::
+
+            Q^{-1}b=(A^\mathsf{T}A)^{-1}b=A^{-1}A^{-1}b.
+
+        The implementation therefore uses two conjugate-gradient solves and
+        never materializes either ``A`` or ``Q``.  Leading dimensions are
+        broadcast with the distribution's batch shape.
+        """
+        value = jnp.asarray(value)
+        height, width = self.event_shape[:2]
+        if value.ndim < 3 or value.shape[-3:-1] != (height, width):
+            raise ValueError(
+                "value needs trailing shape (H, W, R) with spatial shape "
+                f"{(height, width)}, got {value.shape}"
+            )
+
+        batch_shape = jax.lax.broadcast_shapes(
+            self.batch_shape, value.shape[:-3]
+        )
+        element, (vertical, horizontal) = self.operator_parameters
+        right_hand_sides = value.shape[-1]
+        value = jnp.broadcast_to(
+            value, batch_shape + (height, width, right_hand_sides)
+        )
+
+        def one(argument, diagonal, horizontal_bonds, vertical_bonds):
+            def apply(field):
+                return _apply_precision(
+                    field,
+                    diagonal,
+                    vertical_bonds,
+                    horizontal_bonds,
+                )
+
+            intermediate = utils.cg_solve(
+                apply, argument, iters=self.cg_iters
+            )
+            return utils.cg_solve(
+                apply, intermediate, iters=self.cg_iters
+            )
+
+        solve = _batched(one, len(batch_shape))
+        return solve(
+            value,
+            jnp.broadcast_to(element, batch_shape + (height, width)),
+            jnp.broadcast_to(
+                horizontal, batch_shape + (height, width - 1)
+            ),
+            jnp.broadcast_to(
+                vertical, batch_shape + (height - 1, width)
+            ),
+        )
+
 class SpatialMixtureSameFamily(Distribution):
     """A per-pixel finite mixture over a spatial tensor.
 
