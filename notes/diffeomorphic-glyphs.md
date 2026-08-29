@@ -101,3 +101,147 @@ python scripts/diffeomorphic_glyph.py
 
 It displays the canonical glyph, sampled velocity, deformed coordinate grid,
 backward-warped glyph, and discrete Jacobian determinant.
+
+## Sparse occurrence renderer
+
+This remains a useful correctness reference, but the current prototype direction
+uses the fixed-shape whole-image field in the next section.
+
+The reference scene renderer represents the active set explicitly. Occurrence
+$i$ has amplitude $a_i$, integer image center $s_i$, dictionary index $k_i$,
+and its own velocity $v_i$. Its total closeness-premultiplied ink field is
+
+$$
+I(p)
+=\sum_{i=1}^N
+a_i K_{k_i}\!\left(\exp(-v_i)(p-s_i)\right),
+$$
+
+where all four kernel channels are warped together: the first three carry
+$\tau c$ and the fourth carries optical depth $\tau$. Their sums therefore
+retain the existing renderer's compositing semantics,
+
+$$
+\tau(p)=I_4(p),\qquad
+\alpha(p)=1-\exp[-\tau(p)],\qquad
+c(p)=\frac{I_{1:3}(p)}{\tau(p)}.
+$$
+
+The implementation `vmap`s the warp over the $N$ active occurrences and then
+scatter-adds the resulting $H_g\times W_g$ patches with canvas-edge clipping.
+It costs $O(NH_gW_g)$ storage and work outside the scaling-and-squaring
+compositions, rather than materializing an $H\times W\times K$ field of warped
+kernels. At zero velocity it agrees exactly with `_stamp`, including its
+even-kernel centering convention and overlapping amplitudes.
+
+The current reference renderer deliberately keeps centers on integer image
+sites, matching the Poisson count lattice. Velocities and amplitudes are
+differentiable. Continuous placement offsets can later be absorbed into each
+occurrence's backward sampling grid or handled by the eventual deformable
+transposed-convolution implementation.
+
+Run the two-occurrence example with
+
+```shell
+python scripts/sparse_diffeomorphic_scene.py
+```
+
+## Whole-image foreground flow
+
+The simpler scene model retains the ordinary convolutional renderer and places
+one velocity field over the image:
+
+$$
+\begin{aligned}
+I_0 &= \operatorname{Stamp}(a,K),\\
+\phi &= \exp(v),\\
+I(p) &= I_0(\phi^{-1}(p)).
+\end{aligned}
+$$
+
+Only the four foreground ink channels are pulled back through $\phi^{-1}$.
+For a fixed paper field $b(p)$, the final mean remains
+
+$$
+\mu_\theta(p)
+=\alpha_I(p)c_I(p)+[1-\alpha_I(p)]b(p),
+$$
+
+so the paper does not move. The velocity latent has a fixed shape independent
+of the number of active dictionary coefficients, and `_stamp` remains one
+optimized transposed convolution.
+
+### Removing affine components
+
+Translation, rotation, scale, and shear are redundant with glyph placement and
+pose latents. Let the coarse velocity channel have the normalized prior
+
+$$
+p_\theta(u)=\mathcal N(u;0,Q^{-1}),
+$$
+
+let $R\in\mathbb R^{HW\times hw}$ be the coarse-to-image resize, let $W$ be a
+diagonal boundary window, and let $B\in\mathbb R^{HW\times3}$ contain the
+normalized image-coordinate functions
+
+$$
+B=[\mathbf 1, y, x]
+$$
+
+with $y,x\in[-1,1]$. The desired image velocity $v=WRu_\perp$ is affine-free
+when
+
+$$
+B^\top v=B^\top WRu_\perp=0.
+$$
+
+Pulling those constraints back to the coarse lattice gives
+
+$$
+C=R^\top WB\in\mathbb R^{hw\times3},
+\qquad C^\top u_\perp=0.
+$$
+
+Rather than subtracting the ordinary least-squares affine fit, we condition the
+GMRF on these three linear constraints per velocity channel. Given an
+unconstrained draw $u\sim p_\theta(u)$, define
+
+$$
+\begin{aligned}
+X &= Q^{-1}C,\\
+M &= C^\top X=C^\top Q^{-1}C,\\
+u_\perp &= u-XM^{-1}C^\top u,\\
+v &= WRu_\perp.
+\end{aligned}
+$$
+
+The resulting conditional Gaussian has covariance
+
+$$
+\operatorname{Cov}(u_\perp)
+=Q^{-1}-Q^{-1}C(C^\top Q^{-1}C)^{-1}C^\top Q^{-1}.
+$$
+
+The three scalar modes in each of two coordinate channels are the two
+translations and the four coefficients of a linear $2\times2$ map, encompassing
+rotation, scale, and shear. The sine window additionally makes $v=0$ on the
+image boundary. The implementation obtains $C$ with the transpose of automatic
+differentiation's resize map, computes $X$ with three sparse
+`SecondOrderGaussianMrf.solve_precision` right-hand sides, and solves only the
+dense $3\times3$ system $M$.
+
+This is affine-free by construction and respects the GMRF covariance geometry.
+It is also a linear transformation of the original Gaussian draw. The induced
+density over $u_\perp$ or $v$ is necessarily singular in the ambient space,
+because it lives on an exactly constrained subspace. In a generative program we
+can retain the proper, normalized latent density $p_\theta(u)$ and make
+$u_\perp$ and $v$ deterministic; the discarded affine coordinates then remain
+uninformed auxiliary randomness. A reduced-coordinate parameterization could
+remove that redundancy, but a dense null-space basis would sacrifice the GMRF's
+sparse Markov structure.
+
+Run this version with
+
+```shell
+python scripts/global_diffeomorphic_scene.py
+```
