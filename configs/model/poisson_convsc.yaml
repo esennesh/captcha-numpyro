@@ -1,5 +1,6 @@
 defaults:
   - placements/shaper/shape_dict@placements.shape_dict: sandbox
+  - _self_
 
 _target_: src.model.model.poisson_convsc_model
 _partial_: true
@@ -120,7 +121,24 @@ learn_df: false
 ambient_depth: 1.0e-4
 
 placements:
-  _target_: src.model.model.PoissonConvPlacements
+  _target_: src.model.model.TexturedDiffeomorphicPoissonConvPlacements
+  # One RGB logit texture over the canonical glyph rectangle is shared across
+  # all 36 dictionary entries in each image. It is stamped through whichever
+  # glyphs are active; there is neither a per-class nor per-occurrence field.
+  texture_bond_precision: 4.0
+  texture_element_precision: 1.0
+
+  # One stationary velocity covers the image. After removing translation,
+  # rotation, scale and shear in the GMRF covariance geometry, scaling and
+  # squaring exponentiates it and pulls back foreground ink only. A 10x10 raw
+  # lattice keeps the latent compact while the rendered flow stays 80x80.
+  warp_bond_precision: 0.4
+  warp_coarse_height: 10
+  warp_coarse_width: 10
+  warp_element_precision: 0.1
+  warp_scale: 1.5
+  warp_squaring_steps: 7
+
   # Initializes log_rate only; the rate then learns freely. Sandbox captchas carry
   # TWO characters each -- every filename has two, and every render shows two --
   # and the ELBO wants ~2 expected spikes on each, because a Poisson at lambda = 1

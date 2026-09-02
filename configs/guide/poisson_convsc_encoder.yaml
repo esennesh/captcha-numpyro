@@ -1,5 +1,7 @@
 defaults:
   - /model/placements/shaper/shape_dict@placements.shape_dict: sandbox
+  - /model/placements/shaper/shape_dict@fields.shape_dict: sandbox
+  - _self_
 
 _target_: src.inference.poisson_conv_encoder.poisson_convsc_guide
 _partial_: true
@@ -43,6 +45,20 @@ color_finder:
   rngs:
     _target_: flax.nnx.Rngs
     default: 5678
+fields:
+  _target_: src.inference.poisson_conv_encoder.ForegroundFieldGuide
+  backbone_channels: 64
+  # Start at the model's proper second-order GMRF covariances. The scalar
+  # precisions then learn while neural heads amortize the two field means.
+  texture_bond_precision: 4.0
+  texture_element_precision: 1.0
+  warp_bond_precision: 0.4
+  warp_coarse_height: 10
+  warp_coarse_width: 10
+  warp_element_precision: 0.1
+  rngs:
+    _target_: flax.nnx.Rngs
+    default: 7890
 placements:
   _target_: src.inference.poisson_conv_encoder.PoissonRateHead
   backbone_channels: 64
