@@ -1,16 +1,23 @@
-from flax import nnx
+import math
+
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array
-import math
 import numpyro
 import numpyro.distributions as dist
+from flax import nnx
+from jaxtyping import Array
 from numpyro.contrib.module import nnx_module
-from typing import Optional
 
 from src.data.dictionary import ShapeDictionary
-from src.distributions import ConcreteLogits, SpatialMixtureSameFamily
-from src import utils
+from src.distributions import (
+    SecondOrderGaussianMrf,
+    SpatialMixtureSameFamily,
+)
+from src.model.diffeomorphism import (
+    affine_free_velocity,
+    boundary_taper,
+    diffeomorphic_warp,
+)
 
 
 def _as_nhwc_dictionary(shapes: Array) -> Array:
@@ -63,13 +70,15 @@ def _dictionary_alpha_rgb(shapes: Array) -> tuple[Array, Array]:
     return alpha, rgb
 
 
-def _ink_kernel(shapes: Array) -> Array:
+def _ink_kernel(shapes: Array, color_field: Array | None = None) -> Array:
     """The stamping kernel, shaped ``(kh, kw, 4, K)`` for ``conv_transpose``.
 
     Channels 0:3 carry *premultiplied* colour ``alpha_k * rgb_k`` and channel 3
     carries ``alpha_k`` alone, so a single transposed convolution of the count
     field emits both the colour numerator and the optical depth that normalizes
-    it (see :meth:`PoissonConvPlacements.ink_field`).
+    it (see :meth:`PoissonConvPlacements.ink_field`). An optional canonical RGB
+    multiplier can be batched and is shared across every dictionary entry in
+    each batch member.
 
     The layout is HWOI as ``conv_transpose(..., transpose_kernel=True)`` wants
     it: ``O`` is the deconvolution's output channels (the 4 ink channels) and
@@ -91,7 +100,23 @@ def _ink_kernel(shapes: Array) -> Array:
     # [0., 0.999] for numerical stability at large values.
     tau = -jnp.log1p(-jnp.clip(alpha, 0., 1. - 1e-3))
     ink = jnp.concatenate((hue * tau, tau), axis=-1)  # (K, kh, kw, 4)
-    return jnp.moveaxis(ink, 0, -1)
+    ink = jnp.moveaxis(ink, 0, -1)
+    if color_field is None:
+        return ink
+
+    color_field = jnp.asarray(color_field)
+    if color_field.ndim < 3 or color_field.shape[-3:] != (
+        ink.shape[0], ink.shape[1], 3
+    ):
+        raise ValueError(
+            "color_field needs trailing shape (kh, kw, 3), got "
+            f"{color_field.shape} for kernel shape {ink.shape[:2]}"
+        )
+    colored = ink[..., :3, :] * color_field[..., jnp.newaxis]
+    depth = jnp.broadcast_to(
+        ink[..., 3:4, :], color_field.shape[:-3] + ink[..., 3:4, :].shape
+    )
+    return jnp.concatenate((colored, depth), axis=-2)
 
 
 def _stamp(counts: Array, kernel: Array) -> Array:
@@ -114,6 +139,27 @@ def _stamp(counts: Array, kernel: Array) -> Array:
     they land; nothing here depends on it, because *equivariance* holds exactly
     either way and that is the property the design uses.
     """
+    if kernel.ndim < 4:
+        raise ValueError(
+            "kernel needs trailing shape (kh, kw, C, K), "
+            f"got {kernel.shape}"
+        )
+    if kernel.ndim > 4:
+        counts_leading = counts.shape[:-3]
+        kernel_leading = kernel.shape[:-4]
+        leading = jax.lax.broadcast_shapes(counts_leading, kernel_leading)
+        count_shape = counts.shape[-3:]
+        kernel_shape = kernel.shape[-4:]
+        total = max(1, math.prod(leading))
+        counts = jnp.broadcast_to(counts, leading + count_shape).reshape(
+            (total,) + count_shape
+        )
+        kernel = jnp.broadcast_to(kernel, leading + kernel_shape).reshape(
+            (total,) + kernel_shape
+        )
+        stamped = jax.vmap(_stamp)(counts, kernel)
+        return stamped.reshape(leading + stamped.shape[-3:])
+
     kh, kw = kernel.shape[:2]
     height, width = counts.shape[-3:-1]
     # conv_transpose wants exactly one batch dim; fold any particle/plate dims.
@@ -155,7 +201,7 @@ class PoissonConvPlacements(nnx.Module):
 
     def __init__(self, shape_dict: ShapeDictionary, expected_count: float=1.,
                  img_h: int=80, img_w: int=80, *,
-                 rngs: Optional[nnx.Rngs]=None):
+                 rngs: nnx.Rngs | None=None):
         del rngs
         self.expected_count = expected_count
         self.height = img_h
@@ -190,7 +236,7 @@ class PoissonConvPlacements(nnx.Module):
                                 (1, self.height, self.width, self.num_features))
         return numpyro.sample("a", dist.Poisson(rate).to_event(3))
 
-    def ink_field(self, counts) -> Array:
+    def ink_field(self, counts, color_field: Array | None = None) -> Array:
         """Stamp the counts into an ``(..., H, W, 4)`` ink field.
 
         Channels 0:3 hold premultiplied colour and channel 3 the optical depth.
@@ -198,11 +244,171 @@ class PoissonConvPlacements(nnx.Module):
         genuinely deformable renderers (§6 of the design note) can replace this
         method without anything downstream changing.
         """
-        return jnp.clip(_stamp(counts, self.ink_kernel), 0., None)
+        kernel = (
+            self.ink_kernel
+            if color_field is None
+            else _ink_kernel(self.shape_dict.shapes, color_field)
+        )
+        return jnp.clip(_stamp(counts, kernel), 0., None)
 
-    def __call__(self, rngs=None):
+    def __call__(self, color: Array | None = None, rngs=None):
+        del color
         del rngs
         return self.ink_field(self.sample_counts())
+
+
+class TexturedDiffeomorphicPoissonConvPlacements(PoissonConvPlacements):
+    r"""Stamp one shared canonical texture and warp the complete foreground.
+
+    For an image-level baseline colour ``c_0`` and canonical texture ``r``,
+
+    .. math::
+
+        r &\sim \mathcal N(0,Q_{\mathrm{tex}}^{-1}\otimes I_3),\\
+        c(u) &= \operatorname{sigmoid}(\operatorname{logit}c_0+r(u)).
+
+    The renderer stamps the baseline-relative multiplier
+
+    .. math::
+
+        m(u)=\frac{c(u)}{c_0}
+            =\frac{\exp r(u)}{1+c_0(\exp r(u)-1)}
+
+    through every dictionary kernel and retains the former final multiplication
+    by ``c_0``. Thus there is one texture field per image, not one per glyph
+    class or occurrence, and ``r=0`` recovers the old renderer exactly. The
+    four resulting ink channels are then pulled back through one whole-image
+    diffeomorphism:
+
+    .. math::
+
+        u &\sim \mathcal N(0,Q_{\mathrm{warp}}^{-1}\otimes I_2),\\
+        v &= WR\,\operatorname{ConditionAffineFree}(u),\\
+        \phi &= \exp(v),\\
+        I(p) &= I_0(\phi^{-1}(p)).
+
+    Colour numerators and optical depth are warped together.  Background
+    compositing remains downstream, so the deformation moves foreground ink
+    only.  ``u`` is the normalized latent; conditioning, resizing, and
+    exponentiation are deterministic transformations and require no additional
+    Jacobian factor in the joint density.
+    """
+
+    def __init__(
+        self,
+        shape_dict: ShapeDictionary,
+        expected_count: float = 1.0,
+        img_h: int = 80,
+        img_w: int = 80,
+        *,
+        cg_iters: int = 300,
+        rngs: nnx.Rngs | None = None,
+        texture_bond_precision: float = 4.0,
+        texture_element_precision: float = 1.0,
+        warp_bond_precision: float = 0.4,
+        warp_coarse_height: int = 10,
+        warp_coarse_width: int = 10,
+        warp_element_precision: float = 0.1,
+        warp_scale: float = 1.5,
+        warp_squaring_steps: int = 7,
+    ):
+        super().__init__(
+            shape_dict,
+            expected_count,
+            img_h,
+            img_w,
+            rngs=rngs,
+        )
+        self.cg_iters = cg_iters
+        self.texture_bond_precision = texture_bond_precision
+        self.texture_element_precision = texture_element_precision
+        self.warp_bond_precision = warp_bond_precision
+        self.warp_coarse_height = warp_coarse_height
+        self.warp_coarse_width = warp_coarse_width
+        self.warp_element_precision = warp_element_precision
+        self.warp_scale = warp_scale
+        self.warp_squaring_steps = warp_squaring_steps
+
+    def __call__(self, color: Array | None = None, rngs=None):
+        if color is None:
+            raise ValueError(
+                "TexturedDiffeomorphicPoissonConvPlacements needs an RGB "
+                "baseline color"
+            )
+        del rngs
+        counts = self.sample_counts()
+        modulation = self.color_modulation(color)
+        return self.warp_ink(self.ink_field(counts, modulation))
+
+    def color_modulation(self, color: Array) -> Array:
+        """Sample canonical texture and return its baseline-relative colour."""
+        texture = numpyro.sample("color_texture", self.texture_prior())
+        baseline = color[..., jnp.newaxis, jnp.newaxis, :]
+        exponential = jnp.exp(texture)
+        return exponential / (
+            1.0 + baseline * jnp.expm1(texture)
+        )
+
+    def texture_prior(self) -> SecondOrderGaussianMrf:
+        """Return the normalized proper prior over canonical RGB texture."""
+        height, width = self.ink_kernel.shape[:2]
+        return SecondOrderGaussianMrf(
+            jnp.zeros((height, width, 3), dtype=self.ink_kernel.dtype),
+            self.texture_element_precision
+            * jnp.ones((height, width), dtype=self.ink_kernel.dtype),
+            jnp.asarray(
+                self.texture_bond_precision, dtype=self.ink_kernel.dtype
+            ),
+            cg_iters=self.cg_iters,
+        )
+
+    def velocity_prior(self) -> SecondOrderGaussianMrf:
+        """Return the normalized proper prior over coarse image velocity."""
+        shape = (self.warp_coarse_height, self.warp_coarse_width)
+        return SecondOrderGaussianMrf(
+            jnp.zeros((*shape, 2), dtype=self.ink_kernel.dtype),
+            self.warp_element_precision
+            * jnp.ones(shape, dtype=self.ink_kernel.dtype),
+            jnp.asarray(self.warp_bond_precision, dtype=self.ink_kernel.dtype),
+            cg_iters=self.cg_iters,
+        )
+
+    def warp_ink(self, ink: Array) -> Array:
+        """Sample one affine-free image flow and pull back foreground ink."""
+        prior = self.velocity_prior()
+        raw_velocity = numpyro.sample("warp_velocity", prior)
+        leading = jax.lax.broadcast_shapes(
+            ink.shape[:-3], raw_velocity.shape[:-3]
+        )
+        coarse_shape = raw_velocity.shape[-3:]
+        ink_shape = ink.shape[-3:]
+        total = max(1, math.prod(leading))
+        inks = jnp.broadcast_to(ink, leading + ink_shape).reshape(
+            (total,) + ink_shape
+        )
+        raw_velocities = jnp.broadcast_to(
+            raw_velocity, leading + coarse_shape
+        ).reshape((total,) + coarse_shape)
+        window = boundary_taper(
+            (self.height, self.width), dtype=ink.dtype
+        )
+
+        def warp_one(image, raw):
+            velocity = self.warp_scale * affine_free_velocity(
+                raw,
+                prior.solve_precision,
+                (self.height, self.width),
+                window=window,
+            )
+            return diffeomorphic_warp(
+                image,
+                velocity,
+                squaring_steps=self.warp_squaring_steps,
+            )
+
+        warped = jax.vmap(warp_one)(inks, raw_velocities)
+        return warped.reshape(leading + ink_shape)
+
 
 class BackgroundDecoder(nnx.Module):
     def __init__(self, embedding_dim: int=50, height=60, hiddens=400, width=160,
@@ -347,7 +553,7 @@ def _observation_df(opacity, observation_df, learn_df: bool=False,
                      f"{df_couples_to!r}")
 
 
-def generate_poisson_convsc(placements, backgrounder: Optional[BackgroundDecoder]=None,
+def generate_poisson_convsc(placements, backgrounder: BackgroundDecoder | None=None,
                             ambient_depth: float=1e-4):
     """Composite the ink field over the background into ``(foreground, background, opacity)``.
 
@@ -380,9 +586,7 @@ def generate_poisson_convsc(placements, backgrounder: Optional[BackgroundDecoder
     # mean-field guide can mirror it without proposing colours off-support.
     color = numpyro.sample("color", dist.Beta(jnp.ones((3,)),
                                               jnp.ones((3,))).to_event(1))
-    color = color[..., jnp.newaxis, jnp.newaxis, :]
-
-    ink = placements()
+    ink = placements(color)
     depth = ink[..., 3:]
     # Premultiplied colour divided by optical depth is the depth-weighted mean
     # ink colour. A Poisson process has no depth ordering -- its points are
@@ -390,13 +594,17 @@ def generate_poisson_convsc(placements, backgrounder: Optional[BackgroundDecoder
     # ordered "over". With a white dictionary this is identically 1.
     #
     # Where there is no ink the ratio is 0/0 and the mean ink colour is simply
-    # undefined; fall back to 1, so the foreground component reads "if this
-    # pixel were ink, it would be this image's ink colour". Falling back to 0
-    # (black) instead would make the foreground hypothesis wrong in a way that
-    # depends on the glyph dictionary rather than on the image.
-    tint = jnp.where(depth > 1e-6, ink[..., :3] / jnp.clip(depth, 1e-6, None),
-                     1.)
-    foreground = tint * color
+    # undefined; fall back to the image-level baseline, so the foreground
+    # component still reads "if this pixel were ink, it would have this image's
+    # ink colour". Falling back to black would make the hypothesis wrong in a
+    # way that depends on the glyph dictionary rather than on the image.
+    fallback = jnp.ones_like(color[..., jnp.newaxis, jnp.newaxis, :])
+    tint = jnp.where(
+        depth > 1e-6,
+        ink[..., :3] / jnp.clip(depth, 1e-6, None),
+        fallback,
+    )
+    foreground = tint * color[..., jnp.newaxis, jnp.newaxis, :]
 
     if backgrounder is not None:
         background = backgrounder()
@@ -412,7 +620,7 @@ def generate_poisson_convsc(placements, backgrounder: Optional[BackgroundDecoder
 
 
 def poisson_convsc_model(images, placements: PoissonConvPlacements,
-                         backgrounder: Optional[BackgroundDecoder]=None,
+                         backgrounder: BackgroundDecoder | None=None,
                          ambient_depth: float=1e-4,
                          df_couples_to: str="opacity",
                          learn_df: bool=False,
