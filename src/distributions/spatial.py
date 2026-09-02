@@ -403,8 +403,10 @@ class SecondOrderGaussianMrf(Distribution):
 
     arg_constraints = {
         "bond_precision": constraints.greater_than(0.),
-        "element_precision": constraints.greater_than(0.),
-        "loc": constraints.real,
+        "element_precision": constraints.independent(
+            constraints.greater_than(0.), 2
+        ),
+        "loc": constraints.independent(constraints.real, 3),
     }
     pytree_data_fields = ("_mask_h", "_mask_v", "bond_precision",
                           "element_precision", "loc")
