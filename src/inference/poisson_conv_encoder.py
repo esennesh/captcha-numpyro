@@ -38,17 +38,16 @@ site through its score-function surrogate with a leave-one-out baseline. No
 relaxation is involved anywhere in this guide.
 """
 
-from typing import Optional, Tuple
-
-from flax import nnx
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Float
 import numpyro
 import numpyro.distributions as dist
+from flax import nnx
+from jaxtyping import Array, Float
 from numpyro.contrib.module import nnx_module
 
 from src.data.dictionary import ShapeDictionary
+from src.distributions import SecondOrderGaussianMrf
 from src.inference.captcha_encoder import _valid_num_groups
 from src.model.model import _dictionary_alpha_rgb
 
@@ -92,8 +91,8 @@ class PoissonConvBackbone(nnx.Module):
     the equivariance that makes the count field and the image the same grid.
     """
 
-    def __init__(self, hidden_dims: Tuple[int, ...]=(32, 64, 64, 64, 64),
-                 dilations: Tuple[int, ...]=(1, 2, 4, 8, 16),
+    def __init__(self, hidden_dims: tuple[int, ...]=(32, 64, 64, 64, 64),
+                 dilations: tuple[int, ...]=(1, 2, 4, 8, 16),
                  in_channels: int=3, max_groups: int=32, *, rngs: nnx.Rngs):
         if len(hidden_dims) != len(dilations):
             raise ValueError(
@@ -236,6 +235,121 @@ class PoissonRateHead(nnx.Module):
         return numpyro.sample("a", dist.Poisson(jnp.exp(log_rate)).to_event(3))
 
 
+class ForegroundFieldGuide(nnx.Module):
+    r"""Correlated amortized proposals for texture and raw warp velocity.
+
+    The canonical texture location is decoded from globally pooled image
+    features, while the image-coordinate velocity location is decoded from the
+    same features after resizing them to the coarse velocity lattice.  Both
+    proposal covariances retain the model's proper second-order GMRF form:
+
+    .. math::
+
+        q_\phi(r\mid x)
+        &=\mathcal N(r;m_{\phi,r}(x),Q_{\phi,r}^{-1}),\\
+        q_\phi(u\mid x)
+        &=\mathcal N(u;m_{\phi,u}(x),Q_{\phi,u}^{-1}).
+
+    Their scalar element and bond precisions are learned.  The velocity guide
+    proposes the unconstrained coarse ``u`` sampled by the model; affine
+    conditioning remains the same deterministic model transformation for every
+    proposal sample.
+    """
+
+    def __init__(
+        self,
+        shape_dict: ShapeDictionary,
+        backbone_channels: int = 64,
+        *,
+        cg_iters: int = 300,
+        rngs: nnx.Rngs,
+        texture_bond_precision: float = 4.0,
+        texture_element_precision: float = 1.0,
+        warp_bond_precision: float = 0.4,
+        warp_coarse_height: int = 10,
+        warp_coarse_width: int = 10,
+        warp_element_precision: float = 0.1,
+    ):
+        dictionary = jnp.asarray(shape_dict.shapes)
+        if dictionary.ndim != 4:
+            raise ValueError(
+                "shape_dict.shapes needs shape (K, kh, kw, C), "
+                f"got {dictionary.shape}"
+            )
+        self.cg_iters = cg_iters
+        self.kernel_height = dictionary.shape[1]
+        self.kernel_width = dictionary.shape[2]
+        self.texture_bond_precision = texture_bond_precision
+        self.texture_element_precision = texture_element_precision
+        self.texture_head = nnx.Linear(
+            backbone_channels,
+            self.kernel_height * self.kernel_width * 3,
+            bias_init=nnx.initializers.zeros_init(),
+            kernel_init=nnx.initializers.zeros_init(),
+            rngs=rngs,
+        )
+        self.velocity_head = nnx.Conv(
+            backbone_channels,
+            2,
+            (1, 1),
+            bias_init=nnx.initializers.zeros_init(),
+            kernel_init=nnx.initializers.zeros_init(),
+            rngs=rngs,
+        )
+        self.warp_bond_precision = warp_bond_precision
+        self.warp_coarse_height = warp_coarse_height
+        self.warp_coarse_width = warp_coarse_width
+        self.warp_element_precision = warp_element_precision
+
+    def __call__(self, features: Float[Array, "B H W C_feat"]):
+        texture_loc = self.texture_head(features.mean(axis=(1, 2))).reshape(
+            features.shape[0], self.kernel_height, self.kernel_width, 3
+        )
+        texture_bond_precision = jnp.exp(numpyro.param(
+            "log_color_texture_bond_precision_q",
+            jnp.log(jnp.asarray(self.texture_bond_precision)),
+        ))
+        texture_element_precision = jnp.exp(numpyro.param(
+            "log_color_texture_element_precision_q",
+            jnp.log(jnp.asarray(self.texture_element_precision)),
+        ))
+        numpyro.sample(
+            "color_texture",
+            SecondOrderGaussianMrf(
+                texture_loc,
+                texture_element_precision
+                * jnp.ones((self.kernel_height, self.kernel_width)),
+                texture_bond_precision,
+                cg_iters=self.cg_iters,
+            ),
+        )
+
+        coarse_shape = (self.warp_coarse_height, self.warp_coarse_width)
+        resized = jax.image.resize(
+            features,
+            (features.shape[0], *coarse_shape, features.shape[-1]),
+            method="cubic",
+        )
+        velocity_loc = self.velocity_head(resized)
+        warp_bond_precision = jnp.exp(numpyro.param(
+            "log_warp_bond_precision_q",
+            jnp.log(jnp.asarray(self.warp_bond_precision)),
+        ))
+        warp_element_precision = jnp.exp(numpyro.param(
+            "log_warp_element_precision_q",
+            jnp.log(jnp.asarray(self.warp_element_precision)),
+        ))
+        numpyro.sample(
+            "warp_velocity",
+            SecondOrderGaussianMrf(
+                velocity_loc,
+                warp_element_precision * jnp.ones(coarse_shape),
+                warp_bond_precision,
+                cg_iters=self.cg_iters,
+            ),
+        )
+
+
 class InkColorFinder(nnx.Module):
     """Amortized ``q(color)``, located by a closed-form estimate off the image.
 
@@ -313,7 +427,7 @@ class InkColorFinder(nnx.Module):
         )
 
     def estimate(self, images: Float[Array, "B H W 3"]
-                 ) -> Tuple[Float[Array, "B 3"], Float[Array, "B 1"]]:
+                 ) -> tuple[Float[Array, "B 3"], Float[Array, "B 1"]]:
         """Closed-form ink colour and ink mass, ``(B, 3)`` and ``(B, 1)``.
 
         Inverting the model's own compositing over a white background: with
@@ -398,15 +512,19 @@ class InkColorFinder(nnx.Module):
 def poisson_convsc_guide(images, backbone: PoissonConvBackbone,
                          placements: PoissonRateHead,
                          color_finder: InkColorFinder,
-                         backgrounder: Optional[nnx.Module]=None):
+                         fields: ForegroundFieldGuide | None=None,
+                         backgrounder: nnx.Module | None=None):
     """Guide mirroring :func:`src.model.model.poisson_convsc_model`.
 
-    Samples the same two latent sites the model does -- ``a`` with event shape
-    ``(H, W, K)`` and ``color`` with event shape ``(3,)`` -- inside the same
-    ``batch`` plate.
+    Samples the model's ``a``, ``color``, ``color_texture``, and
+    ``warp_velocity`` sites inside the same ``batch`` plate.  Passing
+    ``fields=None`` retains compatibility with an untextured, unwarped
+    :class:`~src.model.model.PoissonConvPlacements`.
     """
     backbone = nnx_module("backbone_q", backbone)
     color_finder = nnx_module("color_finder_q", color_finder)
+    if fields is not None:
+        fields = nnx_module("fields_q", fields)
     placements = nnx_module("placements_q", placements)
     if backgrounder is not None:
         backgrounder = nnx_module("backgrounder_q", backgrounder)
@@ -414,6 +532,8 @@ def poisson_convsc_guide(images, backbone: PoissonConvBackbone,
     with numpyro.plate("batch", images.shape[0]):
         features = backbone(images)
         color_finder(features, images)
+        if fields is not None:
+            fields(features)
         if backgrounder is not None:
             backgrounder(features)
         placements(features, images)
