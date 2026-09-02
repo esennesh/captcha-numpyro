@@ -119,7 +119,10 @@ to allocate a total firing mass across anchors and glyphs. With an explicit inte
 - The KL-collapse failure recorded for `z_mark`'s Concrete density — gone. No relaxation, no
   temperature, and the Poisson log-density is bounded above on its support.
 
-The model's entire latent surface is now `a` and `color`.
+At this stage the model's entire latent surface was `a` and `color`. As of the
+2026-09-01 foreground-field integration, the active model adds the continuous
+`color_texture` and `warp_velocity` sites described in §§3 and 6. The discrete
+structural surface remains the single count field `a`.
 
 ---
 
@@ -181,8 +184,20 @@ With today's white dictionary `c_bar == 1` identically and this collapses to a s
 ink colour. **Decision: keep the 4-channel form anyway**, so coloured dictionary entries drop
 in later. It costs one extra output channel.
 
-Ink colour stays as it is today — `color ~ Beta(1,1)^3`, per image — and the foreground is
-`fg = c_bar * color`.
+The image-level baseline remains `color ~ Beta(1,1)^3`. It now anchors a shared
+canonical logit texture
+
+```
+color_texture ~ SecondOrderGaussianMrf(0, Q_texture)
+color_field(u) = sigmoid(logit(color) + color_texture(u))
+color_modulation(u) = color_field(u) / color
+```
+
+of shape `(kh, kw, 3)`. The same baseline-relative modulation multiplies every
+dictionary kernel before stamping, after which the old compositor multiplies by
+`color`. There are not 36 class-specific fields and not one field per active
+occurrence. At `color_texture = 0`, the modulation is exactly one, recovering
+the former global-colour renderer, `fg = c_bar * color`, without a special case.
 
 ### The ink field
 
@@ -390,6 +405,21 @@ written down by hand. That is a third argument for the mixture, on top of the tw
 ## 6. The seam for deformable convolutions
 
 The ink field of §3 is the seam. Three rungs, each a drop-in replacement:
+
+The implemented main-line model now takes a whole-image variant of rung 2:
+
+```
+ink0 = render_dense(counts, color_field)
+warp_velocity ~ SecondOrderGaussianMrf(0, Q_warp)
+velocity = affine_free(resize(warp_velocity))
+ink = pullback(ink0, exp(velocity))
+```
+
+It warps the complete four-channel foreground after stamping, so glyph centres
+may move together with their strokes while the paper remains fixed. This keeps
+the latent shape independent of the number of active glyphs and retains the
+optimized transposed convolution. Per-occurrence fields remain a tested
+reference, not the active generative path.
 
 1. **`render_dense(counts)`** — the transposed convolution above. Rigid stamps.
 2. **`render_warped_dense(counts, warp)`** — sample a per-image warp latent (affine 6-dof, or a

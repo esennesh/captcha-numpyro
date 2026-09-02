@@ -245,3 +245,55 @@ Run this version with
 ```shell
 python scripts/global_diffeomorphic_scene.py
 ```
+
+## Main-model integration
+
+`TexturedDiffeomorphicPoissonConvPlacements` installs the prototype in the
+Poisson CAPTCHA generative model. For each observed image, the normalized
+latent factors are
+
+$$
+\begin{aligned}
+p_\theta(a)
+&=\prod_{k,y,x}\operatorname{Poisson}(a_{kyx};\lambda),\\
+p_\theta(c_0)
+&=\prod_{j=1}^3\operatorname{Beta}(c_{0j};1,1),\\
+p_\theta(r)
+&=\mathcal N(r;0,Q_{\mathrm{tex}}^{-1}\otimes I_3),\\
+p_\theta(u)
+&=\mathcal N(u;0,Q_{\mathrm{warp}}^{-1}\otimes I_2).
+\end{aligned}
+$$
+
+The deterministic renderer is
+
+$$
+\begin{aligned}
+c(s)&=\operatorname{sigmoid}(\operatorname{logit}c_0+r(s)),\\
+m(s)&=\frac{c(s)}{c_0}
+     =\frac{\exp r(s)}{1+c_0(\exp r(s)-1)},\\
+I_0&=\operatorname{Stamp}(a,K\odot m),\\
+u_\perp&=\operatorname{ConditionAffineFree}(u),\\
+v&=WRu_\perp,\\
+\phi&=\exp(v),\\
+I(p)&=I_0(\phi^{-1}(p)).
+\end{aligned}
+$$
+
+Here `color_texture` is one canonical field shared across the dictionary, while
+`warp_velocity` is one image-coordinate field shared by every foreground glyph.
+Only after the four ink channels have been warped does the existing likelihood
+recover foreground colour, multiply it by the baseline $c_0$, and composite it
+over paper. The baseline-relative $m$ preserves the old compositor and makes
+$r=0$ exactly its former global-colour path. Setting both fields to zero
+therefore recovers the former renderer exactly.
+
+The amortized proposal mirrors both sites with proper second-order GMRFs,
+
+$$
+q_\phi(r\mid x)=\mathcal N(r;m_{\phi,r}(x),Q_{\phi,r}^{-1}),\qquad
+q_\phi(u\mid x)=\mathcal N(u;m_{\phi,u}(x),Q_{\phi,u}^{-1}),
+$$
+
+using a globally decoded canonical texture mean and a coarse convolutional
+velocity mean. Their scalar element and bond precisions are learned.
