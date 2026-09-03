@@ -7,9 +7,10 @@ classes_per_location: 3
 min_distance: 6.0
 num_candidates: 12
 
-# Proposal initialization only: redistribute this expected count over the
-# shortlist so the first importance grid contains nonblank explanations.
-# null reuses placements.expected_count. The model prior remains unchanged.
+# Proposal initialization only: put most expected count on the top alpha-mask
+# class at each location while reserving mass for the retained alternatives.
+# null count mass reuses placements.expected_count. The model prior is unchanged.
+initial_alternative_fraction: 0.2
 initial_count_mass: null
 
 # K alternatives are drawn independently for each of the four latent sites.

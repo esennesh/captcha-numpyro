@@ -13,7 +13,7 @@ from numpyro.distributions.exp_family import from_mean_params, mean_params
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
 from src.data.dictionary import ShapeDictionary
-from src.inference.qem_online import QEMCaptchaInference
+from src.inference.qem_online import QEMCaptchaInference, _initial_candidate_mean
 from src.model.model import (
     TexturedDiffeomorphicPoissonConvPlacements,
     poisson_convsc_model,
@@ -49,6 +49,18 @@ def test_beta_mean_parameter_round_trip():
     np.testing.assert_allclose(
         matched.concentration0, target.concentration0, rtol=1e-5
     )
+
+
+def test_candidate_initialization_favors_the_best_class_at_each_location():
+    sites = jnp.asarray(
+        ((2, 3, 0), (2, 3, 1), (6, 7, 0), (6, 7, 1))
+    )
+    means = _initial_candidate_mean(
+        jnp.zeros((1, 4)), sites, alternative_fraction=0.2, count_mass=2.0
+    )
+
+    np.testing.assert_allclose(means, ((0.8, 0.2, 0.8, 0.2),))
+    np.testing.assert_allclose(means.sum(), 2.0)
 
 
 def test_qem_runs_on_candidate_restricted_captcha():

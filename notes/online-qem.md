@@ -9,8 +9,8 @@ training an amortized encoder.
 
 The full activation tensor has $80\cdot80\cdot36=230{,}400$ coordinates. A
 single QEM alternative for that entire tensor almost never lands near a useful
-CAPTCHA explanation. Before inference, normalized cross-correlation between
-image darkness and dictionary alpha masks selects a small set $S$ of
+CAPTCHA explanation. Before inference, alpha-normalized matched filtering of
+image darkness against dictionary masks selects a small set $S$ of
 $(y,x,k)$ candidates. Several glyph identities are retained at each
 non-maximum-suppressed spatial location.
 
@@ -29,10 +29,23 @@ changes the reported `log P_MP(x)` by a constant but changes neither normalized
 importance weights nor posterior moments.
 
 The model still assigns every candidate its original homogeneous rate
-$\lambda$. The initial proposal instead redistributes the configured expected
-count mass over $S$. Without this proposal-only initialization, nearly every
-first-round count vector is zero because the model rate was originally spread
-over 230,400 sites, leaving QEM no nonblank alternative to reweight.
+$\lambda$. At each selected location, candidates are ordered by their alpha-mask
+score. The initial proposal assigns a fraction $1-\rho$ of the configured count
+mass to the best class at each location and distributes the exploration fraction
+$\rho$ over the other retained classes:
+
+$$
+m_i^{(0)}=
+\begin{cases}
+(1-\rho)M/L,&i\text{ is a location's best class},\\
+\rho M/(|S|-L),&\text{otherwise},
+\end{cases}
+$$
+
+where $M$ is the configured initial count mass and $L$ the number of spatial
+locations. Without this proposal-only initialization, nearly every first-round
+count vector is zero because the model rate was originally spread over 230,400
+sites. The original $p_\theta$ is unchanged.
 
 ## QEM update
 

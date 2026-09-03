@@ -26,6 +26,7 @@ from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import numpyro
 from jax.scipy.special import digamma, polygamma
 from numpyro import handlers
@@ -155,6 +156,37 @@ def _gmrf_sufficient_statistics(
     return {"x": value}
 
 
+def _initial_candidate_mean(
+    candidate_mean: jax.Array,
+    candidate_sites: jax.Array,
+    alternative_fraction: float,
+    count_mass: float,
+) -> jax.Array:
+    """Put most initial mass on the best class at each spatial location."""
+    candidate_numpy = np.asarray(candidate_sites)
+    first_indices = []
+    locations = set()
+    for index, (y, x, _) in enumerate(candidate_numpy):
+        location = (int(y), int(x))
+        if location not in locations:
+            first_indices.append(index)
+            locations.add(location)
+
+    num_alternatives = candidate_sites.shape[0] - len(first_indices)
+    if num_alternatives:
+        alternative_mean = (
+            alternative_fraction * count_mass / num_alternatives
+        )
+        initial_mean = jnp.full_like(candidate_mean, alternative_mean)
+        primary_mean = (
+            (1.0 - alternative_fraction) * count_mass / len(first_indices)
+        )
+    else:
+        initial_mean = jnp.zeros_like(candidate_mean)
+        primary_mean = count_mass / len(first_indices)
+    return initial_mean.at[..., jnp.asarray(first_indices)].set(primary_mean)
+
+
 def _solve_beta_parameters(
     expected_log_x: jax.Array,
     expected_log1m_x: jax.Array,
@@ -230,6 +262,7 @@ class QEMCaptchaInference:
         *,
         classes_per_location: int = 3,
         forget: float | None = None,
+        initial_alternative_fraction: float = 0.2,
         initial_count_mass: float | None = None,
         min_distance: float = 6.0,
         num_candidates: int = 12,
@@ -244,6 +277,8 @@ class QEMCaptchaInference:
             "warp_velocity",
         ),
     ):
+        if not 0.0 <= initial_alternative_fraction < 1.0:
+            raise ValueError("initial_alternative_fraction needs to be in [0, 1)")
         if initial_count_mass is not None and initial_count_mass <= 0:
             raise ValueError("initial_count_mass needs to be positive")
         if num_posterior_samples < 1:
@@ -254,6 +289,7 @@ class QEMCaptchaInference:
             raise ValueError("num_steps needs to be positive")
         self.classes_per_location = classes_per_location
         self.forget = forget
+        self.initial_alternative_fraction = initial_alternative_fraction
         self.initial_count_mass = initial_count_mass
         self.min_distance = min_distance
         self.model = model
@@ -293,8 +329,11 @@ class QEMCaptchaInference:
         initial_means = state.mean_params.copy()
         candidate_mean = initial_means["candidate_counts"]["x"]
         initial_means["candidate_counts"] = {
-            "x": jnp.full_like(
-                candidate_mean, initial_count_mass / self.num_candidates
+            "x": _initial_candidate_mean(
+                candidate_mean,
+                sites,
+                self.initial_alternative_fraction,
+                initial_count_mass,
             )
         }
         state = state._replace(mean_params=initial_means)
