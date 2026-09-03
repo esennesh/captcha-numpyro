@@ -17,6 +17,7 @@ dsgd_kwargs:
 # Fit a factorized proposal around the relaxed joint MAP, then draw exact
 # particles from that proposal and self-normalize their importance weights.
 init_dispersion: 0.1
+initial_count_mass: null
 num_dispersion_particles: 8
 num_importance_samples: 64
 optimizer_options:

@@ -11,7 +11,10 @@ from flax import nnx
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
 from src.data.dictionary import ShapeDictionary
-from src.inference.map_proposal_online import MAPProposalCaptchaInference
+from src.inference.map_proposal_online import (
+    MAPProposalCaptchaInference,
+    _initial_guide_values,
+)
 from src.model.model import (
     TexturedDiffeomorphicPoissonConvPlacements,
     poisson_convsc_model,
@@ -35,6 +38,21 @@ def make_model():
         warp_scale=0.0,
     )
     return functools.partial(poisson_convsc_model, placements=placements)
+
+
+def test_initial_values_form_a_coherent_foreground_explanation():
+    image = jnp.ones((1, 9, 9, 3)).at[:, 3:6, 4, :].set(0.1)
+    sites = jnp.asarray(
+        ((2, 3, 0), (2, 3, 1), (6, 7, 0), (6, 7, 1))
+    )
+    values = _initial_guide_values(make_model(), sites, image, count_mass=2.0)
+
+    np.testing.assert_allclose(values["candidate_counts"].sum(), 2.0)
+    assert values["candidate_counts"][0, 0] > values["candidate_counts"][0, 1]
+    assert values["candidate_counts"][0, 2] > values["candidate_counts"][0, 3]
+    np.testing.assert_allclose(values["color"], ((0.1, 0.1, 0.1),))
+    np.testing.assert_allclose(values["color_texture"], 0.0)
+    np.testing.assert_allclose(values["warp_velocity"], 0.0)
 
 
 def test_map_proposal_runs_on_candidate_restricted_captcha():

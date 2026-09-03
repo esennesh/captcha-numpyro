@@ -33,9 +33,11 @@ from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import numpyro
 from numpyro import handlers
 from numpyro.contrib.map_proposal import AutoMAPProposal
+from numpyro.infer.initialization import init_to_value
 from numpyro.infer.util import get_importance_trace
 
 from src.inference.online import restrict_poisson_model
@@ -79,6 +81,54 @@ def _frozen_guide(guide: AutoMAPProposal):
         return result
 
     return sample
+
+
+def _initial_guide_values(model, candidate_sites, images, count_mass):
+    """Construct a coherent, neutral starting CAPTCHA explanation."""
+    candidate_numpy = np.asarray(candidate_sites)
+    first_indices = []
+    locations = set()
+    for index, (y, x, _) in enumerate(candidate_numpy):
+        location = (int(y), int(x))
+        if location not in locations:
+            first_indices.append(index)
+            locations.add(location)
+
+    placements = model.keywords["placements"]
+    minimum_count = jnp.minimum(
+        jnp.asarray(1e-3, dtype=images.dtype),
+        count_mass / (2.0 * candidate_sites.shape[0]),
+    )
+    candidate_counts = jnp.full(
+        (1, candidate_sites.shape[0]), minimum_count, dtype=images.dtype
+    )
+    remaining_count = count_mass - minimum_count * (
+        candidate_sites.shape[0] - len(first_indices)
+    )
+    candidate_counts = candidate_counts.at[0, jnp.asarray(first_indices)].set(
+        remaining_count / len(first_indices)
+    )
+    color = jnp.clip(
+        jnp.quantile(images, 0.01, axis=(0, 1, 2)), 1e-3, 1.0 - 1e-3
+    )[jnp.newaxis]
+    color_texture = jnp.zeros(
+        (1, *placements.ink_kernel.shape[:2], 3), dtype=images.dtype
+    )
+    warp_velocity = jnp.zeros(
+        (
+            1,
+            placements.warp_coarse_height,
+            placements.warp_coarse_width,
+            2,
+        ),
+        dtype=images.dtype,
+    )
+    return {
+        "candidate_counts": candidate_counts,
+        "color": color,
+        "color_texture": color_texture,
+        "warp_velocity": warp_velocity,
+    }
 
 
 def _stabilize_fitted_guide(guide: AutoMAPProposal) -> None:
@@ -133,18 +183,22 @@ class MAPProposalCaptchaInference:
         discrete_temperature: float = 0.1,
         dsgd_kwargs: dict | None = None,
         init_dispersion: float = 0.1,
+        initial_count_mass: float | None = None,
         min_distance: float = 6.0,
         num_candidates: int = 12,
         num_dispersion_particles: int = 8,
         num_importance_samples: int = 64,
         optimizer_options: dict | None = None,
     ):
+        if initial_count_mass is not None and initial_count_mass <= 0:
+            raise ValueError("initial_count_mass needs to be positive")
         if num_importance_samples < 1:
             raise ValueError("num_importance_samples needs to be positive")
         self.classes_per_location = classes_per_location
         self.discrete_temperature = discrete_temperature
         self.dsgd_kwargs = dsgd_kwargs
         self.init_dispersion = init_dispersion
+        self.initial_count_mass = initial_count_mass
         self.min_distance = min_distance
         self.model = model
         self.num_candidates = num_candidates
@@ -162,11 +216,20 @@ class MAPProposalCaptchaInference:
             min_distance=self.min_distance,
             num_candidates=self.num_candidates,
         )
+        initial_count_mass = (
+            self.model.keywords["placements"].expected_count
+            if self.initial_count_mass is None
+            else self.initial_count_mass
+        )
+        initial_values = _initial_guide_values(
+            model, candidate_sites, images, initial_count_mass
+        )
         guide = AutoMAPProposal(
             model,
             discrete_temperature=self.discrete_temperature,
             dsgd_kwargs=self.dsgd_kwargs,
             init_dispersion=self.init_dispersion,
+            init_loc_fn=init_to_value(values=initial_values),
             num_dispersion_particles=self.num_dispersion_particles,
             optimizer_options=self.optimizer_options,
         )

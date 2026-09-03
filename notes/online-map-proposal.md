@@ -28,6 +28,18 @@ original joint density on the restricted support. Candidate selection is still
 an inference approximation: a true glyph omitted from $S$ cannot be recovered.
 The canonical texture and whole-image affine-free warp remain latent in full.
 
+The original homogeneous model rate is only about $4/230{,}400$ per site. An
+optimizer initialized from that rate starts effectively on the all-zero count
+boundary, even though its search now contains only a few sites. At each selected
+location, candidates are ordered by their alpha-mask score. The guide puts the
+configured expected count mass on the best initial class at each location and
+puts the other relaxed counts just inside their positive support. It initializes
+the color from the darkest image percentile and starts texture and velocity at
+zero. This is one coherent, unwarped CAPTCHA explanation rather than a
+translucent superposition of every class alternative. It changes only the
+optimizer's initial point; every objective evaluation still uses the original
+$p_\theta(a_S,a_{\neg S}=0)$ above.
+
 ## Fitted proposal
 
 For the restricted latent vector
