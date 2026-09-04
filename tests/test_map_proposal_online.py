@@ -65,13 +65,18 @@ def test_map_proposal_runs_on_candidate_restricted_captcha():
         num_candidates=1,
         num_dispersion_particles=2,
         num_importance_samples=3,
-        optimizer_options={"maxiter": 2},
+        map_max_steps=2,
+        proposal_max_steps=2,
     )
     result = inference(jax.random.key(3), image)
 
     assert result.candidate_sites.shape == (1, 3)
     assert result.log_weights.shape == (3,)
+    assert result.map_losses.shape == (2,)
+    assert result.map_num_steps == 2
     assert result.reconstructions.shape == (3, 1, 9, 9, 3)
+    assert result.dispersion_losses.shape == (2,)
+    assert result.dispersion_num_steps == 2
     assert result.weighted_reconstruction.shape == (1, 9, 9, 3)
     assert set(result.samples) == {
         "candidate_counts",

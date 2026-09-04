@@ -31,9 +31,10 @@ def main(arguments: argparse.Namespace) -> None:
         online_config = hydra.compose(config_name="online/map_proposal")
     model = hydra.utils.instantiate(model_config.model)
     online = hydra.utils.instantiate(online_config.online)(model)
+    online.map_max_steps = arguments.map_max_steps
     online.num_dispersion_particles = arguments.num_dispersion_particles
     online.num_importance_samples = arguments.num_importance_samples
-    online.optimizer_options = {"maxiter": arguments.maxiter}
+    online.proposal_max_steps = arguments.proposal_max_steps
 
     images = load_image(
         arguments.image,
@@ -53,22 +54,30 @@ def main(arguments: argparse.Namespace) -> None:
     figure.savefig(arguments.output, dpi=150)
 
     print(f"candidate sites:\n{np.asarray(result.candidate_sites)}")
-    print(f"dispersion converged: {bool(result.dispersion_converged)}")
+    print(
+        "dispersion fit: "
+        f"{int(result.dispersion_num_steps)} steps, "
+        f"converged={bool(result.dispersion_converged)}"
+    )
     print(f"effective sample size: {float(result.effective_sample_size):.2f}")
     print(f"largest normalized weight: {float(result.normalized_weights.max()):.4f}")
-    print(f"MAP converged: {bool(result.map_converged)}")
+    print(
+        f"MAP fit: {int(result.map_num_steps)} steps, "
+        f"converged={bool(result.map_converged)}"
+    )
     print(f"saved {arguments.output}")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image", type=Path)
-    parser.add_argument("--maxiter", default=20, type=int)
+    parser.add_argument("--map-max-steps", default=200, type=int)
     parser.add_argument("--num-dispersion-particles", default=8, type=int)
     parser.add_argument("--num-importance-samples", default=64, type=int)
     parser.add_argument(
         "--output", default=Path("map-proposal-online.png"), type=Path
     )
+    parser.add_argument("--proposal-max-steps", default=200, type=int)
     parser.add_argument("--seed", default=0, type=int)
     return parser.parse_args()
 

@@ -18,7 +18,17 @@ dsgd_kwargs:
 # particles from that proposal and self-normalize their importance weights.
 init_dispersion: 0.1
 initial_count_mass: null
+map_max_steps: 200
+map_optimizer:
+  _target_: numpyro.optim.Adam
+  step_size: 0.01
+map_tolerance: 1.0e-5
 num_dispersion_particles: 8
 num_importance_samples: 64
-optimizer_options:
-  maxiter: 20
+proposal_max_steps: 200
+proposal_optimizer:
+  _target_: numpyro.optim.Adam
+  step_size: 0.01
+proposal_tolerance: 1.0e-3
+termination_check_interval: 20
+termination_patience: 5
