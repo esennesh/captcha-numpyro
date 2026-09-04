@@ -7,10 +7,10 @@ self-normalized importance sampling.
 
 ## Restricted count support
 
-The full activation tensor has $80\cdot80\cdot36=230{,}400$ coordinates. A
-dense BFGS solve over that count tensor and the continuous fields would require
-an impractical dense inverse-Hessian approximation. Before optimization, an
-alpha-mask matched filter selects a small set $S$ of $(y,x,k)$ candidates.
+The full activation tensor has $80\cdot80\cdot36=230{,}400$ coordinates.
+Optimizing every count coordinate together with the continuous fields would be
+impractical. Before optimization, an alpha-mask matched filter selects a small
+set $S$ of $(y,x,k)$ candidates.
 Spatial non-maximum suppression keeps separated locations, while several glyph
 identities remain possible at each location.
 
@@ -57,8 +57,29 @@ $$
   \log\gamma_{\theta,\eta}(\widetilde z;x).
 $$
 
-It then fits a factorized proposal $q_\phi(z\mid x)$ around that mode by
-minimizing a fixed-randomness Monte Carlo estimate of
+It then fits a factorized proposal $q_\phi(z\mid x)$ around that mode. Both
+phases use an iterative NumPyro or Optax optimizer. For example, Adam updates a
+parameter vector $v_t$ from a stochastic loss gradient $g_t$ as
+
+$$
+\begin{aligned}
+g_t &= \nabla_v \widehat{\mathcal L}_t(v_t),\\
+m_t &= \beta_1m_{t-1}+(1-\beta_1)g_t,\\
+r_t &= \beta_2r_{t-1}+(1-\beta_2)g_t^2,\\
+v_{t+1} &= v_t-\rho
+\frac{\widehat m_t}{\sqrt{\widehat r_t}+\epsilon}.
+\end{aligned}
+$$
+
+For the MAP phase, $v$ is the unconstrained relaxed latent vector and
+
+$$
+\mathcal L_{\mathrm{MAP}}(v)
+=-\log\gamma_{\theta,\eta}(T(v);x),
+$$
+
+where $T$ maps unconstrained values to each site's support. For the dispersion
+phase, $v=\phi$ and each step uses fresh Monte Carlo draws to estimate
 
 $$
 \mathbb E_{q_\phi(\widetilde z\mid x)}
@@ -72,10 +93,25 @@ Continuous sites use transformed Normal factors centered at the MAP. Count
 sites use exact GammaCount factors after fitting, so the particles evaluated by
 the original model contain integer counts.
 
+The two maximum-step settings are safety caps. After each interval of $K$
+steps, the fitter computes the average loss $\overline{\mathcal L}_j$. An
+improvement over the best previous interval $b_{j-1}$ is meaningful when
+
+$$
+b_{j-1}-\overline{\mathcal L}_j
+>\tau(1+|b_{j-1}|).
+$$
+
+The phase reports convergence after $P$ consecutive checks without a
+meaningful improvement. Its returned result also contains the complete loss
+history and actual step count.
+
 ## Importance correction
 
-The implementation freezes the fitted guide before drawing particles; calling
-`AutoMAPProposal` directly would refit it for every call. For each particle,
+The implementation calls `AutoMAPProposal.fit` exactly once. The returned
+`MAPProposalResult` holds the MAP locations, proposal parameters, loss
+histories, step counts, and convergence flags. Subsequent guide calls only draw
+from that reusable fitted state and perform no optimization. For each particle,
 
 $$
 z^{(s)}&\sim q_\phi(z\mid x),\\
@@ -93,12 +129,10 @@ $$
 =\sum_s\widetilde w_s\mu_\theta(z^{(s)}).
 $$
 
-If BFGS stops with a non-finite or exponentially overflowing proposal
-log-parameter, that coordinate falls back to the guide's initial full-support
-dispersion. This changes only $q_\phi$, not $\gamma_\theta$, so the importance
-ratio remains the required correction. The script reports convergence of both
-optimization stages so that such a smoke run is not mistaken for a fitted
-posterior.
+The script reports convergence and step counts for both optimization stages so
+that a capped smoke run is not mistaken for a fitted posterior. The loss
+histories are available on the inference result as `map_losses` and
+`dispersion_losses`.
 
 The effective sample size
 
@@ -119,6 +153,7 @@ uv sync
 uv run python scripts/online_map_proposal.py path/to/captcha.png
 ```
 
-The default uses twelve candidate sites, twenty BFGS iterations, eight
-dispersion-fitting particles, and sixty-four importance particles. Reducing
-`--maxiter` is useful for a compile smoke test but not for assessing recovery.
+The default uses twelve candidate sites, at most two hundred Adam steps in each
+fit, eight dispersion-fitting particles, and sixty-four importance particles.
+Reducing `--map-max-steps` and `--proposal-max-steps` is useful for a compile
+smoke test but not for assessing recovery.
