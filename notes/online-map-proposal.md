@@ -9,10 +9,18 @@ self-normalized importance sampling.
 
 The full activation tensor has $80\cdot80\cdot36=230{,}400$ coordinates.
 Optimizing every count coordinate together with the continuous fields would be
-impractical. Before optimization, an alpha-mask matched filter selects a small
-set $S$ of $(y,x,k)$ candidates.
-Spatial non-maximum suppression keeps separated locations, while several glyph
-identities remain possible at each location.
+impractical. Before optimization, an alpha-mask matched filter and spatial
+non-maximum suppression select a small location set
+$\mathcal L(x)\subseteq[1\ldots H]\times[1\ldots W]$. The retained count sites
+are the Cartesian product
+
+$$
+S(x)=\mathcal L(x)\times\{0,\ldots,K-1\}.
+$$
+
+Thus every one of the $K$ dictionary identities remains available at every
+selected location. Template scores rank the initial class within a location;
+they no longer remove classes from the optimization problem.
 
 The candidate model is the full model conditioned on $a_i=0$ for
 $i\notin S$:
@@ -24,14 +32,16 @@ p_\theta(a_S,a_{\neg S}=0)
 $$
 
 Unlike a heuristic replacement prior, the retained factor means this is the
-original joint density on the restricted support. Candidate selection is still
-an inference approximation: a true glyph omitted from $S$ cannot be recovered.
-The canonical texture and whole-image affine-free warp remain latent in full.
+original joint density on the restricted support. Location selection is still
+an inference approximation: a true glyph whose center is omitted from
+$\mathcal L(x)$ cannot be recovered. Once its location is retained, however,
+its identity cannot be rejected by the candidate-selection stage. The
+canonical texture and whole-image affine-free warp remain latent in full.
 
 The original homogeneous model rate is only about $4/230{,}400$ per site. An
 optimizer initialized from that rate starts effectively on the all-zero count
-boundary, even though its search now contains only a few sites. At each selected
-location, candidates are ordered by their alpha-mask score. The guide puts the
+boundary, even on the restricted spatial support. At each selected location,
+candidates are ordered by their alpha-mask score. The guide puts the
 configured expected count mass on the best initial class at each location and
 puts the other relaxed counts just inside their positive support. It initializes
 the color from the darkest image percentile and starts texture and velocity at
@@ -153,7 +163,9 @@ uv sync
 uv run python scripts/online_map_proposal.py path/to/captcha.png
 ```
 
-The default uses twelve candidate sites, at most two hundred Adam steps in each
-fit, eight dispersion-fitting particles, and sixty-four importance particles.
-Reducing `--map-max-steps` and `--proposal-max-steps` is useful for a compile
-smoke test but not for assessing recovery.
+The default selects four spatial locations. With the 36-template CAPTCHA
+dictionary, that gives 144 count coordinates. It uses at most two hundred Adam
+steps in each fit, eight dispersion-fitting particles, and sixty-four
+importance particles. Reducing `--map-max-steps` and
+`--proposal-max-steps` is useful for a compile smoke test but not for assessing
+recovery.
