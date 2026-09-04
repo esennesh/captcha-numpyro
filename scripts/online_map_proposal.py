@@ -34,7 +34,6 @@ def main(arguments: argparse.Namespace) -> None:
     online.map_max_steps = arguments.map_max_steps
     online.num_dispersion_particles = arguments.num_dispersion_particles
     online.num_importance_samples = arguments.num_importance_samples
-    online.num_locations = arguments.num_locations
     online.proposal_max_steps = arguments.proposal_max_steps
 
     images = load_image(
@@ -54,13 +53,13 @@ def main(arguments: argparse.Namespace) -> None:
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(arguments.output, dpi=150)
 
-    print(f"candidate sites:\n{np.asarray(result.candidate_sites)}")
     print(
         "dispersion fit: "
         f"{int(result.dispersion_num_steps)} steps, "
         f"converged={bool(result.dispersion_converged)}"
     )
     print(f"effective sample size: {float(result.effective_sample_size):.2f}")
+    print(f"expected total count: {float(result.weighted_counts.sum()):.3f}")
     print(f"largest normalized weight: {float(result.normalized_weights.max()):.4f}")
     print(
         f"MAP fit: {int(result.map_num_steps)} steps, "
@@ -75,7 +74,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--map-max-steps", default=200, type=int)
     parser.add_argument("--num-dispersion-particles", default=8, type=int)
     parser.add_argument("--num-importance-samples", default=64, type=int)
-    parser.add_argument("--num-locations", default=4, type=int)
     parser.add_argument(
         "--output", default=Path("map-proposal-online.png"), type=Path
     )

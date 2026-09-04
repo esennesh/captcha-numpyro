@@ -1,10 +1,8 @@
 _target_: src.inference.map_proposal_online.MAPProposalCaptchaInference
 _partial_: true
 
-# Retain every dictionary template at four spatial hypotheses. This is an
-# inference restriction only; Poisson sites at omitted locations are zero.
-min_distance: 6.0
-num_locations: 4
+# Optimize the full image-resolution Poisson count tensor. There is no
+# observation-derived candidate restriction or data-derived warm-start.
 
 # Temperature and finite recurrence window for the DSGD count relaxation used
 # while locating the mode. Importance samples are exact integer counts.
@@ -16,7 +14,6 @@ dsgd_kwargs:
 # Fit a factorized proposal around the relaxed joint MAP, then draw exact
 # particles from that proposal and self-normalize their importance weights.
 init_dispersion: 0.1
-initial_count_mass: null
 map_max_steps: 200
 map_optimizer:
   _target_: numpyro.optim.Adam
