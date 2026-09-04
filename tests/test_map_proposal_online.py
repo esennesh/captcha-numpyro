@@ -59,13 +59,12 @@ def test_map_proposal_runs_on_candidate_restricted_captcha():
     image = jnp.ones((1, 9, 9, 3)).at[:, 3:6, 4, :].set(0.1)
     inference = MAPProposalCaptchaInference(
         make_model(),
-        classes_per_location=1,
         dsgd_kwargs={"max_count": 8, "width": 16},
+        map_max_steps=2,
         min_distance=2.0,
-        num_candidates=1,
         num_dispersion_particles=2,
         num_importance_samples=3,
-        map_max_steps=2,
+        num_locations=1,
         proposal_max_steps=2,
     )
     result = inference(jax.random.key(3), image)

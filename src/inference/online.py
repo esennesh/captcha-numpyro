@@ -1,9 +1,11 @@
 r"""Candidate-restricted online inference for the Poisson CAPTCHA model.
 
-The full count field has ``H * W * K`` integer coordinates.  Online methods
-that optimize or importance-sample that tensor as one latent site are not
-computationally useful, so this module first constructs a deterministic
-shortlist from the observation and then conditions every omitted count to zero.
+The full count field has ``H * W * K`` integer coordinates. Online methods that
+optimize or importance-sample that tensor as one latent site are not
+computationally useful, so this module first constructs a deterministic set
+``L`` of spatial locations from the observation. Every one of the ``K`` glyph
+classes remains available at each retained location, giving
+``S = L x {0, ..., K - 1}``. Counts outside ``S`` are conditioned to zero.
 
 If ``S`` is the shortlisted set and the homogeneous count rate is ``lambda``,
 the restricted count factor is
@@ -20,7 +22,6 @@ selection is an inference approximation, not part of the generative model.
 """
 
 import functools
-import math
 
 import jax
 import jax.numpy as jnp
@@ -66,28 +67,22 @@ def candidate_indices(
     images: Array,
     shape_dict: ShapeDictionary,
     *,
-    classes_per_location: int = 3,
     min_distance: float = 6.0,
-    num_candidates: int = 12,
+    num_locations: int = 4,
 ) -> Array:
-    """Shortlist ``(y, x, glyph)`` triples by matched filtering and NMS.
+    """Select locations by matched filtering and retain every glyph there.
 
-    Non-maximum suppression acts on spatial locations, while retaining several
-    class alternatives at every selected location.  This avoids filling the
-    shortlist with one glyph at adjacent pixels without prematurely committing
-    to a dictionary identity.
+    Non-maximum suppression acts only on spatial locations. Every dictionary
+    identity remains a candidate at each selected location, so the candidate
+    restriction cannot discard an identity while retaining its location.
     """
-    if classes_per_location < 1:
-        raise ValueError("classes_per_location needs to be positive")
     if min_distance < 0:
         raise ValueError("min_distance needs to be nonnegative")
-    if num_candidates < 1:
-        raise ValueError("num_candidates needs to be positive")
+    if num_locations < 1:
+        raise ValueError("num_locations needs to be positive")
 
     scores = np.asarray(_candidate_scores(images, shape_dict))
-    height, width, num_classes = scores.shape
-    classes_per_location = min(classes_per_location, num_classes)
-    num_locations = math.ceil(num_candidates / classes_per_location)
+    height, width, _ = scores.shape
     location_order = np.argsort(scores.max(axis=-1).ravel())[::-1]
     locations: list[tuple[int, int]] = []
     for flat_index in location_order:
@@ -104,11 +99,8 @@ def candidate_indices(
     candidates: list[tuple[int, int, int]] = []
     for y, x in locations:
         class_order = np.argsort(scores[y, x])[::-1]
-        candidates.extend(
-            (y, x, int(glyph))
-            for glyph in class_order[:classes_per_location]
-        )
-    return jnp.asarray(candidates[:num_candidates], dtype=jnp.int32)
+        candidates.extend((y, x, int(glyph)) for glyph in class_order)
+    return jnp.asarray(candidates, dtype=jnp.int32)
 
 
 class CandidateTexturedDiffeomorphicPoissonConvPlacements(
@@ -186,9 +178,8 @@ def restrict_poisson_model(
     model: functools.partial,
     images: Array,
     *,
-    classes_per_location: int = 3,
     min_distance: float = 6.0,
-    num_candidates: int = 12,
+    num_locations: int = 4,
 ) -> tuple[functools.partial, Array]:
     """Return the observation-specific candidate model and its site indices."""
     if not isinstance(model, functools.partial):
@@ -201,9 +192,8 @@ def restrict_poisson_model(
     sites = candidate_indices(
         images,
         placements.shape_dict,
-        classes_per_location=classes_per_location,
         min_distance=min_distance,
-        num_candidates=num_candidates,
+        num_locations=num_locations,
     )
     restricted = CandidateTexturedDiffeomorphicPoissonConvPlacements.from_placements(
         sites, placements

@@ -59,6 +59,7 @@ class MAPProposalCaptchaResult(NamedTuple):
     samples: dict[str, jax.Array]
     weighted_reconstruction: jax.Array
 
+
 def _initial_guide_values(model, candidate_sites, images, count_mass):
     """Construct a coherent, neutral starting CAPTCHA explanation."""
     candidate_numpy = np.asarray(candidate_sites)
@@ -106,6 +107,7 @@ def _initial_guide_values(model, candidate_sites, images, count_mass):
         "warp_velocity": warp_velocity,
     }
 
+
 def _sum_sample_log_probs(model_trace, guide_trace):
     """Return ``log gamma_theta(z; x) - log q_phi(z | x)``."""
     guide_log_prob = sum(
@@ -128,7 +130,6 @@ class MAPProposalCaptchaInference:
         self,
         model,
         *,
-        classes_per_location: int = 3,
         discrete_temperature: float = 0.1,
         dsgd_kwargs: dict | None = None,
         init_dispersion: float = 0.1,
@@ -137,9 +138,9 @@ class MAPProposalCaptchaInference:
         map_optimizer=None,
         map_tolerance: float = 1e-5,
         min_distance: float = 6.0,
-        num_candidates: int = 12,
         num_dispersion_particles: int = 8,
         num_importance_samples: int = 64,
+        num_locations: int = 4,
         proposal_max_steps: int = 1000,
         proposal_optimizer=None,
         proposal_tolerance: float = 1e-3,
@@ -150,7 +151,6 @@ class MAPProposalCaptchaInference:
             raise ValueError("initial_count_mass needs to be positive")
         if num_importance_samples < 1:
             raise ValueError("num_importance_samples needs to be positive")
-        self.classes_per_location = classes_per_location
         self.discrete_temperature = discrete_temperature
         self.dsgd_kwargs = dsgd_kwargs
         self.init_dispersion = init_dispersion
@@ -160,9 +160,9 @@ class MAPProposalCaptchaInference:
         self.map_tolerance = map_tolerance
         self.min_distance = min_distance
         self.model = model
-        self.num_candidates = num_candidates
         self.num_dispersion_particles = num_dispersion_particles
         self.num_importance_samples = num_importance_samples
+        self.num_locations = num_locations
         self.proposal_max_steps = proposal_max_steps
         self.proposal_optimizer = proposal_optimizer
         self.proposal_tolerance = proposal_tolerance
@@ -175,9 +175,8 @@ class MAPProposalCaptchaInference:
         model, candidate_sites = restrict_poisson_model(
             self.model,
             images,
-            classes_per_location=self.classes_per_location,
             min_distance=self.min_distance,
-            num_candidates=self.num_candidates,
+            num_locations=self.num_locations,
         )
         initial_count_mass = (
             self.model.keywords["placements"].expected_count

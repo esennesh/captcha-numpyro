@@ -69,21 +69,23 @@ def test_candidate_counts_are_scattered_and_omitted_mass_is_retained():
     )
 
 
-def test_candidate_selection_retains_class_alternatives():
+def test_candidate_selection_retains_every_class_at_each_location():
+    dictionary = make_dictionary()
     image = jnp.ones((12, 11, 3)).at[4:9, 5, :].set(0.0)
+    num_classes = dictionary.shapes.shape[0]
     sites = candidate_indices(
         image,
-        make_dictionary(),
-        classes_per_location=2,
+        dictionary,
         min_distance=4.0,
-        num_candidates=4,
+        num_locations=2,
     )
-    first_location = np.asarray(sites[:2, :2])
-    first_classes = np.asarray(sites[:2, 2])
+    site_array = np.asarray(sites)
 
-    assert sites.shape == (4, 3)
-    assert np.array_equal(first_location[0], first_location[1])
-    assert set(first_classes) == {0, 1}
+    assert sites.shape == (2 * num_classes, 3)
+    assert len(np.unique(site_array[:, :2], axis=0)) == 2
+    for location_sites in site_array.reshape(2, num_classes, 3):
+        assert np.all(location_sites[:, :2] == location_sites[0, :2])
+        assert set(location_sites[:, 2]) == set(range(num_classes))
 
 
 def test_restricted_model_uses_candidate_latent_and_renders_full_image():
@@ -92,9 +94,8 @@ def test_restricted_model_uses_candidate_latent_and_renders_full_image():
     restricted, sites = restrict_poisson_model(
         model,
         image,
-        classes_per_location=2,
         min_distance=4.0,
-        num_candidates=4,
+        num_locations=2,
     )
     model_trace = trace(seed(restricted, jax.random.key(1))).get_trace(
         image, plot_mean=True

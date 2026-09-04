@@ -34,6 +34,7 @@ def main(arguments: argparse.Namespace) -> None:
     online.map_max_steps = arguments.map_max_steps
     online.num_dispersion_particles = arguments.num_dispersion_particles
     online.num_importance_samples = arguments.num_importance_samples
+    online.num_locations = arguments.num_locations
     online.proposal_max_steps = arguments.proposal_max_steps
 
     images = load_image(
@@ -74,6 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--map-max-steps", default=200, type=int)
     parser.add_argument("--num-dispersion-particles", default=8, type=int)
     parser.add_argument("--num-importance-samples", default=64, type=int)
+    parser.add_argument("--num-locations", default=4, type=int)
     parser.add_argument(
         "--output", default=Path("map-proposal-online.png"), type=Path
     )

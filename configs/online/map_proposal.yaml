@@ -1,11 +1,10 @@
 _target_: src.inference.map_proposal_online.MAPProposalCaptchaInference
 _partial_: true
 
-# Three class alternatives at four spatial hypotheses. This is an inference
-# restriction only; the omitted Poisson sites are fixed to zero.
-classes_per_location: 3
+# Retain every dictionary template at four spatial hypotheses. This is an
+# inference restriction only; Poisson sites at omitted locations are zero.
 min_distance: 6.0
-num_candidates: 12
+num_locations: 4
 
 # Temperature and finite recurrence window for the DSGD count relaxation used
 # while locating the mode. Importance samples are exact integer counts.
