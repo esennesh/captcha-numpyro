@@ -5,57 +5,46 @@ This branch uses the experimental
 to fit an observation-specific proposal and then correct it with
 self-normalized importance sampling.
 
-## Restricted count support
+## Full count support
 
-The full activation tensor has $80\cdot80\cdot36=230{,}400$ coordinates.
-Optimizing every count coordinate together with the continuous fields would be
-impractical. Before optimization, an alpha-mask matched filter and spatial
-non-maximum suppression select a small location set
-$\mathcal L(x)\subseteq[1\ldots H]\times[1\ldots W]$. The retained count sites
-are the Cartesian product
+The latent count field retains all image locations and all glyph identities,
 
 $$
-S(x)=\mathcal L(x)\times\{0,\ldots,K-1\}.
+a\in\mathbb N_0^{H\times W\times K}.
 $$
 
-Thus every one of the $K$ dictionary identities remains available at every
-selected location. Template scores rank the initial class within a location;
-they no longer remove classes from the optimization problem.
+For an $80\times80$ image and a 36-template dictionary, this is
+$80\cdot80\cdot36=230{,}400$ count coordinates. No matched filter,
+non-maximum suppression, or observation-dependent support restriction is
+applied. Consequently every location and glyph identity can receive posterior
+mass.
 
-The candidate model is the full model conditioned on $a_i=0$ for
-$i\notin S$:
+Writing the remaining latents as the baseline color $c_0$, canonical texture
+$r$, and image-level warp velocity $u$, the full latent state is
 
 $$
-p_\theta(a_S,a_{\neg S}=0)
-=\prod_{i\in S}\operatorname{Poisson}(a_i;\lambda)
- \exp\{-\lambda(|\mathcal I|-|S|)\}.
+z=(a,c_0,r,u).
 $$
 
-Unlike a heuristic replacement prior, the retained factor means this is the
-original joint density on the restricted support. Location selection is still
-an inference approximation: a true glyph whose center is omitted from
-$\mathcal L(x)$ cannot be recovered. Once its location is retained, however,
-its identity cannot be rejected by the candidate-selection stage. The
-canonical texture and whole-image affine-free warp remain latent in full.
+The unsmoothed inference target is therefore the original joint density,
 
-The original homogeneous model rate is only about $4/230{,}400$ per site. An
-optimizer initialized from that rate starts effectively on the all-zero count
-boundary, even on the restricted spatial support. At each selected location,
-candidates are ordered by their alpha-mask score. The guide puts the
-configured expected count mass on the best initial class at each location and
-puts the other relaxed counts just inside their positive support. It initializes
-the color from the darkest image percentile and starts texture and velocity at
-zero. This is one coherent, unwarped CAPTCHA explanation rather than a
-translucent superposition of every class alternative. It changes only the
-optimizer's initial point; every objective evaluation still uses the original
-$p_\theta(a_S,a_{\neg S}=0)$ above.
+$$
+\gamma_\theta(z;x)=p_\theta(x,z)
+=p_\theta(x\mid z)p_\theta(a)p_\theta(c_0)p_\theta(r)p_\theta(u).
+$$
+
+There is also no image-derived warm-start. `AutoMAPProposal` uses its generic,
+support-aware initialization in the unconstrained representation. Removing
+the warm-start prevents an external matched-filter decision from deciding
+which sites begin with appreciable count mass. It does not remove the
+homogeneous Poisson occupancy cost from the target.
 
 ## Fitted proposal
 
-For the restricted latent vector
+For the full latent state
 
 $$
-z=(a_S,c_0,r,u),
+z=(a,c_0,r,u),
 $$
 
 the guide first replaces count sites with the DSGD relaxation at temperature
@@ -163,9 +152,8 @@ uv sync
 uv run python scripts/online_map_proposal.py path/to/captcha.png
 ```
 
-The default selects four spatial locations. With the 36-template CAPTCHA
-dictionary, that gives 144 count coordinates. It uses at most two hundred Adam
-steps in each fit, eight dispersion-fitting particles, and sixty-four
-importance particles. Reducing `--map-max-steps` and
-`--proposal-max-steps` is useful for a compile smoke test but not for assessing
-recovery.
+The default optimizes all 230,400 count coordinates for an $80\times80$ image
+and 36-template dictionary. It uses at most two hundred Adam steps in each
+fit, eight dispersion-fitting particles, and sixty-four importance particles.
+Reducing `--map-max-steps` and `--proposal-max-steps` is useful for a compile
+smoke test but not for assessing recovery.
