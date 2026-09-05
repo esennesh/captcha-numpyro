@@ -1,0 +1,68 @@
+--- a/numpyro/contrib/diag_sgd.py
++++ b/numpyro/contrib/diag_sgd.py
+@@ -369,7 +369,21 @@
+         self.log_pmf = log_pmf
+         self.params = params
+ 
++
++def _safe_logdiffexp(larger, smaller, floor):
++    """``logdiffexp`` whose derivative survives two equal, floored operands.
+ 
++    ``logdiffexp(x, x)`` is ``-inf``, and its derivative is an indeterminate
++    ``0 / 0``. Both operands are already floored by the caller, so they collide
++    exactly when the true difference is below the floor and the mass is
++    negligible. Substitute a finite, strictly ordered pair there and discard
++    the result, so no branch ever evaluates an infinity.
++    """
++    degenerate = larger <= smaller
++    ordered = jnp.where(degenerate, larger - 1.0, smaller)
++    return jnp.where(degenerate, jnp.log(floor), logdiffexp(larger, ordered))
++
++
+ def _gamma_count_log_pmf(value, concentration, rate):
+     r"""Analytically continue the Gamma-count log PMF to real ``value``.
+ 
+@@ -395,14 +409,36 @@
+     upper_right = gammaincc(right_shape, scaled_rate)
+     use_lower = lower_left < upper_right
+ 
+-    safe_lower_left = jnp.where(use_lower, lower_left, 1.0)
+-    safe_lower_right = jnp.where(use_lower, lower_right, 0.5)
+-    safe_upper_left = jnp.where(use_lower, 0.5, upper_left)
+-    safe_upper_right = jnp.where(use_lower, 1.0, upper_right)
+-    lower_log_prob = logdiffexp(jnp.log(safe_lower_left), jnp.log(safe_lower_right))
+-    upper_log_prob = logdiffexp(jnp.log(safe_upper_right), jnp.log(safe_upper_left))
++    # Both tails underflow to exactly zero far enough out, and ``log(0)`` is
++    # ``-inf``. ``logdiffexp`` still returns the correct *value* there, because
++    # ``exp(-inf - x)`` is 0, but reverse mode applies ``d log(y)/dy = 1 / y``
++    # at ``y = 0`` and multiplies the resulting infinity by a zero sensitivity,
++    # so the *derivative* is NaN. That is invisible: the loss is right and
++    # ``eval_and_stable_update`` silently discards every update.
++    #
++    # Guarding after the fact does not work -- both ``jnp.where`` branches are
++    # differentiated -- so floor the tails before they reach ``jnp.log``, in the
++    # same spirit as the ``safe_*`` values just below. The floor is the smallest
++    # positive *normal*, not zero: ``1 / x`` appears in the derivative and the
++    # reciprocal of a denormal already overflows.
++    #
++    # Enabling x64 only moves the boundary. At rate 1e-3 a concentration of 7.4
++    # is past it in float32 and 54.6 is past it in float64.
++    tiny = jnp.finfo(jnp.result_type(lower_left, float)).tiny
++    safe_lower_left = jnp.clip(jnp.where(use_lower, lower_left, 1.0), tiny, None)
++    safe_lower_right = jnp.clip(jnp.where(use_lower, lower_right, 0.5), tiny, None)
++    safe_upper_left = jnp.clip(jnp.where(use_lower, 0.5, upper_left), tiny, None)
++    safe_upper_right = jnp.clip(jnp.where(use_lower, 1.0, upper_right), tiny, None)
++    lower_log_prob = _safe_logdiffexp(
++        jnp.log(safe_lower_left), jnp.log(safe_lower_right), tiny
++    )
++    upper_log_prob = _safe_logdiffexp(
++        jnp.log(safe_upper_right), jnp.log(safe_upper_left), tiny
++    )
+     positive_log_prob = jnp.where(use_lower, lower_log_prob, upper_log_prob)
+-    zero_log_prob = jnp.log(gammaincc(concentration, scaled_rate))
++    zero_log_prob = jnp.log(
++        jnp.clip(gammaincc(concentration, scaled_rate), tiny, None)
++    )
+     return jnp.where(value == 0, zero_log_prob, positive_log_prob)
+ 
+ 
