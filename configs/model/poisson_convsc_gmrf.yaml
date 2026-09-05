@@ -1,0 +1,69 @@
+# Two random fields -- one for paper, one for ink -- composited with `over`,
+# under a Gamma-Normal partitioned GMRF likelihood.
+#
+# This is `poisson_convsc` with its observation model replaced. Everything about
+# the renderer, the dictionary, the texture and the warp is inherited unchanged;
+# only `backgrounder` and `likelihood` differ, plus the two GMRF precisions the
+# new likelihood needs.
+#
+# WHY: `poisson_convsc` fixes the paper to pure white at sigma_bg = 0.01. The
+# paper in data/examples departs from white by 0.04 to 0.07 per channel, which
+# is four to seven standard deviations at each of 6,400 pixels, so the cheapest
+# thing the count field can do is tile the canvas with glyphs and repaint the
+# sheet. Measured with the model's own log joint on 0000_LJ:
+#
+#     blank canvas                                     -62,059
+#     the correct two glyphs, correct ink colour       -69,192
+#     49 stamps tiling the canvas in the paper colour  -21,091
+#
+# and on the clean, upright 0000_N6: -37,332 / -31,964 / -10,553. Canvas tiling
+# is the global mode of that model on BOTH images, so better MAP optimization
+# makes the reconstruction worse rather than better. Supplying the paper colour
+# reverses it: 0000_N6 becomes 38,488 / 41,476 / 10,308, correct first and
+# tiling last.
+#
+# NOTE: the amortized guide in configs/guide/poisson_convsc_encoder.yaml does
+# NOT yet mirror the `paper_logit`, `paper_field` and `local_precision` sites,
+# so this config is for the online MAP-proposal path. Training with the encoder
+# still uses configs/model/poisson_convsc.yaml.
+
+defaults:
+  - poisson_convsc
+  - _self_
+
+likelihood: gmrf
+
+# One coarse Gaussian field of paper colour in logit space, plus a global RGB
+# logit that carries the overall tint. Splitting them matters for the same
+# reason it does for ink: pushing an overall shift through the field would
+# charge one element-precision penalty per lattice site.
+backgrounder:
+  _target_: src.model.model.PaperGmrfBackground
+  # Paper medians over the ten examples run 0.933 to 1.000, i.e. logits 2.6 to
+  # 9.2 (the 9.2 is a clipped pure white). 0.96 is logit 3.18 and a scale of
+  # 1.5 covers 0.843 to 0.991 at one standard deviation.
+  paper_color: [0.96, 0.96, 0.96]
+  logit_scale: 1.5
+  # Coarse-block logit variation *within* an image measures 0.75 to 2.07, so an
+  # element precision of 0.25 -- a marginal standard deviation of 2 in logit
+  # space -- is the right order. Taken from section 3 of
+  # notebooks/partitioned_gmrf.ipynb.
+  bond_precision: 1.0
+  coarse_height: 8
+  coarse_width: 8
+  element_precision: 0.25
+  img_h: 80
+  img_w: 80
+
+# The observation GMRF, Q = element I + bond L, with lattice bonds cut wherever
+# the composite's region count changes -- so ink and paper do not smooth into
+# each other across a glyph outline. Section 3 of the partitioned_gmrf notebook
+# fitted real captcha data at these values.
+gmrf_bond_precision: 100.0
+gmrf_element_precision: 50.0
+cg_iters: 300
+
+# Unused under `likelihood: gmrf`; the Gamma mixing variable supplies the tail.
+# Kept visible so the difference from the blend path is explicit rather than
+# silent.
+observation_df: null

@@ -22,6 +22,8 @@ from src.model.diffeomorphism import (
     resize_velocity,
     scaling_and_squaring,
     sparse_diffeomorphic_stamp,
+    translation_basis,
+    translation_free_velocity,
 )
 from src.model.model import _stamp
 
@@ -48,6 +50,54 @@ def test_affine_free_velocity_annihilates_all_six_modes():
     velocity = basis @ coefficients
     projected = affine_free_velocity(velocity, lambda value: value, (9, 8))
     assert np.allclose(projected, 0.0, atol=1e-12)
+
+
+def test_translation_free_velocity_annihilates_only_translation():
+    """Rotation, scale and shear must survive; the constant must not."""
+    basis = affine_basis((9, 8), dtype=jnp.float64)
+    translation = basis[..., :1] @ jnp.asarray(
+        [[1.2, -0.7]], dtype=jnp.float64
+    )
+    linear = basis[..., 1:] @ jnp.asarray(
+        [[0.4, 0.9], [-0.3, 0.2]], dtype=jnp.float64
+    )
+
+    projected = translation_free_velocity(
+        translation, lambda value: value, (9, 8)
+    )
+    assert np.allclose(projected, 0.0, atol=1e-12)
+
+    projected = translation_free_velocity(linear, lambda value: value, (9, 8))
+    assert np.linalg.norm(projected) > 0.1 * np.linalg.norm(linear)
+
+    # The remaining field carries no translation of its own.
+    weighted = translation_basis((9, 8), dtype=jnp.float64)
+    moment = jnp.einsum("hwk,hwc->kc", weighted, projected)
+    assert np.allclose(moment, 0.0, atol=1e-10)
+
+
+def test_translation_free_velocity_keeps_a_local_rotation_cheaper():
+    """The affine projection inverts the cost ordering of local deformations.
+
+    A rotation confined to one patch carries a nonzero global affine moment,
+    so ``affine_free_velocity`` has to build a compensating counter-rotation
+    elsewhere and the fitted field grows. Conditioning out translation alone
+    does not.
+    """
+    shape = (24, 24)
+    grid = coordinate_grid(shape, dtype=jnp.float64)
+    offset_y = grid[..., 0] - 8.0
+    offset_x = grid[..., 1] - 8.0
+    bump = jnp.exp(-0.5 * (offset_y ** 2 + offset_x ** 2) / 16.0)
+    rotation = bump[..., None] * jnp.stack((offset_x, -offset_y), axis=-1)
+
+    affine = affine_free_velocity(rotation, lambda value: value, shape)
+    translation = translation_free_velocity(
+        rotation, lambda value: value, shape
+    )
+    assert np.linalg.norm(translation - rotation) < np.linalg.norm(
+        affine - rotation
+    )
 
 
 def test_affine_free_velocity_is_differentiable():

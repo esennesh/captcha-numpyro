@@ -16,12 +16,15 @@ __all__ = [
     "bilinear_sample",
     "boundary_taper",
     "compose_displacements",
+    "conditioned_velocity",
     "coordinate_grid",
     "diffeomorphic_warp",
     "jacobian_determinant",
     "resize_velocity",
     "scaling_and_squaring",
     "sparse_diffeomorphic_stamp",
+    "translation_basis",
+    "translation_free_velocity",
     "warp_image",
 ]
 
@@ -37,19 +40,27 @@ def affine_basis(
     return jnp.stack((jnp.ones_like(y), y, x), axis=-1)
 
 
-def affine_free_velocity(
+def translation_basis(
+    shape: tuple[int, int], *, dtype=jnp.float32
+) -> Float[Array, "H W 1"]:
+    """Return the constant basis ``[1]``, whose moment is a translation."""
+    return affine_basis(shape, dtype=dtype)[..., :1]
+
+
+def conditioned_velocity(
     velocity: Float[Array, "h w 2"],
     covariance_solve,
     shape: tuple[int, int],
+    basis: Float[Array, "H W k"],
     *,
     method: str = "cubic",
     window: Float[Array, "H W"] | None = None,
 ) -> Float[Array, "H W 2"]:
-    r"""Condition a coarse Gaussian velocity to have no affine image modes.
+    r"""Condition a coarse Gaussian velocity to have no ``basis`` image modes.
 
     Let the raw coarse field be ``u ~ N(0, Q^-1)``, let ``R`` resize it to
-    ``shape``, let ``W`` be the optional image-space window, and let
-    ``B = [1, y, x]``.  The affine-free condition is
+    ``shape``, let ``W`` be the optional image-space window, and let ``B`` be
+    ``basis``.  The conditioned field satisfies
 
     .. math::
 
@@ -65,14 +76,16 @@ def affine_free_velocity(
 
     ``covariance_solve`` must apply ``Q^-1`` on the coarse lattice; passing
     :meth:`SecondOrderGaussianMrf.solve_precision` retains the GMRF covariance
-    geometry without materializing a dense precision.  The only dense solve
-    is three by three.  Both velocity channels use the same conditional map,
-    removing two translations and the four entries of a linear map.
+    geometry without materializing a dense precision.  The only dense solve is
+    ``k`` by ``k``.  Both velocity channels use the same conditional map.
 
     Passing a window that vanishes at the image boundary additionally gives a
     fixed boundary.  Resizing, conditioning, and windowing are linear, so the
     result is a Gaussian field.  It is singular in ambient image coordinates,
     as any Gaussian supported on an exactly constrained subspace must be.
+
+    :param basis: image-space modes to remove, ``(H, W, k)``.  See
+        :func:`translation_basis` and :func:`affine_basis`.
     """
     if velocity.ndim != 3 or velocity.shape[-1] != 2:
         raise ValueError(
@@ -84,36 +97,99 @@ def affine_free_velocity(
             "window and output need matching spatial shapes, "
             f"got {window.shape} and {shape}"
         )
+    if basis.ndim != 3 or basis.shape[:2] != shape:
+        raise ValueError(
+            f"basis needs shape {(*shape, -1)}, got {basis.shape}"
+        )
 
-    basis = affine_basis(shape, dtype=velocity.dtype)
+    modes = basis.shape[-1]
     weights = (
         jnp.ones(shape, dtype=velocity.dtype)
         if window is None
         else window.astype(velocity.dtype)
     )
-    weighted_basis = weights[..., None] * basis
+    weighted_basis = weights[..., None] * basis.astype(velocity.dtype)
 
     coarse_shape = velocity.shape[:2]
 
     def resize_basis(field):
-        return jax.image.resize(field, (*shape, 3), method=method)
+        return jax.image.resize(field, (*shape, modes), method=method)
 
     _, resize_transpose = jax.vjp(
         resize_basis,
-        jnp.zeros((*coarse_shape, 3), dtype=velocity.dtype),
+        jnp.zeros((*coarse_shape, modes), dtype=velocity.dtype),
     )
     constraints = resize_transpose(weighted_basis)[0]
     covariance_constraints = covariance_solve(constraints)
     conditional_gram = jnp.einsum(
         "hwk,hwl->kl", constraints, covariance_constraints
     )
-    affine_coordinates = jnp.einsum("hwk,hwc->kc", constraints, velocity)
-    coefficients = jnp.linalg.solve(conditional_gram, affine_coordinates)
+    basis_coordinates = jnp.einsum("hwk,hwc->kc", constraints, velocity)
+    coefficients = jnp.linalg.solve(conditional_gram, basis_coordinates)
     conditioned = velocity - jnp.einsum(
         "hwk,kc->hwc", covariance_constraints, coefficients
     )
     resized = resize_velocity(conditioned, shape, method=method)
     return weights[..., None] * resized
+
+
+def affine_free_velocity(
+    velocity: Float[Array, "h w 2"],
+    covariance_solve,
+    shape: tuple[int, int],
+    *,
+    method: str = "cubic",
+    window: Float[Array, "H W"] | None = None,
+) -> Float[Array, "H W 2"]:
+    """Remove the six image affine modes, ``[1, y, x]`` in each channel.
+
+    The three scalar modes per channel are the two translations and the four
+    coefficients of a linear ``2 x 2`` map, so this deletes translation,
+    rotation, scale, and shear together.
+
+    **This is rarely the conditioning you want with the convolutional
+    renderer.** Translation is genuinely redundant with the count field's site
+    index, but rotation, scale, and shear have no other latent to express them,
+    so removing them removes them from the model. Worse, a *local* deformation
+    generally carries a nonzero global affine moment, so the projection forces
+    a compensating counter-deformation elsewhere in the image: least-squares
+    fitting one glyph-sized 25 degree rotation costs 2294 nats here against 99
+    nats under :func:`translation_free_velocity`. Prefer that function unless
+    another latent supplies the pose.
+    """
+    return conditioned_velocity(
+        velocity,
+        covariance_solve,
+        shape,
+        affine_basis(shape, dtype=velocity.dtype),
+        method=method,
+        window=window,
+    )
+
+
+def translation_free_velocity(
+    velocity: Float[Array, "h w 2"],
+    covariance_solve,
+    shape: tuple[int, int],
+    *,
+    method: str = "cubic",
+    window: Float[Array, "H W"] | None = None,
+) -> Float[Array, "H W 2"]:
+    """Remove the two image translation modes and nothing else.
+
+    Translation is the one affine mode that is redundant with the count field,
+    which already places a glyph at any site. Rotation, scale, and shear stay
+    available, at a prior cost that rises with how far the deformation departs
+    from the identity rather than with where it sits in the image.
+    """
+    return conditioned_velocity(
+        velocity,
+        covariance_solve,
+        shape,
+        translation_basis(shape, dtype=velocity.dtype),
+        method=method,
+        window=window,
+    )
 
 
 def bilinear_sample(

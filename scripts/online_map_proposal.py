@@ -27,14 +27,18 @@ def main(arguments: argparse.Namespace) -> None:
     with hydra.initialize_config_dir(
         config_dir=config_directory, version_base="1.3"
     ):
-        model_config = hydra.compose(config_name="model/poisson_convsc")
+        model_config = hydra.compose(config_name="model/poisson_convsc_gmrf")
         online_config = hydra.compose(config_name="online/map_proposal")
     model = hydra.utils.instantiate(model_config.model)
     online = hydra.utils.instantiate(online_config.online)(model)
-    online.map_max_steps = arguments.map_max_steps
-    online.num_dispersion_particles = arguments.num_dispersion_particles
-    online.num_importance_samples = arguments.num_importance_samples
-    online.proposal_max_steps = arguments.proposal_max_steps
+    # Only override what was asked for. The config's step budgets are derived
+    # from how far the count field has to travel in log space; overriding them
+    # with a smaller number gives a compile smoke test, not a fit.
+    for name in ("map_max_steps", "num_dispersion_particles",
+                 "num_importance_samples", "proposal_max_steps"):
+        value = getattr(arguments, name)
+        if value is not None:
+            setattr(online, name, value)
 
     images = load_image(
         arguments.image,
@@ -60,6 +64,7 @@ def main(arguments: argparse.Namespace) -> None:
     )
     print(f"effective sample size: {float(result.effective_sample_size):.2f}")
     print(f"expected total count: {float(result.weighted_counts.sum()):.3f}")
+    print(f"dispersion losses finite: {bool(np.isfinite(result.dispersion_losses).all())}")
     print(f"largest normalized weight: {float(result.normalized_weights.max()):.4f}")
     print(
         f"MAP fit: {int(result.map_num_steps)} steps, "
@@ -71,13 +76,13 @@ def main(arguments: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image", type=Path)
-    parser.add_argument("--map-max-steps", default=200, type=int)
-    parser.add_argument("--num-dispersion-particles", default=8, type=int)
-    parser.add_argument("--num-importance-samples", default=64, type=int)
+    parser.add_argument("--map-max-steps", default=None, type=int)
+    parser.add_argument("--num-dispersion-particles", default=None, type=int)
+    parser.add_argument("--num-importance-samples", default=None, type=int)
     parser.add_argument(
         "--output", default=Path("map-proposal-online.png"), type=Path
     )
-    parser.add_argument("--proposal-max-steps", default=200, type=int)
+    parser.add_argument("--proposal-max-steps", default=None, type=int)
     parser.add_argument("--seed", default=0, type=int)
     return parser.parse_args()
 

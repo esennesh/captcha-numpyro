@@ -8,23 +8,79 @@ _partial_: true
 # while locating the mode. Importance samples are exact integer counts.
 discrete_temperature: 0.1
 dsgd_kwargs:
-  max_count: 16
-  width: 32
+  max_count: 72
+  # 32 -> 8, for the recurrence window's cost, not for correctness.
+  #
+  # The window used to have to be tiny to dodge a NaN, but the NaN was never
+  # about the window: `_gamma_count_log_pmf` takes the logarithm of an
+  # incomplete-gamma tail that has underflowed to zero, and although the value
+  # it returns is right, the derivative is NaN. The proposal phase then hands
+  # `eval_and_stable_update` a NaN gradient, every update is discarded, and the
+  # only visible symptom is a loss history of NaN. That is repaired in
+  # src/inference/count_relaxation.py and belongs upstream.
+  #
+  # What actually drove it was the *fitted* GammaCount concentration, not the
+  # rate and not the width. It starts at one and the proposal objective pushes
+  # it up, because an underdispersed count proposal is what reduces
+  # importance-weight variance. Whether the gradient was finite at rate 1e-3:
+  #
+  #   concentration  1.00  1.65  2.72  4.48
+  #   W = 2          yes   yes   yes   NaN
+  #   W = 4          yes   yes   NaN   NaN
+  #   W = 8          yes   NaN   NaN   NaN
+  #
+  # So no width survived a concentration the fitter was always going to reach,
+  # and the earlier `width: 4` only postponed the failure past a short smoke
+  # run. With the repair in place every combination up to concentration 500 and
+  # W = 32 is finite.
+  #
+  # 8 rather than 32 because the window is materialized per site: 230,400 sites
+  # times 2W terms is 14.7M floats per particle at W = 32 against 3.7M at W = 8,
+  # and the relaxed mean is identical for every rate up to 4.
+  width: 8
 
 # Fit a factorized proposal around the relaxed joint MAP, then draw exact
 # particles from that proposal and self-normalize their importance weights.
 init_dispersion: 0.1
-map_max_steps: 200
+
+# Start the relaxed count field at its own prior mean rather than at
+# AutoMAPProposal's support-aware default. The default draws exp(U(-2, 2)) per
+# coordinate -- 417,081 glyph stamps for an 80x80 image -- which drives the
+# optical depth to 7.1e4 per pixel. There A = 1 exactly and dA/dtau = exp(-tau)
+# is exactly zero in float32, so the likelihood gradient on all 230,400 count
+# coordinates vanishes and only the Poisson prior pushes. See
+# init_to_count_mean for the arithmetic that identified this.
+init_loc_fn:
+  _target_: src.inference.map_proposal_online.init_to_count_mean
+  _partial_: true
+
+# The MAP phase moves the count field in LOG space, and Adam moves at most one
+# step size per step. From the prior mean at log(4/230400) = -10.96, raising the
+# handful of true sites to a count near one is a journey of about 11, so it
+# needs at least 11/step_size steps: 1,100 at the former 0.01. The former 200
+# steps could travel 2.0 and were never going to arrive. 0.05 x 1500 gives 75
+# of travel, with plenty of margin for the line the optimizer actually walks.
+map_max_steps: 1500
 map_optimizer:
   _target_: numpyro.optim.Adam
-  step_size: 0.01
+  step_size: 0.05
 map_tolerance: 1.0e-5
 num_dispersion_particles: 8
 num_importance_samples: 64
-proposal_max_steps: 200
+
+# The dispersion phase starts each count rate at the MAP value, so it has no
+# comparable distance to travel and keeps the smaller step. Its objective is
+# stochastic, so a smaller step is also the right call.
+proposal_max_steps: 500
 proposal_optimizer:
   _target_: numpyro.optim.Adam
   step_size: 0.01
 proposal_tolerance: 1.0e-3
+
+# Must not exceed the max-step counts, or the convergence test never runs a
+# second interval and `converged` is False by construction. The notebook used
+# to leave this at the class default of 50 with max_steps = 20, so both
+# convergence flags it printed were guaranteed to be False and carried no
+# information.
 termination_check_interval: 20
 termination_patience: 5

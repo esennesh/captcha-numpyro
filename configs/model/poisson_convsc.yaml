@@ -128,15 +128,43 @@ placements:
   texture_bond_precision: 4.0
   texture_element_precision: 1.0
 
-  # One stationary velocity covers the image. After removing translation,
-  # rotation, scale and shear in the GMRF covariance geometry, scaling and
-  # squaring exponentiates it and pulls back foreground ink only. A 10x10 raw
-  # lattice keeps the latent compact while the rendered flow stays 80x80.
+  # One stationary velocity covers the image. After conditioning out the
+  # redundant modes in the GMRF covariance geometry, scaling and squaring
+  # exponentiates it and pulls back foreground ink only. A 10x10 raw lattice
+  # keeps the latent compact while the rendered flow stays 80x80; a
+  # least-squares fit of a rotation field through this lattice leaves a 1%
+  # residual, so the lattice is not the limit.
+  #
+  # "translation", not "affine". The design note argued that translation,
+  # rotation, scale and shear are all "redundant with glyph placement and pose
+  # latents", but this renderer has NO pose latent: the count field supplies a
+  # site index and nothing else. Conditioning the affine modes out therefore
+  # deleted rotation, scale and shear from the model outright, and
+  # data/examples plainly contains them -- rotating the template raises the
+  # matched-filter score by 70% on 0000_LJ (+25 deg on both glyphs), 48% on
+  # 0001_JA (-20 deg), 17% on 0003_7Z.
+  #
+  # It is worse than a deletion. A *local* deformation carries a nonzero global
+  # affine moment, so the projection forces a compensating counter-deformation
+  # elsewhere: one glyph-sized 25 deg rotation costs 2294 nats affine-free
+  # against 99 nats translation-free, i.e. the projection made an isolated
+  # local rotation cost MORE than a two-glyph differential one (1258 nats). The
+  # cost ordering of local deformations was inverted. Translation alone stays
+  # conditioned out because it is genuinely redundant with the site index.
+  warp_modes: translation
   warp_bond_precision: 0.4
   warp_coarse_height: 10
   warp_coarse_width: 10
   warp_element_precision: 0.1
-  warp_scale: 1.5
+
+  # 1.5 -> 5.0. At 1.5 the prior gave local rotations of sd 3.8 degrees and a
+  # p95 displacement of 1.9 px, against the ~8 px needed to turn a 38 px glyph
+  # by 25 degrees; the observed deformation was a 4-8 sigma event and the model
+  # could not reach it at any affordable prior cost. Least-squares fits of the
+  # measured deformations, translation-free, cost 596 nats (0001_JA, -20/+5
+  # degrees) and 462 nats (0000_LJ, +25/+25) at scale 1.5. Cost falls as
+  # 1/scale^2, so 5.0 puts both near 50 nats, which the likelihood can pay.
+  warp_scale: 5.0
   warp_squaring_steps: 7
 
   # Initializes log_rate only; the rate then learns freely. Sandbox captchas carry

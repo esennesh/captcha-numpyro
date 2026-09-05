@@ -10,14 +10,29 @@ from numpyro.contrib.module import nnx_module
 
 from src.data.dictionary import ShapeDictionary
 from src.distributions import (
+    CompleteGaussianMrf,
+    LocallyScaledGaussianMrf,
     SecondOrderGaussianMrf,
     SpatialMixtureSameFamily,
+)
+from src.distributions.layers import (
+    POTENTIAL_EDGE_ALPHA,
+    AlphaFormat,
+    Layer,
 )
 from src.model.diffeomorphism import (
     affine_free_velocity,
     boundary_taper,
     diffeomorphic_warp,
+    translation_free_velocity,
 )
+
+# Which image modes ``TexturedDiffeomorphicPoissonConvPlacements`` conditions
+# out of its velocity field. See the ``warp_modes`` argument.
+_WARP_CONDITIONERS = {
+    "affine": affine_free_velocity,
+    "translation": translation_free_velocity,
+}
 
 
 def _as_nhwc_dictionary(shapes: Array) -> Array:
@@ -292,6 +307,13 @@ class TexturedDiffeomorphicPoissonConvPlacements(PoissonConvPlacements):
     only.  ``u`` is the normalized latent; conditioning, resizing, and
     exponentiation are deterministic transformations and require no additional
     Jacobian factor in the joint density.
+
+    ``ConditionTranslationFree`` is the default conditioning: translation is
+    redundant with the count field's site index, but rotation, scale, and shear
+    have no other latent in this renderer, so conditioning them out removes
+    them from the model. ``warp_modes="affine"`` restores the former
+    :func:`~src.model.diffeomorphism.affine_free_velocity` behaviour; see its
+    docstring for the measured cost.
     """
 
     def __init__(
@@ -309,7 +331,8 @@ class TexturedDiffeomorphicPoissonConvPlacements(PoissonConvPlacements):
         warp_coarse_height: int = 10,
         warp_coarse_width: int = 10,
         warp_element_precision: float = 0.1,
-        warp_scale: float = 1.5,
+        warp_modes: str = "translation",
+        warp_scale: float = 5.0,
         warp_squaring_steps: int = 7,
     ):
         super().__init__(
@@ -319,6 +342,11 @@ class TexturedDiffeomorphicPoissonConvPlacements(PoissonConvPlacements):
             img_w,
             rngs=rngs,
         )
+        if warp_modes not in _WARP_CONDITIONERS:
+            raise ValueError(
+                f"Unknown warp_modes {warp_modes!r}; expected one of "
+                f"{sorted(_WARP_CONDITIONERS)}."
+            )
         self.cg_iters = cg_iters
         self.texture_bond_precision = texture_bond_precision
         self.texture_element_precision = texture_element_precision
@@ -326,6 +354,7 @@ class TexturedDiffeomorphicPoissonConvPlacements(PoissonConvPlacements):
         self.warp_coarse_height = warp_coarse_height
         self.warp_coarse_width = warp_coarse_width
         self.warp_element_precision = warp_element_precision
+        self.warp_modes = warp_modes
         self.warp_scale = warp_scale
         self.warp_squaring_steps = warp_squaring_steps
 
@@ -392,9 +421,10 @@ class TexturedDiffeomorphicPoissonConvPlacements(PoissonConvPlacements):
         window = boundary_taper(
             (self.height, self.width), dtype=ink.dtype
         )
+        condition = _WARP_CONDITIONERS[self.warp_modes]
 
         def warp_one(image, raw):
-            velocity = self.warp_scale * affine_free_velocity(
+            velocity = self.warp_scale * condition(
                 raw,
                 prior.solve_precision,
                 (self.height, self.width),
@@ -408,6 +438,107 @@ class TexturedDiffeomorphicPoissonConvPlacements(PoissonConvPlacements):
 
         warped = jax.vmap(warp_one)(inks, raw_velocities)
         return warped.reshape(leading + ink_shape)
+
+
+class PaperGmrfBackground(nnx.Module):
+    r"""A coarse Gaussian random field of paper colour, in logit space.
+
+    .. math::
+
+        m_b &\sim \mathcal N(\operatorname{logit}b_0,\sigma_b^2 I_C),\\
+        f &\sim \mathcal N(0,Q_{\mathrm{paper}}^{-1}\otimes I_C),\\
+        b(p) &= \operatorname{sigmoid}(m_b+(Rf)(p)),
+
+    where ``R`` resizes the coarse lattice to the image. The global logit
+    ``m_b`` carries the overall paper colour and the field carries smooth
+    variation across the sheet, exactly the split
+    :class:`TexturedDiffeomorphicPoissonConvPlacements` uses for ink: pushing
+    an overall shift through the field would charge one element-precision
+    penalty per lattice site, while a ``C``-vector can shift it directly.
+
+    This exists because a *fixed* white paper is not a harmless simplification.
+    The captcha paper in ``data/examples`` departs from white by 0.04 to 0.07
+    per channel, which at ``sigma_bg = 0.01`` is four to seven standard
+    deviations at each of 6,400 pixels. The cheapest escape the count field has
+    is to tile the canvas with glyphs and repaint the paper, and it is worth
+    tens of thousands of nats: on ``0000_LJ`` the model's own log joint scores
+    49 stamps of tiling at -21,091 against -69,192 for the correct two glyphs.
+    Sampling the paper removes that incentive rather than penalizing it.
+
+    The resize is deterministic, so the joint density needs no extra Jacobian
+    factor; ``f`` carries the normalized :class:`CompleteGaussianMrf` density on
+    the coarse lattice.
+    """
+
+    def __init__(
+        self,
+        img_h: int = 80,
+        img_w: int = 80,
+        channels: int = 3,
+        *,
+        bond_precision: float = 1.0,
+        cg_iters: int = 300,
+        coarse_height: int = 8,
+        coarse_width: int = 8,
+        element_precision: float = 0.25,
+        logit_scale: float = 0.35,
+        paper_color: tuple[float, ...] = (0.94, 0.95, 0.98),
+        resize_method: str = "cubic",
+        rngs: nnx.Rngs | None = None,
+    ):
+        del rngs
+        paper_color = jnp.asarray(paper_color)
+        if paper_color.shape != (channels,):
+            raise ValueError(
+                f"paper_color needs {channels} entries, got {paper_color.shape}"
+            )
+        self.bond_precision = bond_precision
+        self.cg_iters = cg_iters
+        self.channels = channels
+        self.coarse_height = coarse_height
+        self.coarse_width = coarse_width
+        self.element_precision = element_precision
+        self.height = img_h
+        self.logit_loc = jnp.log(paper_color) - jnp.log1p(-paper_color)
+        self.logit_scale = logit_scale
+        self.resize_method = resize_method
+        self.width = img_w
+
+    def field_prior(self):
+        """Return the normalized proper prior over the coarse paper field."""
+        shape = (self.coarse_height, self.coarse_width)
+        dtype = self.logit_loc.dtype
+        return CompleteGaussianMrf(
+            jnp.zeros((*shape, self.channels), dtype=dtype),
+            self.element_precision * jnp.ones(shape, dtype=dtype),
+            jnp.asarray(self.bond_precision, dtype=dtype),
+            cg_iters=self.cg_iters,
+        )
+
+    def resize_field(self, field: Array) -> Array:
+        """Resize ``(..., h, w, C)`` to image resolution, folding batch dims."""
+        leading = field.shape[:-3]
+        total = max(1, math.prod(leading))
+        folded = field.reshape((total,) + field.shape[-3:])
+        resized = jax.vmap(
+            lambda one: jax.image.resize(
+                one,
+                (self.height, self.width, self.channels),
+                method=self.resize_method,
+            )
+        )(folded)
+        return resized.reshape(leading + resized.shape[-3:])
+
+    def __call__(self, rngs=None):
+        del rngs
+        logit = numpyro.sample(
+            "paper_logit",
+            dist.Normal(self.logit_loc, self.logit_scale).to_event(1),
+        )
+        field = numpyro.sample("paper_field", self.field_prior())
+        return jax.nn.sigmoid(
+            logit[..., jnp.newaxis, jnp.newaxis, :] + self.resize_field(field)
+        )
 
 
 class BackgroundDecoder(nnx.Module):
@@ -619,10 +750,83 @@ def generate_poisson_convsc(placements, backgrounder: BackgroundDecoder | None=N
     return foreground, background, opacity, depth
 
 
+def _ink_layer(ink: Array, color: Array, ambient_depth: float = 1e-4) -> Layer:
+    """Wrap a stamped ink field as a foreground :class:`Layer`.
+
+    ``ink`` is the ``(..., H, W, 4)`` pair :meth:`PoissonConvPlacements.ink_field`
+    emits: premultiplied colour in channels 0:3 and optical depth in channel 3.
+    The layer carries straight-alpha coverage ``A = 1 - exp(-tau)``, the
+    premultiplied image ``A c``, and the integer region count that
+    :class:`~src.distributions.spatial.PartitionedGaussianMrf` needs.
+
+    The count is ``1`` wherever coverage reaches
+    :data:`~src.distributions.layers.POTENTIAL_EDGE_ALPHA` and ``0`` elsewhere,
+    following :mod:`src.distributions.layers`: an intermediate alpha is an
+    anti-aliased edge, so the median coverage is where a region boundary
+    belongs. It is a threshold, hence flat in the counts, which is why the
+    Gamma degrees of freedom this feeds are a *labelling* rather than another
+    channel for the count field to inflate.
+
+    This deliberately repeats the tint algebra of
+    :func:`generate_poisson_convsc` instead of sharing it: that function's
+    inkless fallback and opacity floor are calibrated against the ``blend``
+    likelihood (§§4, 5 and 17 of the design note) and changing them to suit the
+    layer algebra would silently re-tune it.
+    """
+    depth = ink[..., 3:]
+    coverage = -jnp.expm1(-(depth + ambient_depth))
+    fallback = jnp.ones_like(color[..., jnp.newaxis, jnp.newaxis, :])
+    tint = jnp.where(
+        depth > 1e-6,
+        ink[..., :3] / jnp.clip(depth, 1e-6, None),
+        fallback,
+    )
+    foreground = tint * color[..., jnp.newaxis, jnp.newaxis, :]
+    return Layer(
+        count=jnp.where(
+            coverage[..., 0] >= POTENTIAL_EDGE_ALPHA, 1, 0
+        ).astype(jnp.int32),
+        coverage=coverage[..., 0],
+        format=AlphaFormat.PREMULTIPLIED,
+        image=coverage * foreground,
+    )
+
+
+def composite_poisson_convsc(placements, backgrounder=None,
+                             ambient_depth: float=1e-4) -> Layer:
+    """Composite the ink layer *over* the paper layer and return one Layer.
+
+    This is the two-field counterpart of :func:`generate_poisson_convsc`: the
+    glyph field and the paper field are each their own random field, and
+    ``over`` -- :meth:`src.distributions.layers.Layer.__matmul__` -- combines
+    them. Because the paper covers the sheet, the composite's coverage is one
+    everywhere and its image is exactly ``A c + (1 - A) b``. Its *count* is not
+    constant: it is one under ink and zero on bare paper, which is the
+    labelling the partitioned GMRF cuts its lattice bonds along and the
+    labelling the Gamma degrees of freedom read.
+
+    ``backgrounder=None`` falls back to fixed white paper, which reproduces the
+    former mean. See :class:`PaperGmrfBackground` for why that fallback costs
+    tens of thousands of nats on real captcha paper.
+    """
+    color = numpyro.sample("color", dist.Beta(jnp.ones((3,)),
+                                              jnp.ones((3,))).to_event(1))
+    glyph = _ink_layer(placements(color), color, ambient_depth)
+    if backgrounder is not None:
+        background = backgrounder()
+    else:
+        background = jnp.ones(glyph.image.shape[:-1] + (1,))
+    background = jnp.broadcast_to(background, glyph.image.shape)
+    return glyph @ Layer.straight(background)
+
+
 def poisson_convsc_model(images, placements: PoissonConvPlacements,
                          backgrounder: BackgroundDecoder | None=None,
                          ambient_depth: float=1e-4,
+                         cg_iters: int=300,
                          df_couples_to: str="opacity",
+                         gmrf_bond_precision: float=100.,
+                         gmrf_element_precision: float=50.,
                          learn_df: bool=False,
                          likelihood: str="blend",
                          observation_df=None,
@@ -641,6 +845,21 @@ def poisson_convsc_model(images, placements: PoissonConvPlacements,
     ``"blend"`` (default)
         One composited layer, ``A * fg + (1 - A) * bg``, whose per-pixel scale
         comes from :func:`_ink_scale`.
+    ``"gmrf"``
+        A Gamma-Normal partitioned GMRF over the whole image, from
+        :func:`composite_poisson_convsc` and
+        :class:`~src.distributions.spatial.LocallyScaledGaussianMrf`. The mean
+        is the same ``over`` composite; the residual is a Gaussian field whose
+        lattice bonds are cut wherever the region count changes, scaled pixel by
+        pixel by a latent precision ``lambda_p ~ Gamma(nu_p/2, nu_p/2)`` with
+        ``nu_p = count_p + 1``. Bare paper therefore gets ``nu = 1``, a very
+        dispersed precision that can fall to ~0.03 and absorb speckles and
+        distractor strokes the renderer does not represent, while ink gets
+        ``nu = 2`` and is held closer to the render. ``sigma_bg``,
+        ``sigma_ink_init``, ``variance_schedule``, ``observation_df``,
+        ``df_couples_to`` and ``learn_df`` are all unused in this branch, which
+        gets its tails from the Gamma mixing variable instead. See sections 3
+        and 4 of ``notebooks/partitioned_gmrf.ipynb``.
 
     **The blend is the default because the mixture cannot represent this data.**
     The mixture's gradient properties are genuinely better -- its derivative in
@@ -672,6 +891,38 @@ def poisson_convsc_model(images, placements: PoissonConvPlacements,
 
     batch_size = images.shape[0] if images is not None else 1
     with numpyro.plate("batch", batch_size):
+        if likelihood == "gmrf":
+            composite = composite_poisson_convsc(
+                placements, backgrounder, ambient_depth
+            )
+            # nu = 1 on bare paper, 2 under ink. The Gamma is its own latent,
+            # so a pixel the renderer cannot explain is downweighted rather
+            # than dragging the paper field or the count field towards it.
+            degrees_of_freedom = composite.count.astype(
+                composite.image.dtype
+            ) + 1.
+            local_precision = numpyro.sample(
+                "local_precision",
+                dist.Gamma(
+                    0.5 * degrees_of_freedom, 0.5 * degrees_of_freedom
+                ).to_event(2),
+            )
+            observation = LocallyScaledGaussianMrf(
+                composite,
+                gmrf_element_precision * jnp.ones(
+                    composite.image.shape[:-1], dtype=composite.image.dtype
+                ),
+                jnp.asarray(gmrf_bond_precision, dtype=composite.image.dtype),
+                local_precision,
+                cg_iters=cg_iters,
+            )
+            mean = observation.mean
+            if plot_mean:
+                numpyro.deterministic("mean", mean)
+            if images is not None:
+                numpyro.deterministic("residual", (images - mean) ** 2)
+            return numpyro.sample("obs", observation, obs=images)
+
         foreground, background, opacity, depth = generate_poisson_convsc(
             placements, backgrounder, ambient_depth
         )
@@ -706,7 +957,7 @@ def poisson_convsc_model(images, placements: PoissonConvPlacements,
                 ).to_event(3)
         else:
             raise ValueError(f"Unknown likelihood {likelihood!r}; expected "
-                             "'mixture' or 'blend'.")
+                             "'blend', 'gmrf' or 'mixture'.")
 
         mean = observation.mean
         if plot_mean:

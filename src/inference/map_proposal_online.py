@@ -28,13 +28,78 @@ Every spatial location and dictionary identity remains represented in the
 Poisson count tensor throughout fitting and sampling.
 """
 
+import functools
 from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 from numpyro import handlers
+from numpyro.contrib.diag_sgd import SmoothedCount
 from numpyro.contrib.map_proposal import AutoMAPProposal
+from numpyro.infer.initialization import init_to_uniform
 from numpyro.infer.util import get_importance_trace
+
+from src.inference.count_relaxation import patch_count_log_pmf
+
+# Repair the Gamma-count log PMF before any relaxed count is differentiated.
+# Without it the proposal phase silently reports NaN losses and never moves;
+# see :mod:`src.inference.count_relaxation`. A no-op once upstream carries the
+# fix.
+patch_count_log_pmf()
+
+# The DSGD relaxation of a count site has support ``(0, inf)``, so its
+# unconstrained representation is a logarithm and no positive count can be
+# initialized at zero. This floor is the smallest count the initializer will
+# hand back.
+_MINIMUM_RELAXED_COUNT = 1e-12
+
+
+def _relaxed_count_base(distribution):
+    """The discrete law behind a DSGD count relaxation, or ``None``."""
+    if isinstance(distribution, SmoothedCount):
+        return distribution.base_dist
+    base = getattr(distribution, "base_dist", None)
+    return None if base is None else _relaxed_count_base(base)
+
+
+def init_to_count_mean(site=None, *, fallback=init_to_uniform):
+    r"""Initialize a DSGD-relaxed count site at its own prior mean.
+
+    ``AutoMAPProposal`` otherwise falls back to
+    :func:`~numpyro.infer.initialization.init_to_uniform`, and
+    :class:`~numpyro.contrib.diag_sgd.SmoothedCount` has support ``(0, inf)``,
+    so the unconstrained representation is a logarithm and the default draws
+    ``exp(U(-2, 2))`` -- a mean of 1.81 -- at *every* count coordinate. For an
+    ``80 x 80`` image and a 36-glyph dictionary that is 417,081 glyph stamps.
+
+    That point is not merely far from the mode, it is a point where the
+    optimizer has nothing to follow. Counts reach the image only through the
+    optical depth ``tau``, and 417,081 stamps put ``tau`` at 7.1e4 per pixel, so
+    ``A = 1 - exp(-tau)`` is 1.0 and ``dA/dtau = exp(-tau)`` is *exactly zero in
+    float32* at every pixel. The likelihood gradient on all 230,400 count
+    coordinates vanishes and only the Poisson prior pushes, uniformly downward,
+    one Adam step size per step.
+
+    The prior mean is the natural cure and it restores the gradient: at a
+    homogeneous rate of ``4/230400`` the same render has ``tau = 0.68`` per
+    pixel and ``dA/dtau`` up to 0.81. It is also not a warm start -- it uses the
+    model's own rate and nothing derived from the observation, so no matched
+    filter decides which sites begin with count mass.
+
+    Sites without a count relaxation, such as the paper field or the local
+    Gamma precisions, go to ``fallback``.
+    """
+    if site is None:
+        return functools.partial(init_to_count_mean, fallback=fallback)
+    if site["type"] == "sample" and not site["is_observed"]:
+        base = _relaxed_count_base(site["fn"])
+        if base is not None:
+            sample_shape = site["kwargs"].get("sample_shape") or ()
+            mean = jnp.broadcast_to(
+                base.mean, sample_shape + site["fn"].shape()
+            )
+            return jnp.clip(mean, _MINIMUM_RELAXED_COUNT, None)
+    return fallback(site)
 
 
 class MAPProposalCaptchaResult(NamedTuple):
@@ -81,6 +146,7 @@ class MAPProposalCaptchaInference:
         discrete_temperature: float = 0.1,
         dsgd_kwargs: dict | None = None,
         init_dispersion: float = 0.1,
+        init_loc_fn=init_to_count_mean,
         map_max_steps: int = 1000,
         map_optimizer=None,
         map_tolerance: float = 1e-5,
@@ -97,6 +163,7 @@ class MAPProposalCaptchaInference:
         self.discrete_temperature = discrete_temperature
         self.dsgd_kwargs = dsgd_kwargs
         self.init_dispersion = init_dispersion
+        self.init_loc_fn = init_loc_fn
         self.map_max_steps = map_max_steps
         self.map_optimizer = map_optimizer
         self.map_tolerance = map_tolerance
@@ -117,6 +184,7 @@ class MAPProposalCaptchaInference:
             discrete_temperature=self.discrete_temperature,
             dsgd_kwargs=self.dsgd_kwargs,
             init_dispersion=self.init_dispersion,
+            init_loc_fn=self.init_loc_fn,
             map_max_steps=self.map_max_steps,
             map_optimizer=self.map_optimizer,
             map_tolerance=self.map_tolerance,
