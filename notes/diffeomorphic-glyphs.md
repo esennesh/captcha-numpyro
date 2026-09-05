@@ -173,6 +173,10 @@ optimized transposed convolution.
 
 ### Removing affine components
 
+**Correction, 2026-09-04: the premise below is false for the convolutional
+renderer, and only translation should be removed. See "Which modes are actually
+redundant" after the derivation.**
+
 Translation, rotation, scale, and shear are redundant with glyph placement and
 pose latents. Let the coarse velocity channel have the normalized prior
 
@@ -230,6 +234,60 @@ differentiation's resize map, computes $X$ with three sparse
 `SecondOrderGaussianMrf.solve_precision` right-hand sides, and solves only the
 dense $3\times3$ system $M$.
 
+### Which modes are actually redundant
+
+The premise above holds for `sparse_diffeomorphic_stamp`, which takes a
+per-occurrence velocity and therefore does carry a pose latent.
+`TexturedDiffeomorphicPoissonConvPlacements` does not. Its only placement
+latent is the count field $a$, which supplies a *site index* and nothing else.
+Translation is genuinely redundant with that index; rotation, scale, and shear
+have no other latent at all, so conditioning them out removes them from the
+model.
+
+`data/examples` contains them. Correlating the dictionary against each image
+over rotations and scales, rotating the template raises the matched-filter
+score by 70% on `0000_LJ` (both glyphs at about 25 degrees), 48% on `0001_JA`
+(one glyph at $-20$ degrees, the other at $+5$), 17% on `0003_7Z`, and 16% on
+`0004_7D`. The five older examples are upright and gain nothing, which is why
+this went unnoticed.
+
+The projection is also worse than a deletion, because a *local* deformation
+carries a nonzero global affine moment and the constraint forces a
+compensating counter-deformation elsewhere in the image. Least-squares fitting
+each target velocity field through the coarse-to-image map and reading off the
+prior cost, on the $10\times10$ lattice at `warp_scale = 1.5`:
+
+| target | affine-free | translation-free |
+|---|---|---|
+| one glyph rotated 25 degrees | 2294 nats | **99 nats** |
+| `0001_JA`, $-20$ and $+5$ degrees | 1258 nats | **596 nats** |
+| `0000_LJ`, $+25$ and $+25$ degrees | 5920 nats | **462 nats** |
+
+Under the affine projection an *isolated* local rotation costs more than a
+two-glyph differential one. The cost ordering of local deformations is
+inverted, which is the opposite of what a deformation prior is for. The
+relative residual is 1% or better in every row, so the coarse lattice
+represents these fields perfectly well; the whole difference is prior cost.
+
+`warp_scale` was raised 1.5 to 5.0 at the same time. Cost falls as
+$1/\text{scale}^2$, so the two measured deformations land near 50 nats. At 1.5
+the prior gave local rotations of standard deviation 3.8 degrees and a 95th
+percentile displacement of 1.9 px, against the roughly 8 px needed to turn a
+38 px glyph by 25 degrees.
+
+Measured end to end on `0000_LJ`, scoring the correct two-glyph explanation
+with the model's own log joint, with and without the fitted rotation:
+
+| conditioning | scale | warp prior cost | change in log joint |
+|---|---|---|---|
+| affine-free | 1.5 | 5920 | **$-2660$** |
+| translation-free | 1.5 | 462 | $+2802$ |
+| translation-free | 5.0 | 42 | **$+3223$** |
+
+So under the former settings the model was right to refuse the rotation: the
+projection charged more for it than the likelihood would pay. `warp_modes`
+selects between the two conditionings and defaults to `"translation"`.
+
 This is affine-free by construction and respects the GMRF covariance geometry.
 It is also a linear transformation of the original Gaussian draw. The induced
 density over $u_\perp$ or $v$ is necessarily singular in the ambient space,
@@ -273,7 +331,7 @@ c(s)&=\operatorname{sigmoid}(\operatorname{logit}c_0+r(s)),\\
 m(s)&=\frac{c(s)}{c_0}
      =\frac{\exp r(s)}{1+c_0(\exp r(s)-1)},\\
 I_0&=\operatorname{Stamp}(a,K\odot m),\\
-u_\perp&=\operatorname{ConditionAffineFree}(u),\\
+u_\perp&=\operatorname{ConditionTranslationFree}(u),\\
 v&=WRu_\perp,\\
 \phi&=\exp(v),\\
 I(p)&=I_0(\phi^{-1}(p)).

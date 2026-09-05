@@ -1837,3 +1837,166 @@ uncertainty. And for reading reconstructions, `ev.mean(axis=0)` blends across po
 count draws, so a genuinely uncertain glyph renders pale rather than sometimes-absent —
 plotting a single particle, or the per-particle spread, shows what the posterior actually
 believes.
+
+---
+
+## 26. The paper was the problem: canvas tiling was the mode all along
+
+Everything from §15 onwards tuned the *tail* of a likelihood whose *mean* was wrong. The
+model composites ink over paper, `backgrounder: null` makes that paper pure white, and
+`sigma_bg = 0.01` says the model is very sure about it. §0 justified both from the
+sandbox data, where 95.3% of pixels are bit-identical to white.
+
+Five examples added to `data/examples` on 2026-09-03 are not that data. Their paper is
+tinted — median colour 0.933 to 0.992 per channel, no pure-white pixels at all — and
+they carry scattered coloured speckles and a distractor stroke. A departure of 0.04 to
+0.07 at `sigma_bg = 0.01` is four to seven standard deviations at each of 6,400 pixels,
+three channels each.
+
+The model has exactly one way to escape that, and it is not subtle. Scoring three
+explanations with the model's own log joint, texture and warp at zero:
+
+| explanation | `0000_LJ` | `0000_N6` |
+|---|---|---|
+| blank canvas | -62,059 | -37,332 |
+| the correct two glyphs, correct ink colour | -69,192 | **-31,964** |
+| 49 stamps tiling the canvas in the paper's colour | **-21,091** | **-10,553** |
+
+**Canvas tiling is the global mode on both images**, including `0000_N6` from the
+original, near-white, upright set. It wins by 48,101 nats on the first and 21,411 on the
+second. Each stamp costs about 11 nats of Poisson occupancy, so 49 of them cost ~540
+against a likelihood gain of ~40,000; the sparsity prior is four orders of magnitude too
+weak to matter, and no adjustment to it could be enough.
+
+Two consequences, and both invert how earlier sections read.
+
+**Better optimization makes the reconstruction worse.** Every previous section treated a
+saturated count field as an inference failure — RLOO not getting off the ground (§11),
+DoubleCVTracer pointing the wrong way (§13), over-inking at high `log_total_q` (§17).
+Some of that was real. But an optimizer that reaches this target's actual mode produces
+a tiled canvas, so the more successful the fitting, the worse the picture. The
+`AutoMAPProposal` run in `notebooks/online_map_proposal.ipynb` reported an expected total
+glyph count of 342,414 and was doing exactly what a MAP procedure should.
+
+**The warm start was not helping inference; it was hiding this.** §12's matched-filter
+initialisation and the candidate-set restriction that followed it kept the count field
+near a sparse configuration the optimizer would otherwise have left. Removing them was
+right — a candidate set changes the target and a warm start is not a model — and the
+result is diagnostic rather than a regression.
+
+On `0000_LJ` the correct two glyphs score *worse than a blank canvas* even after the
+paper is supplied. That is a separate defect, the affine-free warp, measured in
+`notes/diffeomorphic-glyphs.md`.
+
+### The fix: two random fields and `over`
+
+`configs/model/poisson_convsc_gmrf` follows sections 3 and 4 of
+`notebooks/partitioned_gmrf.ipynb`. The paper becomes a latent field of its own,
+
+```
+paper_logit ~ Normal(logit b_0, 1.5^2 I_3)        # overall tint, 3 numbers
+paper_field ~ CompleteGaussianMrf(0, Q_paper^-1)  # 8 x 8 x 3, smooth variation
+b(p)        = sigmoid(paper_logit + (R paper_field)(p))
+```
+
+and the composite is `over` on `Layer`s — `render(a, c) @ Layer.straight(b)` — rather
+than an inline blend. Splitting the global logit from the field matters for the same
+reason it does for ink texture: pushing an overall shift through the field would charge
+one element-precision penalty per lattice site.
+
+The observation model becomes the Gamma-Normal partitioned GMRF,
+
+```
+nu_p        = count_p(z) + 1
+lambda_p    ~ Gamma(nu_p / 2, nu_p / 2)
+x | z, lam  ~ N(mu(z), [D(sqrt lam) Q(z) D(sqrt lam)]^-1 (x) I_3)
+```
+
+with `Q(z) = tau I + kappa L(count(z))`, the lattice bonds cut wherever the region count
+changes, so ink and paper do not smooth into each other across a glyph outline. Bare
+paper gets `nu = 1`, a Gamma dispersed enough to fall to ~0.03, which is how the
+speckles and the distractor stroke get absorbed instead of recruiting glyphs to explain
+them. Ink gets `nu = 2` and is held closer to the render.
+
+This replaces the whole `_ink_scale` / `_observation_df` apparatus of §§5, 17, 18, 20,
+21 and 24 — the Gamma mixing variable *is* a Student-t tail, but with a per-pixel scale
+the model infers rather than a schedule keyed to opacity. Those settings still apply to
+`likelihood: blend`, which remains the default and remains what the amortized encoder
+trains against.
+
+### What it buys, measured
+
+Same three explanations under `poisson_convsc_gmrf`, with the warp still at zero and the
+local precisions pinned at one — a real fit can only improve the correct row:
+
+| explanation | `0000_LJ` | `0000_N6` |
+|---|---|---|
+| blank canvas | 10,141 | 26,314 |
+| 49 stamps tiling the canvas | 11,704 | 27,081 |
+| the correct two glyphs | **11,995** | **29,667** |
+| the correct two glyphs, with a fitted warp | **15,218** | — |
+
+The correct explanation is now the best of the three on both images, and with the warp
+fitted it beats tiling by 3,514 nats on the image that formerly lost to it by 48,101.
+
+### First pod run: every component is doing another component's job
+
+2026-09-04, `0000_LJ`, 1500 MAP steps and 500 dispersion steps at the shipped
+config. The inference machinery is fixed and the model is not.
+
+What worked. The MAP objective fell from 1,124,715 to **-33,207**, a swing of
+1.16 million nats, so the count field can now move. The expected total glyph
+count is **10.0** with a largest site/class expectation of **1.0**, against
+342,414 and 16 before -- sparse, and no site holds more than one spike. Both
+loss histories are finite, so the Gamma-count NaN is gone. The local precisions
+span [0.022, 0.316, 1.58, 4.10, 7.91] across the 1/10/50/90/99 quantiles, which
+is the dispersion the construction is supposed to produce.
+
+What did not. Reconstruction RMSE is 0.127, and the three diagnostic panels
+show why: the roles have swapped.
+
+- **The paper field renders the glyphs.** The fitted paper carries two large
+  red blobs sitting exactly on the `L` and the `J`. It is an 8x8 lattice over
+  80x80, so one coarse cell covers about 10x10 px while a glyph is 38x26 px --
+  roughly 4x3 cells. The field has ample resolution to paint a glyph, and at
+  `element_precision: 0.25` (a marginal standard deviation of 2 in logit space)
+  ample amplitude too. So it does.
+- **The count field stamps glyphs onto the confetti.** With the ink already
+  explained, the only unexplained structure left is the speckles, and that is
+  where the ten spikes land. The bottom-left spike sits on the bottom-left
+  speckle.
+- **The Gamma precisions forgive the glyph strokes.** `log10 lambda` drops to
+  about -2 exactly along both glyph strokes and along the horizontal distractor
+  line. Because `nu_p = count_p + 1` and the renderer put no ink there, those
+  pixels get `nu = 1`, the most dispersed prior, so a missed glyph is nearly
+  free. This is §20's lesson resurfacing in a new place: the forgiving tail
+  lands where the model is *wrong* rather than where the noise is.
+
+The three failures are one failure. Give the background a field expressive
+enough to draw a glyph and it will, after which nothing downstream has any
+reason to place one.
+
+The first thing to try is stiffening the paper: a 3x3 or 4x4 coarse lattice
+instead of 8x8 caps the spatial frequency below a glyph, and raising
+`element_precision` caps the amplitude. The Gamma degrees of freedom need
+re-deriving in the same pass, because a paper that cannot draw a glyph will
+leave a large residual at the strokes and `nu = count + 1` still hands those
+pixels the fattest tail. §21 chose that direction on the argument that a miss
+should stay expensive without being catastrophic; here it is not expensive
+enough. Neither change is safe to make blind -- they interact, and the
+measurement is a pod run.
+
+### Open
+
+- The amortized guide (`configs/guide/poisson_convsc_encoder`) does not mirror
+  `paper_logit`, `paper_field` or `local_precision`, so training still runs against
+  `poisson_convsc` and the `blend` likelihood. Adding a paper head and a precision head
+  is the obvious next step.
+- `tau = 50`, `kappa = 100` are carried over from the partitioned-GMRF notebook's fit of
+  `0002_J8`. They have not been swept against this dictionary at 80 x 80.
+- §4's argument that a two-component mixture cannot represent anti-aliased coverage still
+  stands and is unaffected: the Gamma-Normal has one composited mean, not two components.
+- Whether the local Gamma alone would do, without the coarse paper field, is section 4 of
+  the partitioned-GMRF notebook. On `0002_J8` the two were equivalent, but that image's
+  paper was already almost exactly the fixed colour. `0000_LJ` is the counterexample that
+  test needs.
