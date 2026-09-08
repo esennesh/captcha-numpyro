@@ -44,8 +44,28 @@ guide_class:
 # The count block gets its own step size and the projection; everything else
 # keeps a step suited to a logit or a velocity. `keep_params_nonnegative` needs
 # `params` passed to `update`, which `numpyro.optim.optax_to_numpyro` does.
+#
+# count_step_size must be small relative to the amplitude the ANSWER lives at,
+# not relative to one. A recovered glyph holds a peak amplitude of 0.06 to 0.11
+# over a few hundred coefficients, so 1e-2 is 10-20% of the target in a single
+# Adam step: too coarse to resolve a sparse solution, and the field random-walks
+# up to a diffuse haze instead. Ladder A1 on the five upright examples, giving
+# glyph evidence / count total / coefficients:
+#
+#   image       at 1e-2                       at 1e-3
+#   0000_N6     +1,522    0.88      807       +1,655   0.60    497
+#   0001_OO     +2,338    0.98      466       +2,482   0.79    629
+#   0002_J8       -170    6.18    6,253       +2,125   1.18  1,084
+#   0003_LN    -15,398 1605.37   31,291       +2,278   0.85    559
+#   0004_V6       +545    2.37      848       +2,028   0.94    799
+#
+# 1e-3 recovers both glyphs on all five; 1e-2 manages three and diverges on one.
+# It is also the value sections 3 and 4 of notebooks/partitioned_gmrf.ipynb use,
+# and the default of `count_block_adam` -- an earlier version of this config had
+# overridden it to 1e-2 on the strength of a 20x20 toy whose amplitude scale was
+# different, which cost a pod run to find.
 map_optimizer:
   _target_: src.inference.linear_count_proposal.count_block_adam
-  count_step_size: 1.0e-2
+  count_step_size: 1.0e-3
   step_size: 5.0e-2
   count_sites: [a]

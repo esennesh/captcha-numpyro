@@ -2078,6 +2078,8 @@ joint minus the log joint with the count field pinned at zero.
 | `0002_J8` | -170 | 2/2 | 6.18 | 6,253 | 0.173 | 1340 |
 | `0003_LN` | **-15,398** | 0/2 | **1,605** | **31,291** | 0.198 | 1300 |
 
+*Superseded below: at `count_step_size = 1e-3` every row recovers.*
+
 **The joint-identification story holds.** Where no warp is needed, the pipeline
 recovers both glyphs with the right identities within one pixel of the matched
 filter's positions -- `N@(44,55)` and `6@(34,33)` against a truth of (45,56)
@@ -2085,50 +2087,65 @@ and (35,34) -- and glyph evidence in the hundreds to low thousands, against the
 +58 nats `0000_LJ` managed with the warp free. So the slot model is aimed at
 the right thing.
 
-### The haze: a coordinate-wise optimum that is 16,000 nats worse than blank
+### The haze was the step size, and my diagnosis of it was wrong
 
-`0003_LN` is not a spike runaway. Its largest single count is **0.21**, and the
-1,605 total is **31,291 coefficients averaging 0.05 each** -- a diffuse
-semi-transparent wash over an eighth of the field. `0002_J8` shows the same
-thing more mildly at 6,253 coefficients.
+`0003_LN`'s first failure was not a spike runaway: its largest single count was
+0.21 and the 1,605 total was 31,291 coefficients averaging 0.05, a diffuse
+wash. I read that as a *stationary point* of a badly shaped objective, on the
+grounds that the relaxed Poisson prior actively rewards spreading. That prior
+arithmetic is correct and worth keeping:
 
-The arithmetic says this is a stationary point rather than a divergence. The
-relaxed Poisson log density at `a = 0.05` is
+| n | a each | -log p | vs one spike |
+|---|---|---|---|
+| 1 | 1.0 | 10.961 | -- |
+| 20 | 0.05 | 10.425 | **-0.537** |
+| infinity | -> 0 | 10.384 | **-0.577** |
 
-```
-a log(lambda) - lambda - logGamma(a + 1) = -0.548 - 0.000 + 0.027 = -0.521 nats
-```
+The continuation of the Poisson log-pmf pays up to `gamma = 0.577` nats per
+unit of amplitude to fractionalize it, because `logGamma(a + 1)` is negative on
+`(0, 1)` -- `n` sites each collect `logGamma(1 + 1/n) ~ -gamma/n`. The discrete
+Poisson cannot access that discount, since its support is the integers. So the
+relaxation is genuinely not mode-preserving.
 
-and `31,291 x 0.521 = 16,300`, which is the 15,398 deficit. Meanwhile the count
-gradient at a wrong site only has to exceed the prior's `log(lambda) -
-psi(a+1) = -10.4` for that site to be worth lifting off zero. So **each
-coordinate is individually at its own optimum and the aggregate is a
-disaster**: the sites interact through a shared render, so "a little more ink
-here helps" is true one site at a time and false 31,291 times over. A
-factorized prior cannot see that.
+**But that is not what caused the haze.** Re-running A1 with
+`count_step_size` at `1e-3` instead of `1e-2`:
 
-Which images it hits is consistent with that reading. The three successes have
-466 to 848 coefficients; the two failures are the images with the boldest ink
-(`0002_J8`'s darkest ink pixel is 0.635 above its paper) and they are also the
-two runs that kept optimizing longest, 1,340 and 1,300 steps against 460.
+| image | glyph evidence | identity | count total | coefficients | RMSE |
+|---|---|---|---|---|---|
+| `0000_N6` | +1,655 | 2/2 | 0.60 | 497 | 0.094 |
+| `0001_OO` | +2,482 | 2/2 | 0.79 | 629 | 0.104 |
+| `0002_J8` | **+2,125** | 2/2 | 1.18 | 1,084 | 0.119 |
+| `0003_LN` | **+2,278** | 2/2 | 0.85 | 559 | 0.136 |
+| `0004_V6` | +2,028 | 2/2 | 0.94 | 799 | 0.102 |
 
-This is the mirror of §26's problem. Log-space counts were too slow to arrive;
-linear-space counts arrive and then keep going, because the projection bounds
-them below and nothing bounds the *number* of them.
+**All five recover both glyphs**, with glyph evidence between +1,655 and
++2,482. `0003_LN` went from -15,398 to +2,278 and from 31,291 coefficients to
+559. So the haze was overshoot.
 
-Three responses, cheapest first.
+Where the reasoning went wrong is worth recording. The prior's spreading reward
+is half a nat per unit of amplitude and the haze cost 16,300 nats -- three
+orders of magnitude apart, so it could never have paid for it. What misled me
+was that `31,291 x 0.521 = 16,300` matched the deficit almost exactly, and I
+read the coincidence as evidence that each site sat at its own optimum. It is
+not evidence of anything: it is the tautology that the haze's cost *is* the
+prior cost of the amplitude it holds, whatever put it there.
 
-1. **Rerun with `count_step_size` at 1e-3**, the value sections 3 and 4 of the
-   partitioned-GMRF notebook use. If the haze survives a tenfold smaller step
-   it is a genuine stationary point; if it vanishes it was overshoot. This is
-   the discriminator and it costs one run.
-2. **A stronger count prior.** The Poisson costs 0.52 nats at `a = 0.05`; the
-   notebook's `Exponential(25)` costs 1.25, and its `-logGamma(a+1)` term does
-   not partially refund small amplitudes the way the Poisson's does.
-3. **Threshold and refine**, which is exactly what the notebook does and what
-   §26 argued was unnecessary because the projection already produces exact
-   zeros. Exact zeros are not enough: the haze is 31,291 coordinates at 0.05,
-   none of them zero. Pruning below a threshold and refitting kills it directly.
+The real cause is mundane. A recovered glyph holds a peak amplitude of 0.06 to
+0.11, so one Adam step of `1e-2` is 10 to 20% of the answer's own scale -- too
+coarse to resolve a sparse solution, and the field random-walks up to a diffuse
+equilibrium instead. `1e-3` is 1 to 2% of it. That is the value the
+partitioned-GMRF notebook uses and the default of `count_block_adam`; the
+config had overridden it on the strength of a 20 x 20 toy whose amplitude scale
+was different.
+
+Two things worth keeping from the episode. The recovered solution is *not* one
+spike per glyph -- it is a localized cluster of fractional amplitudes, peak
+0.06 to 0.11 over 500 to 1,100 coefficients, which is the same regime section 3
+of the partitioned-GMRF notebook found with its top coefficient at 0.119. The
+two approaches now agree about the amplitude scale. And the step size has to be
+set against that scale, not against one; anything that changes the amplitude
+scale, such as the alpha clip or the count-to-depth map, changes the right step
+size with it.
 
 ---
 
@@ -2333,6 +2350,14 @@ A backlog, organized by which part of the model each one varies, with the
 measurement that motivates it and the objection against it where there is one.
 Items marked **runnable** already have a driver in `scripts/experiments.py`.
 
+**Re-ranked 2026-09-08 after A1 at `count_step_size = 1e-3`.** The haze that
+motivated group A and item B1 was overshoot, not a stationary point, and all
+five upright images recover once the step matches the amplitude scale. Those
+items are kept with their arithmetic intact but marked **unmotivated**: nothing
+currently observed calls for them. Group D is untouched, because §26's
+measurement that the free precisions absorb 84% of the glyph evidence was made
+with the counts *held* at truth and so does not depend on the fit at all.
+
 The organizing observation, from §26's haze: for a count field, the free
 modelling choice is **how the relaxation interpolates between integers**.
 `tau = c a` is exactly right at integer `a`, because `a` copies of one glyph
@@ -2341,7 +2366,12 @@ Poisson log-pmf is exactly right at integer `a` too. Everything in between is
 a choice nobody made deliberately, and it is where the haze lives. Several
 entries below are different ways of making that interpolation prefer integers.
 
-### A. The amplitude prior
+### A. The amplitude prior -- unmotivated as of 2026-09-08
+
+Every item here was motivated by the haze being a stationary point. It was not.
+The arithmetic is kept because the relaxation's fractionalization discount is
+real and may bite again if the amplitude scale changes, but none of these is
+worth running now.
 
 - **A1. Exponential instead of Poisson.** Evaluated at every site,
   `230400 log beta - beta sum(a)` is purely linear in the total, so it is
@@ -2361,7 +2391,8 @@ entries below are different ways of making that interpolation prefer integers.
   a diagonal first-order method cannot leave. §26 argued this was unnecessary
   because the projection already yields exact zeros; the haze is 31,291
   coordinates at 0.05 and none of them is zero, so that argument was wrong.
-  **Cheapest of the three and the most likely to work.**
+  Was "cheapest of the three and most likely to work"; not needed, since the
+  step-size fix leaves 500 to 1,100 coefficients rather than 31,291.
 - **A4. An integer proximal step.** Periodically pull `a` toward the nearest
   integer, or add a penalty on the distance to the integer lattice. The
   principled version of A3. *Note:* annealing `discrete_temperature` does
@@ -2371,9 +2402,11 @@ entries below are different ways of making that interpolation prefer integers.
 
 ### B. The count-to-depth map
 
-- **B1. A superlinear count-to-depth map, `tau = c a^p` with `p > 1`.** This is
-  the direct attack on the likelihood's blindness to spreading, and it looks
-  strong. Total depth from `n` sites holding `M/n` each is `c M^p n^(1-p)`, so:
+- **B1. A superlinear count-to-depth map, `tau = c a^p` with `p > 1`.**
+  *Unmotivated as of 2026-09-08*: it attacks the haze, and the haze was the step
+  size. Recorded because the arithmetic is sound and would matter if spreading
+  ever became load-bearing. It is the direct attack on the likelihood's
+  blindness to spreading. Total depth from `n` sites holding `M/n` each is `c M^p n^(1-p)`, so:
 
   | n | tau, p = 1 | tau, p = 1.5 | tau, p = 2 | prior saving from spreading |
   |---|---|---|---|---|
@@ -2400,7 +2433,8 @@ entries below are different ways of making that interpolation prefer integers.
 
 ### C. The slot lattice
 
-- **C1. A coarser slot lattice.** One slot every two pixels cuts 6,400
+- **C1. A coarser slot lattice.** *Unmotivated as of 2026-09-08*, same reason.
+  One slot every two pixels cuts 6,400
   positions to 1,600 and gives a haze a quarter as many coordinates to spread
   into. Cheap, and it attacks "31,291 marginally justified sites" directly.
   *Note:* it does not shrink the prior's fractionalization discount, which is
