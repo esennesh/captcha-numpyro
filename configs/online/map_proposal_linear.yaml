@@ -1,0 +1,51 @@
+# `map_proposal`, but with the relaxed count field held in linear space under a
+# nonnegativity projection rather than reparameterized through a logarithm.
+#
+# WHY: `AutoMAPProposal` reparameterizes every site through
+# `biject_to(support)`, and a DSGD-relaxed count site has support (0, inf), so
+# the MAP phase walks log a. Adam moves each coordinate by about one step size
+# per step, so from the prior rate 4/230400 a stamp needs 10.96/step_size steps
+# before it renders anything: 219 at 0.05. The paper logit reaches its correct
+# value in about 34, and the ink colour and texture sooner. Whichever block
+# explains the ink first keeps it, and in log space the counts are guaranteed to
+# arrive last. The first pod run showed exactly that -- the paper field drew
+# both glyphs and the count field was left stamping the confetti.
+#
+# Sections 3 and 4 of notebooks/partitioned_gmrf do not have this problem: they
+# hold the counts as a plain nonnegative parameter, start at zero, and step at
+# 1e-3 in linear space, so a coefficient is useful after about 40 steps.
+#
+# Measured on a 20x20 canvas at the pod's own count rate, all non-count sites
+# stepping at 0.05 so only the count geometry differs:
+#
+#                             50 steps            600 steps
+#   parameterization    max count   loss     max count  loss   active  exact 0
+#   log,    step 0.05     0.0003  -1698.1      0.2038  -2035.3      9        0
+#   linear, step 1e-3     0.0369  -1800.6      0.0830  -2033.2      6      393
+#   linear, step 1e-2     0.1605  -1802.6      0.2881  -2036.3      2      398
+#
+# So the geometry buys speed early -- two to three orders of magnitude of count
+# amplitude at 50 steps -- and lands on the same objective by 600. It also buys
+# genuine sparsity for free: projected gradient descent against the Poisson
+# prior pins unsupported sites at exactly zero, which the logarithm can never
+# reach, so there is no need for the notebook's threshold-and-refine pass.
+#
+# UNVERIFIED at 80x80. The toy above has no glyph-shaped structure for the paper
+# field to steal, so it cannot show whether this fixes the role inversion.
+
+defaults:
+  - map_proposal
+  - _self_
+
+guide_class:
+  _target_: src.inference.linear_count_proposal.LinearCountMAPProposal
+  _partial_: true
+
+# The count block gets its own step size and the projection; everything else
+# keeps a step suited to a logit or a velocity. `keep_params_nonnegative` needs
+# `params` passed to `update`, which `numpyro.optim.optax_to_numpyro` does.
+map_optimizer:
+  _target_: src.inference.linear_count_proposal.count_block_adam
+  count_step_size: 1.0e-2
+  step_size: 5.0e-2
+  count_sites: [a]

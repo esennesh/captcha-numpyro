@@ -36,7 +36,7 @@ import jax.numpy as jnp
 from numpyro import handlers
 from numpyro.contrib.diag_sgd import SmoothedCount
 from numpyro.contrib.map_proposal import AutoMAPProposal
-from numpyro.infer.initialization import init_to_uniform
+from numpyro.infer.initialization import init_to_sample
 from numpyro.infer.util import get_importance_trace
 
 from src.inference.count_relaxation import patch_count_log_pmf
@@ -62,7 +62,7 @@ def _relaxed_count_base(distribution):
     return None if base is None else _relaxed_count_base(base)
 
 
-def init_to_count_mean(site=None, *, fallback=init_to_uniform):
+def init_to_count_mean(site=None, *, fallback=init_to_sample):
     r"""Initialize a DSGD-relaxed count site at its own prior mean.
 
     ``AutoMAPProposal`` otherwise falls back to
@@ -86,8 +86,34 @@ def init_to_count_mean(site=None, *, fallback=init_to_uniform):
     model's own rate and nothing derived from the observation, so no matched
     filter decides which sites begin with count mass.
 
-    Sites without a count relaxation, such as the paper field or the local
-    Gamma precisions, go to ``fallback``.
+    Sites without a count relaxation go to ``fallback``, which is
+    :func:`~numpyro.infer.initialization.init_to_sample` -- a draw from each
+    site's own prior -- rather than ``AutoMAPProposal``'s ``init_to_uniform``.
+    The default ignores the prior entirely, and for this model that is not a
+    small difference. Prior log density at the initial point, summed per site:
+
+    ==================  ================  ================
+    site                ``init_to_uniform``  ``init_to_sample``
+    ==================  ================  ================
+    ``color_texture``   -682,986          **+3,535**
+    ``local_precision`` -11,699           -5,203
+    ``paper_field``     -497              -167
+    ``warp_velocity``   -536              -228
+    ``paper_logit``     -11.7             -5.1
+    ==================  ================  ================
+
+    Nearly 690,000 nats of that is pure initialization artifact: a
+    second-order GMRF texture prior penalizes curvature, and ``U(-2, 2)``
+    independent noise is about as curved as a field can be. The MAP phase spent
+    its first steps walking that back rather than fitting the image.
+
+    A prior draw is also finite here for every site, checked over 40 seeds,
+    including the relaxed count site -- the DSGD relaxation returns a strictly
+    positive smoothed count rather than an integer, so it has no zero for the
+    logarithm to reject. The count branch above is still preferred for counts,
+    because the prior mean is deterministic and starts every coordinate the same
+    distance from a useful amplitude, where a draw spreads them over
+    ``[1.6e-8, 8.7e-5]`` and leaves the unlucky ones twice as far away.
     """
     if site is None:
         return functools.partial(init_to_count_mean, fallback=fallback)
@@ -145,6 +171,7 @@ class MAPProposalCaptchaInference:
         *,
         discrete_temperature: float = 0.1,
         dsgd_kwargs: dict | None = None,
+        guide_class=AutoMAPProposal,
         init_dispersion: float = 0.1,
         init_loc_fn=init_to_count_mean,
         map_max_steps: int = 1000,
@@ -162,6 +189,9 @@ class MAPProposalCaptchaInference:
             raise ValueError("num_importance_samples needs to be positive")
         self.discrete_temperature = discrete_temperature
         self.dsgd_kwargs = dsgd_kwargs
+        # `LinearCountMAPProposal` swaps the count sites' logarithm for the
+        # identity; it needs a `map_optimizer` that projects them nonnegative.
+        self.guide_class = guide_class
         self.init_dispersion = init_dispersion
         self.init_loc_fn = init_loc_fn
         self.map_max_steps = map_max_steps
@@ -179,7 +209,7 @@ class MAPProposalCaptchaInference:
     def __call__(self, rng_key: jax.Array, images: jax.Array):
         """Fit once, draw exact proposal samples, and normalize their weights."""
         fit_key, importance_key = jax.random.split(rng_key)
-        guide = AutoMAPProposal(
+        guide = self.guide_class(
             self.model,
             discrete_temperature=self.discrete_temperature,
             dsgd_kwargs=self.dsgd_kwargs,

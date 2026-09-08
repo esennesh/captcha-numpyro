@@ -8,7 +8,12 @@ _partial_: true
 # while locating the mode. Importance samples are exact integer counts.
 discrete_temperature: 0.1
 dsgd_kwargs:
-  max_count: 72
+  # Upper bound on the anchor's binary search over counts. It truncates
+  # silently once the rate passes roughly max_count + width: a Poisson rate of
+  # 30 reads as 24.6 here, and 64 as 25.0. Safe at 16 because the per-site rate
+  # this model reaches is about 1 -- the first pod run put 10 spikes in the
+  # whole image with no site above 1.0.
+  max_count: 16
   # 32 -> 8, for the recurrence window's cost, not for correctness.
   #
   # The window used to have to be tiny to dodge a NaN, but the NaN was never
