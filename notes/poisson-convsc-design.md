@@ -2065,6 +2065,71 @@ change.
   paper was already almost exactly the fixed colour. `0000_LJ` is the counterexample that
   test needs.
 
+### Ladder A1: recovery works on three of five upright images
+
+2026-09-08, `--group upright --warp-scale 0`. Glyph evidence is the fitted log
+joint minus the log joint with the count field pinned at zero.
+
+| image | glyph evidence | identity | count total | coefficients | RMSE | MAP steps |
+|---|---|---|---|---|---|---|
+| `0000_N6` | **+1,522** | **2/2** | 0.88 | 807 | 0.087 | 460 |
+| `0001_OO` | **+2,338** | **2/2** | 0.98 | 466 | 0.095 | 460 |
+| `0004_V6` | **+545** | **2/2** | 2.37 | 848 | 0.118 | 1160 |
+| `0002_J8` | -170 | 2/2 | 6.18 | 6,253 | 0.173 | 1340 |
+| `0003_LN` | **-15,398** | 0/2 | **1,605** | **31,291** | 0.198 | 1300 |
+
+**The joint-identification story holds.** Where no warp is needed, the pipeline
+recovers both glyphs with the right identities within one pixel of the matched
+filter's positions -- `N@(44,55)` and `6@(34,33)` against a truth of (45,56)
+and (35,34) -- and glyph evidence in the hundreds to low thousands, against the
++58 nats `0000_LJ` managed with the warp free. So the slot model is aimed at
+the right thing.
+
+### The haze: a coordinate-wise optimum that is 16,000 nats worse than blank
+
+`0003_LN` is not a spike runaway. Its largest single count is **0.21**, and the
+1,605 total is **31,291 coefficients averaging 0.05 each** -- a diffuse
+semi-transparent wash over an eighth of the field. `0002_J8` shows the same
+thing more mildly at 6,253 coefficients.
+
+The arithmetic says this is a stationary point rather than a divergence. The
+relaxed Poisson log density at `a = 0.05` is
+
+```
+a log(lambda) - lambda - logGamma(a + 1) = -0.548 - 0.000 + 0.027 = -0.521 nats
+```
+
+and `31,291 x 0.521 = 16,300`, which is the 15,398 deficit. Meanwhile the count
+gradient at a wrong site only has to exceed the prior's `log(lambda) -
+psi(a+1) = -10.4` for that site to be worth lifting off zero. So **each
+coordinate is individually at its own optimum and the aggregate is a
+disaster**: the sites interact through a shared render, so "a little more ink
+here helps" is true one site at a time and false 31,291 times over. A
+factorized prior cannot see that.
+
+Which images it hits is consistent with that reading. The three successes have
+466 to 848 coefficients; the two failures are the images with the boldest ink
+(`0002_J8`'s darkest ink pixel is 0.635 above its paper) and they are also the
+two runs that kept optimizing longest, 1,340 and 1,300 steps against 460.
+
+This is the mirror of §26's problem. Log-space counts were too slow to arrive;
+linear-space counts arrive and then keep going, because the projection bounds
+them below and nothing bounds the *number* of them.
+
+Three responses, cheapest first.
+
+1. **Rerun with `count_step_size` at 1e-3**, the value sections 3 and 4 of the
+   partitioned-GMRF notebook use. If the haze survives a tenfold smaller step
+   it is a genuine stationary point; if it vanishes it was overshoot. This is
+   the discriminator and it costs one run.
+2. **A stronger count prior.** The Poisson costs 0.52 nats at `a = 0.05`; the
+   notebook's `Exponential(25)` costs 1.25, and its `-logGamma(a+1)` term does
+   not partially refund small amplitudes the way the Poisson's does.
+3. **Threshold and refine**, which is exactly what the notebook does and what
+   §26 argued was unnecessary because the projection already produces exact
+   zeros. Exact zeros are not enough: the haze is 31,291 coordinates at 0.05,
+   none of them zero. Pruning below a threshold and refitting kills it directly.
+
 ---
 
 ## 27. The slot model: spatial slots, categorical identity, per-slot pose
@@ -2200,12 +2265,59 @@ work:
 2. The guide subclass for route 2, so the particles are discrete again.
 3. Per-slot continuous velocity through `sparse_diffeomorphic_stamp`.
 
+### The pose prior: a discretized von Mises at sigma = 10 degrees
+
+Decided 2026-09-08. Glyph rotation is genuinely circular with period 360
+degrees, so von Mises is the honest family even though at these angles it is
+indistinguishable from a wrapped normal. The latent is a categorical over the
+13 atoms with
+
+```
+logits_i = kappa * cos(theta_i - mu),    mu = 0,   kappa = 1 / sigma^2
+```
+
+in radians. The categorical renormalizes over the atoms, so the von Mises
+normalizer ``I_0(kappa)`` never has to be computed.
+
+The width follows from the measured rotations -- 20 glyphs across the ten
+examples, standard deviation **9.81 degrees** about zero and a maximum
+magnitude of 25 degrees:
+
+| sigma | kappa | p(upright) | nats at 30 deg | mass a full von Mises puts outside the support |
+|---|---|---|---|---|
+| 5 | 131.3 | 0.399 | 17.59 | 0.0% |
+| **10** | **32.8** | **0.199** | **4.40** | **0.3%** |
+| 15 | 14.6 | 0.136 | 1.95 | 4.8% |
+| 20 | 8.2 | 0.111 | 1.10 | 14.2% |
+
+``sigma = 10`` matches the sample, and it is the largest width at which the
+prior and the atom set still agree with each other: at 15 degrees a full von
+Mises wants 4.8% of its mass outside the plus or minus 30 degree support, which
+means the support is the wrong shape for the prior. The resulting weights are
+
+```
+-30:0.002  -25:0.009  -20:0.027  -15:0.065  -10:0.121  -5:0.176
+ +0:0.199   +5:0.176  +10:0.121  +15:0.065  +20:0.027 +25:0.009  +30:0.002
+```
+
+Two things to know before reading the first slot-model run.
+
+**The prior is weak on purpose and cannot discipline pose.** 4.40 nats at 30
+degrees against a glyph signal of order 800 nats will not stop a spurious
+rotation. Real discipline would need ``sigma`` near 3 to 5 degrees, which would
+fight the genuine 25 degree cases. So pose has to be constrained by the
+likelihood and by how few slots are occupied, not by the prior.
+
+**45% of the measured glyphs are exactly upright**, which a unimodal von Mises
+cannot produce -- at ``sigma = 10`` it expects about 20% within 2.5 degrees.
+That excess is most likely a measurement artifact, since rotating a template
+adds interpolation blur and the matched filter prefers the un-rotated one
+whenever the true rotation is small. If the fitted pose posterior piles up at
+zero harder than the prior expects, that is the signal to consider a
+zero-inflated pose rather than a wider one.
+
 ### Open
 
-- The pose prior. A uniform categorical over 13 angles says a glyph is as
-  likely to be at -30 degrees as upright, which the data contradicts -- five of
-  ten examples are upright. A prior peaked at zero is the obvious choice and
-  the peak width is a free parameter.
 - Label switching is *not* a problem here, unlike a permutation-symmetric slot
   model: the slots are pinned to pixels, so they are distinguishable by
   construction. That is a real advantage of decision 1 over a list of `N`

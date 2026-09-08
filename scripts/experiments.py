@@ -140,11 +140,18 @@ def summarize(result, model, image, truth=None, blank_log_joint=None, top=6):
         record["blank_log_joint"] = round(blank_log_joint, 1)
         record["glyph_evidence"] = round(record["log_joint"] - blank_log_joint, 1)
     if truth is not None:
-        found = {peak["glyph"] for peak in peaks}
         record["truth"] = "".join(truth)
-        record["identity_recall"] = sum(
-            1 for character in set(truth) if character in found
-        )
+        # Multiset match, so a repeated character can score twice: `0001_OO`
+        # holds two `O`s, and two `O` peaks is a full recovery rather than a
+        # half one. Each peak may satisfy at most one truth character.
+        available = [peak["glyph"] for peak in peaks]
+        matched = 0
+        for character in truth:
+            if character in available:
+                available.remove(character)
+                matched += 1
+        record["identity_recall"] = matched
+        record["identity_total"] = len(truth)
     if "paper_logit" in result.samples:
         particle = int(np.argmax(np.asarray(result.normalized_weights)))
         logit = np.asarray(result.samples["paper_logit"][particle, 0])
@@ -258,9 +265,9 @@ def experiment_examples(arguments):
             "%s@(%d,%d)=%.3f" % (p["glyph"], p["y"], p["x"], p["count"])
             for p in record["peaks"]), flush=True)
     print("\n=== summary ===")
-    print_rows(records, ["image", "glyph_evidence", "identity_recall", "truth",
-                         "count_total", "count_max", "coefficients", "rmse",
-                         "map_steps", "map_converged"])
+    print_rows(records, ["image", "glyph_evidence", "identity_recall",
+                         "identity_total", "truth", "count_total", "count_max",
+                         "coefficients", "rmse", "map_steps", "map_converged"])
     write(records, arguments.output)
 
 
