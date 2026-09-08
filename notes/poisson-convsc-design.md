@@ -2064,3 +2064,151 @@ change.
   the partitioned-GMRF notebook. On `0002_J8` the two were equivalent, but that image's
   paper was already almost exactly the fixed colour. `0000_LJ` is the counterexample that
   test needs.
+
+---
+
+## 27. The slot model: spatial slots, categorical identity, per-slot pose
+
+Decided 2026-09-08. §26 established that counts and warp are jointly
+unidentified and that the fit's best response to a partly-wrong pose is a
+partial-opacity smear. This section designs the model that removes the
+coupling by construction rather than by scheduling. Four decisions, then two
+things the measurement says about them.
+
+### The decisions
+
+1. **Keep a field, but make the slots purely spatial.** One slot per pixel,
+   `6400` of them at `80 x 80`, indexed by `(y, x)` alone.
+2. **The spike count keeps modulating opacity, and stops carrying identity.**
+   `a[y, x]` is still an integer Poisson count entering the image only through
+   `tau`, exactly as §2 requires.
+3. **Glyph identity becomes a categorical latent**, one per slot.
+4. **Per-slot pose**, rather than one velocity field for the whole image.
+
+### The renderer does not change
+
+Writing `w[y, x, :]` for the one-hot identity at a slot, the optical depth is
+
+```
+tau(p) = sum_{y,x} a[y,x] alpha_{k[y,x]}(p - (y,x))
+       = sum_{y,x,k} (a[y,x] w[y,x,k]) alpha_k(p - (y,x))
+```
+
+which is the existing `_stamp` called with `a[..., None] * w`. Checked
+numerically: the factorized field and the equivalent dense count field render
+identically. So this is a **reparameterization of the count field**, not a new
+stamping path, and `_stamp`, `_ink_kernel` and the whole `Layer` algebra carry
+over untouched.
+
+What it buys is the normalization. The current field can stack several
+*different* glyphs on one site, and the second pod run did exactly that -- a
+site holding a count of 2. A simplex per slot means one location renders one
+glyph, which is what decision 2 asks for, and it is enforced by construction
+rather than by a prior.
+
+### Pose: discrete per slot keeps it a convolution
+
+A *continuous* per-slot velocity cannot be a convolution, because a
+convolution shares one kernel across all locations. Discretizing pose into `A`
+angles restores it: pre-rotate the dictionary, and a per-slot pose becomes
+another categorical factor over an augmented kernel of `K x A` entries. At
+`K = 36` and 13 angles from -30 to +30 degrees:
+
+| | |
+|---|---|
+| augmented dictionary | `(468, 38, 26, 4)` |
+| stamp kernel | `(38, 26, 4, 468)`, 7.4 MB |
+| count field into `_stamp` | `(1, 80, 80, 468)`, 12.0 MB |
+| one render | 0.24 s on a laptop CPU |
+
+Affordable. **But identity and pose must stay separate categoricals**, not one
+joint categorical over the 468 pairs. Joint:
+
+```
+6400 amplitudes + 6400 * 468 logits = 3,001,600 latents
+```
+
+thirteen times the current model. Factorized as independent per-slot
+distributions over glyph and over angle:
+
+```
+6400 amplitudes + 6400 * 36 + 6400 * 13 = 320,000 latents
+```
+
+only 1.4x the current 230,400, with the render taking the outer product
+`w_glyph ⊗ w_pose` per slot. Factorized is the design.
+
+A genuinely continuous per-slot velocity is still worth trying afterwards. It
+forces the scatter path, `sparse_diffeomorphic_stamp` over all 6400 slots,
+since gathering only the occupied ones needs a dynamic shape. That is 6,400
+warps of a 38 x 26 kernel per render -- heavy but not obviously infeasible on
+the pod. It is the follow-up, not the first attempt.
+
+### The blocker: the exact finite-discrete update does not scale
+
+`AutoMAPProposal` handles finite discrete sites with an *exact* mean-field
+coordinate update, and that is genuinely attractive here -- it would replace a
+relaxation with a closed-form step for identity, which the count field could
+never use. It does not survive this many sites.
+`_fit_finite_parameters` loops in **Python** over every index of the site and
+every category, evaluating the model once per pair. Measured on a toy with a
+`(1, side, side)` categorical over 4 classes:
+
+| side | indices | seconds |
+|---|---|---|
+| 1 | 1 | 2.39 |
+| 2 | 4 | 2.08 |
+| 3 | 9 | 2.99 |
+| 4 | 16 | 3.88 |
+
+a marginal 0.128 s per index at `K = 4`, i.e. 0.032 s per index-category pair.
+A `(1, 80, 80)` identity over 36 glyphs is 230,400 pairs:
+
+**about two hours per proposal fit, building one traced graph of 230,400 model
+evaluations.**
+
+So identity cannot go down that path. Three ways out, in increasing order of
+work:
+
+1. **Relax it like everything else.** A subclass that removes the site from
+   `_finite_distributions` after prototype discovery routes it through the
+   ordinary continuous path -- a Normal in the unconstrained representation
+   pushed through `ComposeTransform([biject_to(unit_interval),
+   SmoothICDFTransform])`. This is the same one-line trick
+   `LinearCountMAPProposal` uses for the counts. The cost is that the fitted
+   proposal no longer draws *exact* categories, so the importance particles
+   carry a smoothed identity that the unrelaxed model's support rejects --
+   the same trap the counts hit in §26.
+2. **Fit the logits by gradient, sample exactly.** Keep identity finite, so
+   `_get_proposal` still returns a `Categorical` and the particles stay
+   discrete, but replace the exact coordinate update with a gradient-fitted
+   `logits` parameter. That needs `_proposal_objective` to stop skipping finite
+   sites and `_fit_finite_parameters` to stand down: roughly forty lines in a
+   subclass. **This is the recommended route**, because it keeps the exact
+   discrete particles the whole importance-sampling story depends on.
+3. **Vectorize the update upstream.** The right long-term fix, and it belongs
+   in the same issue as `notes/diag-sgd-count-relaxation-issue.md`. The
+   obstacle is that the exact update needs `E_q[log gamma]` per category and
+   the log target does not decompose over slots, because the render is a sum
+   over all of them. Worth thinking about; not worth blocking on.
+
+### Implementation order
+
+1. `SlotPoissonConvPlacements`: amplitude, glyph simplex, pose simplex, one
+   `_stamp` against the augmented kernel. No guide changes, identity relaxed
+   per route 1, purely to see the model render and score.
+2. The guide subclass for route 2, so the particles are discrete again.
+3. Per-slot continuous velocity through `sparse_diffeomorphic_stamp`.
+
+### Open
+
+- The pose prior. A uniform categorical over 13 angles says a glyph is as
+  likely to be at -30 degrees as upright, which the data contradicts -- five of
+  ten examples are upright. A prior peaked at zero is the obvious choice and
+  the peak width is a free parameter.
+- Label switching is *not* a problem here, unlike a permutation-symmetric slot
+  model: the slots are pinned to pixels, so they are distinguishable by
+  construction. That is a real advantage of decision 1 over a list of `N`
+  free-floating occurrences.
+- Translation equivariance survives, for the same reason: the slot field is
+  still indexed by image position, so §1's argument is untouched.
