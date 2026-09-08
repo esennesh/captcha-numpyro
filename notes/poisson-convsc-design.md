@@ -1986,6 +1986,70 @@ should stay expensive without being catastrophic; here it is not expensive
 enough. Neither change is safe to make blind -- they interact, and the
 measurement is a pod run.
 
+### Second pod run: the fit is stuck, and the Gamma precisions are why
+
+2026-09-08, `0000_LJ` again, now with every site initialized from its own prior
+(`init_to_sample`) and the relaxed counts held in linear space under a
+nonnegativity projection.
+
+Both changes did what they were meant to. The initial MAP loss fell from
+1,124,715 to **88,717** -- the earlier figure was mostly the second-order
+texture prior evaluated at `U(-2, 2)` noise -- and the MAP **converged in 320
+steps** rather than running out at 1500. The render is now *sharp* rather than
+smeared, the count field is down to 6 spikes, and the paper field is flat
+instead of drawing the glyphs.
+
+It still does not recover `L` and `J`. Three measurements say why, and none of
+them is the warp or the dictionary.
+
+**Identity is recoverable.** Holding every other latent at truth and scoring all
+36 classes at each true site, `L` ranks **1st of 36** (+2,761 nats over blank,
+against the runner-up's +1,482) and `J` ranks 2nd, losing to `1` by 19 nats --
+a tie, not a failure.
+
+**The warp helps.** The same sweep raises a correct `L` from +812 to +2,761 and
+a correct `J` from +1,042 to +2,358 once the -25 degree rotation is fitted.
+
+**The fit is stuck, and the model prefers the correct answer.** Holding the
+count field fixed and optimizing every other latent under the same 400-step
+budget:
+
+| count field | log joint | vs the pod fit | worth vs blank |
+|---|---|---|---|
+| blank | 33,183 | -58 | -- |
+| the pod fit | 33,241 | -- | +58 |
+| correct `L` and `J`, warp from zero | 33,877 | +636 | +694 |
+| correct `L` and `J`, warp from the -25 fit | **33,987** | **+746** | **+804** |
+
+So the fit's entire glyph placement is worth 58 nats over placing no ink at
+all, while the correct answer is worth 804 and scores 746 nats higher. This is
+an optimization failure, not a modelling one.
+
+**Why it is stuck.** Same optimization, with the local precisions pinned at one
+instead of free:
+
+| | blank | correct | glyph evidence |
+|---|---|---|---|
+| precisions free (as in the model) | 33,183 | 33,987 | **+804** |
+| precisions pinned at 1 | 17,107 | 22,235 | **+5,129** |
+
+**The free per-pixel Gamma precisions absorb 84% of the evidence for the
+glyphs.** They buy +16,076 nats on a blank canvas by themselves, so the
+objective is dominated by a term indifferent to the render and the whole
+two-glyph signal is a 2.4% ripple on top of it. The mechanism is
+`nu_p = count_p + 1`: a pixel the *renderer* left blank gets `nu = 1`, the most
+dispersed Gamma, so its precision falls to 0.02 and the miss costs almost
+nothing. That is §20's lesson in a new place -- the forgiving tail lands where
+the model is wrong rather than where the noise is -- except §21 chose this
+direction deliberately, and the measurement now says it forgives too much.
+
+**The paper is a symptom, not a cause.** With the correct glyphs placed, the
+fitted paper is `[0.957, 0.959, 0.943]` against a truth of
+`[0.957, 0.957, 0.941]` -- essentially exact. The run's `[0.981, 0.997, 0.990]`
+is the paper drifting bright and cool to offset a wrong render. Its prior mean
+was already within 0.02 of the truth, so the paper field is not the thing to
+change.
+
 ### Open
 
 - The amortized guide (`configs/guide/poisson_convsc_encoder`) does not mirror
