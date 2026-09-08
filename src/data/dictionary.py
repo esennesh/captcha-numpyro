@@ -2,10 +2,13 @@ from pathlib import Path
 from typing import Dict
 
 from flax import nnx
+import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float
 import numpy as np
 from PIL import Image
+
+from scipy import ndimage
 
 from src import utils
 
@@ -96,3 +99,68 @@ class ShapeDictionary(nnx.Pytree):
     def randomize(cls, k: int, h: int, w: int, *, rngs: nnx.Rngs):
         return cls(shapes=rngs.normal(shape=(k, h, w, 4)),
                    targets={str(c): c for c in range(k)})
+
+
+def pose_augmented_dictionary(
+    shape_dict: ShapeDictionary, angles=range(-30, 31, 5)
+) -> tuple[ShapeDictionary, tuple[float, ...]]:
+    """Return ``(dictionary, angles)`` with one entry per (glyph, angle) pair.
+
+    A per-occurrence *pose* cannot be a convolution if it is continuous, because
+    a convolution shares one kernel across every location. Discretizing it
+    restores that: pre-rotate the dictionary and a per-slot pose becomes a
+    choice of dictionary entry, so the renderer stays a single transposed
+    convolution and ``_stamp`` needs no change at all.
+
+    Entries are ordered angle-major, so entry ``a * K + k`` is glyph ``k`` at
+    ``angles[a]`` and the original dictionary is the block at the angle nearest
+    zero. ``targets`` is keyed ``"<glyph>@<angle>"``.
+
+    Rotation is bilinear on all four channels at once and clipped back into
+    ``[0, 1]``, which keeps the alpha convention of
+    :func:`_rgba_shape_transform` -- alpha stays the shape mask, blurred at the
+    edges exactly as the colour channels are.
+    """
+    angles = tuple(float(angle) for angle in angles)
+    shapes = np.asarray(shape_dict.shapes)
+    names = [str(shape_dict.targets[index]) for index in sorted(shape_dict.targets)]
+    blocks, targets = [], {}
+    for angle in angles:
+        if angle == 0.0:
+            rotated = shapes
+        else:
+            rotated = np.clip(
+                ndimage.rotate(shapes, angle, axes=(1, 2), order=1,
+                               reshape=False, cval=0.0),
+                0.0, 1.0,
+            )
+        for name in names:
+            targets[len(targets)] = f"{name.split('_')[0]}@{angle:+.0f}"
+        blocks.append(rotated)
+    return (
+        ShapeDictionary(shapes=jnp.asarray(np.concatenate(blocks, axis=0)),
+                        targets=targets),
+        angles,
+    )
+
+
+def von_mises_pose_weights(angles, sigma_degrees: float = 10.0):
+    """Normalized weights over ``angles`` from a von Mises centred on zero.
+
+    Glyph rotation is circular with period 360 degrees, so von Mises is the
+    honest family even though at these angles it is indistinguishable from a
+    wrapped normal. The logits are ``kappa cos(theta)`` with
+    ``kappa = 1 / sigma^2`` in radians; because the weights are renormalized
+    over the atoms, the von Mises normalizer never has to be computed.
+
+    ``sigma_degrees = 10`` matches the 9.81 degree standard deviation measured
+    over the twenty glyphs in ``data/examples``, and it is the largest width at
+    which the prior and a plus-or-minus-30-degree atom set still agree: at 15
+    degrees a full von Mises wants 4.8% of its mass outside that support. See
+    section 27 of ``notes/poisson-convsc-design.md``.
+    """
+    if sigma_degrees <= 0.0:
+        raise ValueError(f"sigma_degrees must be positive, got {sigma_degrees}")
+    radians = jnp.radians(jnp.asarray(tuple(angles), dtype=jnp.float32))
+    concentration = 1.0 / jnp.radians(sigma_degrees) ** 2
+    return jax.nn.softmax(concentration * jnp.cos(radians))

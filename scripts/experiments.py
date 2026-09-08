@@ -74,11 +74,15 @@ def load_image(path, shape):
     return jnp.asarray(np.asarray(image, dtype=np.float32) / 255.0)[None]
 
 
-def compose(model_overrides=None, online_name="online/map_proposal_linear"):
+MODEL_CONFIG = "model/poisson_convsc_gmrf"
+
+
+def compose(model_overrides=None, online_name="online/map_proposal_linear",
+            model_name=None):
     with hydra.initialize_config_dir(
         config_dir=str(PROJECT_ROOT / "configs"), version_base="1.3"
     ):
-        model_config = hydra.compose(config_name="model/poisson_convsc_gmrf")
+        model_config = hydra.compose(config_name=model_name or MODEL_CONFIG)
         online_config = hydra.compose(config_name=online_name)
     # Overrides may introduce keys the config leaves to the model function's
     # own defaults, so drop struct mode rather than requiring every knob to be
@@ -465,6 +469,11 @@ def experiment_prior_recovery(arguments):
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seed", default=0, type=int)
+    parser.add_argument(
+        "--model-config", default=MODEL_CONFIG,
+        help="hydra config name for the model, e.g. model/poisson_convsc_pose "
+             "for the discrete-pose variant",
+    )
     parser.add_argument("--output", default=None, type=Path)
     parser.add_argument(
         "--no-reference", action="store_true",
@@ -517,4 +526,5 @@ def parse_args():
 
 if __name__ == "__main__":
     arguments = parse_args()
+    globals()["MODEL_CONFIG"] = arguments.model_config
     arguments.function(arguments)

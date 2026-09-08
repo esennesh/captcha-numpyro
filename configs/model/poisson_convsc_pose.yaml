@@ -1,0 +1,59 @@
+# `poisson_convsc_gmrf` with a discrete per-occurrence pose, and the warp
+# conditioned back to affine-free.
+#
+# WHY THE PAIR. `affine_free_velocity` was originally justified on the grounds
+# that translation, rotation, scale and shear are "redundant with glyph
+# placement and pose latents". Section 26 found that premise false for this
+# renderer, because there was no pose latent: conditioning the affine modes out
+# simply deleted rotation from the model, and one glyph-sized 25 degree rotation
+# went from 99 nats to 2,294. This config supplies the missing latent, which
+# makes the premise true, so the two changes belong together and neither is
+# worth running alone.
+#
+# Ladder A2 is why we want the warp constrained again. On the five upright
+# images A1 solves 10/10 with the warp off, enabling it dropped identity to
+# 4/10 while the log joint barely moved -- positions stayed right and labels
+# went wrong, X@(44,58) for a true N@(45,56), I@(44,53) for a true V@(46,53) --
+# because 200 continuous velocity coordinates can deform a wrong glyph into the
+# right shape. A categorical over 13 angles can turn a glyph and cannot turn an
+# X into an N.
+#
+# COST. The count field's feature axis becomes K x A = 36 x 13 = 468, so with
+# the on-canvas constraint it holds 43 x 55 x 468 = 1,106,820 coordinates
+# against 85,140. Section 27 notes a factorized identity-and-pose latent would
+# need only 320,000; that is the slot refactor, and this config buys the
+# experiment without it.
+
+defaults:
+  - poisson_convsc_gmrf
+  - _self_
+
+placements:
+  _target_: src.model.model.PoseAugmentedPlacements
+
+  # Thirteen atoms from -30 to +30 degrees. The measured rotations over the
+  # twenty glyphs in data/examples have a standard deviation of 9.81 degrees
+  # about zero and a maximum magnitude of 25, so this support covers the data
+  # with a little margin.
+  pose_angles: [-30, -25, -20, -15, -10, -5, 0, 5, 10, 15, 20, 25, 30]
+
+  # sigma = 10 matches that 9.81, and it is the largest width at which the prior
+  # and the atom set still agree with each other: at 15 degrees a full von Mises
+  # wants 4.8% of its mass outside plus-or-minus 30 degrees. The resulting
+  # weights run 0.199 upright to 0.0024 at the ends, so the prior is weak -- 4.4
+  # nats at 30 degrees against a glyph signal of order 800 -- and will not by
+  # itself stop a spurious rotation. Pose has to be disciplined by the
+  # likelihood and by how few slots are occupied. See section 27.
+  pose_sigma_degrees: 10.0
+
+  # Back to affine-free, which is the whole point of the pair above.
+  warp_modes: affine
+
+  # 5.0 -> 1.5, the value that predated section 26. The amplitude was raised to
+  # 5.0 only so that the warp could afford the rotations the model had no other
+  # way to express; with pose explicit, the warp is left to supply genuinely
+  # non-rigid residual and does not need the reach. Worth trying at 5.0 as a
+  # one-flag variation --  ++model.placements.warp_scale=5.0 -- to see whether
+  # the extra freedom starts eating identity again even with the affine modes
+  # conditioned out.
+  warp_scale: 1.5

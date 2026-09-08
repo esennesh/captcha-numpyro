@@ -2321,6 +2321,54 @@ work:
    the log target does not decompose over slots, because the render is a sum
    over all of them. Worth thinking about; not worth blocking on.
 
+### The discrete pose beats the warp at its own job, measured
+
+`configs/model/poisson_convsc_pose` builds the first step: the dictionary is
+pre-rotated to one entry per (glyph, angle) pair, so pose is a choice of
+dictionary entry and the renderer stays one transposed convolution, and the
+Poisson rate carries the von Mises prior. `expected_count` keeps its
+calibration, because the rate is the old per-(site, glyph) value split across
+angles by weights that sum to one.
+
+Placing the correct glyph at the correct site in each pose block, with the
+affine-free warp at zero, and scoring the log joint against a blank canvas:
+
+| pose | `0000_LJ` (+25 by matched filter) | `0000_N6` (upright) |
+|---|---|---|
+| -30 | -2,555 | +445 |
+| -15 | -759 | +2,173 |
+| -5 | +829 | **+3,419** |
+| **0** | +1,852 | +3,352 |
+| +15 | +5,996 | +1,960 |
+| +20 | +7,131 | +1,390 |
+| **+25** | **+7,533** | +975 |
+| +30 | +6,850 | +659 |
+
+Both curves are smooth and unimodal, `0000_LJ` peaks at exactly the +25 degrees
+the matched filter measured, and `0000_N6` is flat between -5 and +5 -- its
+best is -5 at +3,419 against +0 at +3,352, a 67-nat difference inside the
+measurement's own 5-degree quantization. So the convention agrees with the
+matched filter and an upright glyph is not handed a spurious rotation.
+
+**The comparison with the warp is the point.** On `0000_LJ` the correct pose is
+worth **+5,681 nats** over upright, and the von Mises charges
+`log(0.199 / 0.0092) = 3.08` nats per glyph for it, 6.2 for the pair. The warp
+route to the same rotation was worth +3,223 nats at a prior cost of 42 --
+translation-free at `warp_scale = 5.0` -- and **-2,660** under the affine-free
+conditioning this config restores. So the discrete pose is both a larger gain
+and a thirtyfold cheaper one, and unlike the warp it cannot deform an ``X`` into
+an ``N`` on the way.
+
+That is the argument for the pair: with pose explicit the warp is left to
+supply genuinely non-rigid residual, which is the only thing §26 ever showed it
+was needed for, and the affine-free conditioning that §26 called a mistake
+becomes correct because the premise it rested on -- that the affine modes are
+redundant with a pose latent -- is now true.
+
+Cost: the feature axis becomes `K A = 468`, so the count field holds
+`43 x 55 x 468 = 1,106,820` coordinates against 85,140. §27's factorized
+identity-and-pose latent would need 320,000; that is the slot refactor.
+
 ### Implementation order
 
 1. `SlotPoissonConvPlacements`: amplitude, glyph simplex, pose simplex, one

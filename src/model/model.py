@@ -8,7 +8,11 @@ from flax import nnx
 from jaxtyping import Array
 from numpyro.contrib.module import nnx_module
 
-from src.data.dictionary import ShapeDictionary
+from src.data.dictionary import (
+    ShapeDictionary,
+    pose_augmented_dictionary,
+    von_mises_pose_weights,
+)
 from src.distributions import (
     CompleteGaussianMrf,
     LocallyScaledGaussianMrf,
@@ -509,6 +513,89 @@ class TexturedDiffeomorphicPoissonConvPlacements(PoissonConvPlacements):
 
         warped = jax.vmap(warp_one)(inks, raw_velocities)
         return warped.reshape(leading + ink_shape)
+
+
+class PoseAugmentedPlacements(TexturedDiffeomorphicPoissonConvPlacements):
+    r"""Discrete per-occurrence pose, carried by the dictionary and the rate.
+
+    The dictionary is pre-rotated to one entry per (glyph, angle) pair, so a
+    per-occurrence pose is a choice of dictionary entry and the renderer stays a
+    single transposed convolution. The Poisson rate then carries the pose prior:
+
+    .. math::
+
+        \lambda(y,x,k,\alpha)
+        = \frac{\text{expected count}}{RCK}\, w(\alpha),\qquad
+        w(\alpha)\propto\exp(\kappa\cos\theta_\alpha),
+
+    with ``w`` summing to one over angles. Summing the rate over both glyph and
+    angle therefore reproduces the unaugmented total, so ``expected_count``
+    keeps its calibration and only the *distribution* over pose is new.
+
+    **Why this pairs with an affine-free warp.** ``affine_free_velocity`` was
+    originally justified on the grounds that translation, rotation, scale and
+    shear are "redundant with glyph placement and pose latents", and §26 found
+    that premise false for this renderer because *there was no pose latent* --
+    conditioning the affine modes out simply deleted rotation from the model.
+    This class supplies the missing latent, which makes the premise true. Ladder
+    A2 is the reason to want it: on five upright images that A1 solves 10/10,
+    enabling the continuous warp dropped identity to 4/10 at no cost in log
+    joint, because 200 velocity coordinates can deform a wrong glyph into the
+    right shape. A categorical over 13 angles can turn a glyph and cannot turn
+    an ``X`` into an ``N``.
+
+    The cost is the count field's width: ``K`` becomes ``K A``, so 43 x 55 x 468
+    is 1.1 million coordinates against 85,140. §27 notes that a *factorized*
+    identity-and-pose latent would need only 320,000, which is the follow-up;
+    this class buys the experiment without the slot refactor.
+    """
+
+    def __init__(
+        self,
+        shape_dict: ShapeDictionary,
+        expected_count: float = 1.0,
+        img_h: int = 80,
+        img_w: int = 80,
+        *,
+        pose_angles=range(-30, 31, 5),
+        pose_sigma_degrees: float = 10.0,
+        **kwargs,
+    ):
+        augmented, angles = pose_augmented_dictionary(shape_dict, pose_angles)
+        super().__init__(augmented, expected_count, img_h, img_w, **kwargs)
+        self.pose_angles = angles
+        self.pose_sigma_degrees = pose_sigma_degrees
+        self.pose_weights = von_mises_pose_weights(angles, pose_sigma_degrees)
+
+    @property
+    def num_poses(self) -> int:
+        return len(self.pose_angles)
+
+    @property
+    def num_glyphs(self) -> int:
+        """Dictionary entries per pose, i.e. the unaugmented glyph count."""
+        return self.num_features // self.num_poses
+
+    def sample_counts(self):
+        """Draw the count field with a von Mises pose prior in its rate.
+
+        The rate is angle-major to match
+        :func:`~src.data.dictionary.pose_augmented_dictionary`'s entry order, and
+        ``log_rate`` remains a single learnable scalar so the *shape* of the pose
+        prior is fixed while its overall level still learns.
+        """
+        log_rate = numpyro.param(
+            "log_rate",
+            jnp.log(self.expected_count / (
+                math.prod(self.count_shape) * self.num_glyphs
+            )),
+        )
+        weights = jnp.repeat(self.pose_weights, self.num_glyphs)
+        rate = jnp.exp(log_rate) * weights
+        rate = jnp.broadcast_to(
+            rate, (1, *self.count_shape, self.num_features)
+        )
+        return numpyro.sample("a", dist.Poisson(rate).to_event(3))
 
 
 class PaperGmrfBackground(nnx.Module):
