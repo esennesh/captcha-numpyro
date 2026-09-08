@@ -2147,6 +2147,53 @@ set against that scale, not against one; anything that changes the amplitude
 scale, such as the alpha clip or the count-to-depth map, changes the right step
 size with it.
 
+### Ladders A2 and A3: the warp absorbs identity, and half-glyphs are generic ink
+
+Run 2026-09-08 at `count_step_size = 1e-3`. A2 is the same five upright images
+as A1 with the warp *enabled*; A3 is the five rotated ones.
+
+| run | identity | glyph evidence | peaks under 75% on-canvas | mean visible area |
+|---|---|---|---|---|
+| A1, upright, no warp | **10/10** | +1,655 to +2,482 | 2/30 | 0.97 |
+| A2, upright, warp | **4/10** | +1,490 to +2,557 | 1/30 | 0.98 |
+| A3, rotated, warp | **3/10** | +349 to +1,594 | **21/30** | **0.66** |
+
+**A2: the warp absorbs identity, and it is nearly free.** On the same images
+that A1 solves 10/10, enabling the warp drops identity to 4/10 while the log
+joint barely moves -- some images gain evidence, some lose it. The positions
+stay right and the *labels* go wrong: `X@(44,58)` for a true `N@(45,56)`,
+`I@(44,53)` for a true `V@(46,53)`, `J@(47,55)` for a true `N`. With 200
+continuous velocity coordinates the model can deform a wrong glyph into the
+right shape, so glyph identity is not identified, and the warp wins the
+competition for the ink. Three of the five runs also hit the 1,500-step cap
+without converging, against none in A1.
+
+This is the joint-identification claim of §26 demonstrated directly rather than
+inferred, and it is the argument for §27's **discrete** pose. A per-slot
+categorical over 13 angles can turn a glyph; it cannot deform an `X` into an
+`N`. Replacing 200 continuous coordinates with one categorical per slot removes
+exactly the freedom that is eating identity.
+
+**A3: edge-cropped stamps act as a generic ink primitive.** 21 of A3's 30 top
+peaks have less than three quarters of their glyph frame on the canvas, and
+many sit at exactly 50% -- `J@(18,79)`, `J@(20,79)`, `1@(44,79)`. `_stamp`
+crops, so a centre at `x = 79` renders only the left half of a 26-wide frame,
+and half-glyphs of different letters are nearly interchangeable. Combined with
+the warp they can paint almost anything.
+
+**Glyph evidence is therefore gameable, and A3 games it.** `0002_QS` has the
+highest evidence in A3 at +1,594 with 0/2 identity and half-glyphs at the
+border, while `0000_LJ` has the lowest at +349 and is the one A3 image whose top
+peaks are 92 to 100% on-canvas. Evidence and correctness are *anti*-correlated
+in that run. `scripts/experiments.py` now reports `peak_visible_area` next to
+the evidence for exactly this reason; treat a low value as a warning that the
+evidence was bought with fragments.
+
+All twelve measured glyph centres in `data/examples` sit fully inside the
+canvas -- `x` from 14 to 60 against a half-width of 12 -- so requiring a stamp
+to fit is a structural constraint on the model rather than an
+observation-derived restriction of the kind §12 removed. It is item C3 of §28.
+
 ---
 
 ## 27. The slot model: spatial slots, categorical identity, per-slot pose
@@ -2441,7 +2488,19 @@ worth running now.
   capped at `gamma` per unit regardless of `n`; it limits the likelihood-side
   hedging only. Costs sub-pixel placement, which §27 already deferred.
 - **C2. The slot model of §27** -- spatial slots, categorical identity, per-slot
-  discrete pose. Designed, not built.
+  discrete pose. Designed, not built. **Now the highest-value item on this
+  list**, because A2 shows 200 continuous warp coordinates absorbing glyph
+  identity on images that need no warp at all, and a discrete pose cannot do
+  that.
+- **C3. Require a stamp to fit on the canvas. Newly motivated.** A centre
+  within half a kernel of an edge renders a sliver, and slivers of different
+  letters are interchangeable, so they serve as a generic deformable ink
+  primitive: 21 of A3's 30 top peaks are under 75% on-canvas and many are at
+  exactly 50%. Zeroing the rate outside the interior is a one-line prior change.
+  All twelve measured glyph centres in `data/examples` are fully inside, so this
+  is a structural constraint rather than the observation-derived support
+  restriction §12 removed. Cheap, and it closes a hole that is independent of
+  the warp.
 
 ### D. The noise model
 

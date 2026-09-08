@@ -109,6 +109,25 @@ def truth_from_stem(stem):
     return tuple(characters)
 
 
+def visible_fraction(model, y, x):
+    """Fraction of a glyph's frame that lands on the canvas, centred at (y, x).
+
+    ``_stamp`` crops, so a centre within half a kernel of an edge renders only a
+    sliver of the glyph -- and slivers of different letters are nearly
+    interchangeable, which makes them a cheap generic ink primitive rather than
+    a glyph. Ladder A3 found 21 of 30 top peaks below 75% visible, many at
+    exactly 50%, on the run with the *highest* glyph evidence and the worst
+    identity. So this is reported alongside the evidence: it is the detector for
+    evidence bought by painting with half-glyphs.
+    """
+    placements = model.keywords["placements"]
+    height, width = placements.ink_kernel.shape[:2]
+    half_y, half_x = (height - 1) // 2, (width - 1) // 2
+    rows = min(y + height - half_y, placements.height) - max(y - half_y, 0)
+    columns = min(x + width - half_x, placements.width) - max(x - half_x, 0)
+    return max(rows, 0) * max(columns, 0) / (height * width)
+
+
 def summarize(result, model, image, truth=None, blank_log_joint=None, top=6):
     names = glyph_names(model)
     counts = np.asarray(result.map_values["a"])
@@ -118,7 +137,8 @@ def summarize(result, model, image, truth=None, blank_log_joint=None, top=6):
         _, y, x, k = np.unravel_index(rank, counts.shape)
         peaks.append(
             {"glyph": names[k], "y": int(y), "x": int(x),
-             "count": round(float(counts.ravel()[rank]), 4)}
+             "count": round(float(counts.ravel()[rank]), 4),
+             "visible": round(visible_fraction(model, int(y), int(x)), 3)}
         )
     observed = np.asarray(image[0])
     reconstruction = np.asarray(result.weighted_reconstruction)[0]
@@ -134,6 +154,9 @@ def summarize(result, model, image, truth=None, blank_log_joint=None, top=6):
         "coefficients": int((counts > 1e-4).sum()),
         "exact_zeros": int((counts == 0.0).sum()),
         "rmse": round(float(np.sqrt(((observed - reconstruction) ** 2).mean())), 4),
+        "peak_visible_area": round(
+            float(np.mean([peak["visible"] for peak in peaks])), 3
+        ),
         "peaks": peaks,
     }
     if blank_log_joint is not None:
@@ -266,8 +289,9 @@ def experiment_examples(arguments):
             for p in record["peaks"]), flush=True)
     print("\n=== summary ===")
     print_rows(records, ["image", "glyph_evidence", "identity_recall",
-                         "identity_total", "truth", "count_total", "count_max",
-                         "coefficients", "rmse", "map_steps", "map_converged"])
+                         "identity_total", "truth", "peak_visible_area",
+                         "count_total", "count_max", "coefficients", "rmse",
+                         "map_steps", "map_converged"])
     write(records, arguments.output)
 
 
