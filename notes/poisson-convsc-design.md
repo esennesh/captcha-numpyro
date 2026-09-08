@@ -2324,3 +2324,115 @@ zero-inflated pose rather than a wider one.
   free-floating occurrences.
 - Translation equivariance survives, for the same reason: the slot field is
   still indexed by image position, so §1's argument is untouched.
+
+---
+
+## 28. Model-design variations to try
+
+A backlog, organized by which part of the model each one varies, with the
+measurement that motivates it and the objection against it where there is one.
+Items marked **runnable** already have a driver in `scripts/experiments.py`.
+
+The organizing observation, from §26's haze: for a count field, the free
+modelling choice is **how the relaxation interpolates between integers**.
+`tau = c a` is exactly right at integer `a`, because `a` copies of one glyph
+really do add their log-transmittance, and the analytic continuation of the
+Poisson log-pmf is exactly right at integer `a` too. Everything in between is
+a choice nobody made deliberately, and it is where the haze lives. Several
+entries below are different ways of making that interpolation prefer integers.
+
+### A. The amplitude prior
+
+- **A1. Exponential instead of Poisson.** Evaluated at every site,
+  `230400 log beta - beta sum(a)` is purely linear in the total, so it is
+  *indifferent* to spreading where the relaxed Poisson actively *rewards* it by
+  up to `gamma = 0.577` nats per unit of amplitude. Strictly better, but still
+  no preference for concentration. `partitioned_gmrf` uses `beta = 25`. Cheap.
+- **A2. A penalty concave in the amplitude.** `L_p` with `p < 1`, a log-sum
+  penalty `sum log(1 + a/eps)`, SCAD or MCP. These genuinely prefer
+  concentration. *Objection:* not normalized densities in general, so the model
+  stops being generative and the importance weights lose their meaning. Would
+  have to be confined to the MAP phase, which makes the MAP and the proposal
+  target different objectives.
+- **A3. Threshold and refine.** Prune coefficients below a threshold, reinit the
+  optimizer, refit -- exactly what sections 3 and 4 of
+  `notebooks/partitioned_gmrf.ipynb` do at `0.02`. Not a model change but an
+  L0-flavoured *non-local* move, which is what escapes a stationary point that
+  a diagonal first-order method cannot leave. §26 argued this was unnecessary
+  because the projection already yields exact zeros; the haze is 31,291
+  coordinates at 0.05 and none of them is zero, so that argument was wrong.
+  **Cheapest of the three and the most likely to work.**
+- **A4. An integer proximal step.** Periodically pull `a` toward the nearest
+  integer, or add a penalty on the distance to the integer lattice. The
+  principled version of A3. *Note:* annealing `discrete_temperature` does
+  **not** do this. `SmoothedCount.log_prob` is the analytic continuation and
+  carries no `eta`, so the fractionalization discount is
+  temperature-independent -- it is in the density, not the sampler.
+
+### B. The count-to-depth map
+
+- **B1. A superlinear count-to-depth map, `tau = c a^p` with `p > 1`.** This is
+  the direct attack on the likelihood's blindness to spreading, and it looks
+  strong. Total depth from `n` sites holding `M/n` each is `c M^p n^(1-p)`, so:
+
+  | n | tau, p = 1 | tau, p = 1.5 | tau, p = 2 | prior saving from spreading |
+  |---|---|---|---|---|
+  | 1 | 6.91 | 6.91 | 6.91 | 0.000 |
+  | 20 | 6.91 | 1.54 | 0.35 | 0.537 |
+  | 100 | 6.91 | 0.69 | 0.07 | 0.567 |
+
+  At `p = 1` the prior pays up to 0.567 nats to spread and the render does not
+  notice. At `p = 2` a twenty-site haze keeps 5% of its optical depth, against
+  a prior saving of half a nat. *Objection:* `p != 1` is wrong for integer
+  counts, so this is only defensible as a choice of interpolation -- which, per
+  the note above, is the free part. `c` needs recalibrating so `a = 1` still
+  gives `tau = 6.908`.
+- **B2. The alpha clip.** Currently `1 - 1e-3`, giving peak `tau = 6.908` per
+  stamp. §26's upright test says this is *correctly* calibrated -- the count
+  gradient at `a = 1` is positive on exactly-matched glyphs (+51 on `0000_N6`,
+  +174 on `0002_J8`) -- so do not change it to chase the haze. Listed to record
+  that it was checked and cleared.
+- **B3. A superlinear opacity law.** Replacing Beer-Lambert so faint ink is
+  disproportionately penalized. *Objection:* §2's "counts add in
+  log-transmittance, colour does not add at all" is the load-bearing argument
+  of the whole renderer. B1 achieves the same end without touching it, since it
+  changes the count-to-depth map rather than the depth-to-opacity map.
+
+### C. The slot lattice
+
+- **C1. A coarser slot lattice.** One slot every two pixels cuts 6,400
+  positions to 1,600 and gives a haze a quarter as many coordinates to spread
+  into. Cheap, and it attacks "31,291 marginally justified sites" directly.
+  *Note:* it does not shrink the prior's fractionalization discount, which is
+  capped at `gamma` per unit regardless of `n`; it limits the likelihood-side
+  hedging only. Costs sub-pixel placement, which §27 already deferred.
+- **C2. The slot model of §27** -- spatial slots, categorical identity, per-slot
+  discrete pose. Designed, not built.
+
+### D. The noise model
+
+- **D1. `gamma_df_floor`** -- runnable. The measured cause of §26's 84%
+  absorption. **Watch the interaction:** raising the floor *strengthens* the
+  likelihood, which is what pays for the haze, so this may make `0002_J8` and
+  `0003_LN` worse even as it helps `0000_LJ`. Read it per image, not on average.
+- **D2. `gamma_df_source: coverage`** -- runnable. Continuous in the counts
+  where the thresholded form is flat.
+- **D3. An explicit clutter component.** A speckle process and a stroke
+  component, so the likelihood does not have to forgive what the renderer
+  cannot represent. The principled resolution that D1 and D2 are knobs on.
+- **D4. Drop the local precisions.** The mirror of `partitioned_gmrf` §4, which
+  ablated the paper field and kept the Gamma. We now have a paper field they
+  did not rely on, so the ablation is worth running the other way round.
+
+### E. Cleared, or symptom only
+
+- **The paper field.** With the correct glyphs placed it fits to
+  `[0.957, 0.959, 0.943]` against a truth of `[0.957, 0.957, 0.941]`. Its drift
+  is a symptom of a wrong render, not a cause. One caveat worth remembering:
+  the sigmoid parameterization can never reach exactly 1.0, and `0000_N6` and
+  `0003_LN` have genuinely pure-white paper.
+- **Glyph identity and the dictionary.** `L` ranks 1st of 36 and `J` 2nd at the
+  correct sites, and A1 recovers both glyphs on three of five upright images.
+- **The warp's conditioning and amplitude.** Translation-free at
+  `warp_scale = 5.0` turns a measured deformation from `-2,660` nats into
+  `+3,223`.
