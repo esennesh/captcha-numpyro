@@ -47,6 +47,7 @@ from jaxtyping import Array, Float
 from numpyro.contrib.module import nnx_module
 
 from src.data.dictionary import ShapeDictionary
+from src.model.model import _as_nhwc_dictionary
 from src.distributions import SecondOrderGaussianMrf
 from src.inference.captcha_encoder import _valid_num_groups
 from src.model.model import _dictionary_alpha_rgb
@@ -170,12 +171,14 @@ class PoissonRateHead(nnx.Module):
     def __init__(self, shape_dict: ShapeDictionary, backbone_channels: int=64,
                  expected_count: float=1., img_h: int=80, img_w: int=80,
                  match_gain: float=2., max_log_rate: float=5.,
-                 min_log_rate: float=-20., *, rngs: nnx.Rngs):
+                 min_log_rate: float=-20., *,
+                 require_on_canvas: bool=True, rngs: nnx.Rngs):
         self.expected_count = expected_count
         self.height = img_h
         self.match_gain = match_gain
         self.max_log_rate = max_log_rate
         self.min_log_rate = min_log_rate
+        self.require_on_canvas = require_on_canvas
         self.shape_dict = shape_dict
         self.width = img_w
         self.head = nnx.Conv(
@@ -183,9 +186,39 @@ class PoissonRateHead(nnx.Module):
             kernel_init=nnx.initializers.zeros_init(),
             bias_init=nnx.initializers.zeros_init(), rngs=rngs,
         )
+        rows, columns = self.count_shape
         self.prior_log_rate = float(
-            jnp.log(expected_count / (img_h * img_w * len(shape_dict)))
+            jnp.log(expected_count / (rows * columns * len(shape_dict)))
         )
+
+    @property
+    def count_origin(self) -> tuple[int, int]:
+        """Mirror of :attr:`PoissonConvPlacements.count_origin`."""
+        if not self.require_on_canvas:
+            return (0, 0)
+        height, width = _as_nhwc_dictionary(self.shape_dict.shapes).shape[1:3]
+        return ((height - 1) // 2, (width - 1) // 2)
+
+    @property
+    def count_shape(self) -> tuple[int, int]:
+        """Mirror of :attr:`PoissonConvPlacements.count_shape`.
+
+        The guide has to emit the same shape the model's ``a`` site has, and
+        with ``require_on_canvas`` that is the set of centres whose glyph frame
+        fits rather than the whole image.
+        """
+        if not self.require_on_canvas:
+            return (self.height, self.width)
+        height, width = _as_nhwc_dictionary(self.shape_dict.shapes).shape[1:3]
+        return (self.height - height + 1, self.width - width + 1)
+
+    def crop_to_count_grid(self, field: Array) -> Array:
+        """Crop an image-resolution field to :attr:`count_shape`."""
+        if not self.require_on_canvas:
+            return field
+        top, left = self.count_origin
+        rows, columns = self.count_shape
+        return field[..., top:top + rows, left:left + columns, :]
 
     @property
     def num_features(self) -> int:
@@ -222,6 +255,11 @@ class PoissonRateHead(nnx.Module):
                                            jnp.log(jnp.asarray(self.match_gain))))
         logits = match_gain * self.scores(images) + self.head(features)
         numpyro.deterministic("match_scores", logits)
+        # The model's count field covers only the centres whose glyph frame
+        # fits, so the proposal has to be normalized over that set and no
+        # other; a softmax over the whole image would leak mass onto sites the
+        # model does not have.
+        logits = self.crop_to_count_grid(logits)
         # Clipping in log space, not a softplus: the score-function gradient
         # cares about d log(lambda_hat) / d logit, which is exactly 1 under exp
         # at every rate. The clip only bounds the tails -- exp(5) caps a site at

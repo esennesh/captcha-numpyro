@@ -5,6 +5,7 @@ import functools
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 import rootutils
 from flax import nnx
 from numpyro.handlers import condition, seed, trace
@@ -120,8 +121,12 @@ def test_model_exposes_normalized_texture_and_velocity_latents():
 
 def test_texture_and_velocity_each_change_the_rendered_mean():
     color = jnp.asarray([[0.2, 0.4, 0.6]])
-    counts = jnp.zeros((1, 12, 11, 2)).at[0, 6, 5, 0].set(1.0)
+    # The count grid is not the image grid: `require_on_canvas` keeps only the
+    # centres whose glyph frame fits. Build it at `count_shape`.
     placements = make_placements(warp_scale=0.5)
+    counts = jnp.zeros(
+        (1, *placements.count_shape, 2)
+    ).at[0, 2, 2, 0].set(1.0)
     zero_texture = jnp.zeros((1, 5, 4, 3))
     zero_velocity = jnp.zeros((1, 3, 3, 2))
     values = {
@@ -153,7 +158,6 @@ def test_texture_and_velocity_each_change_the_rendered_mean():
 
 def test_zero_texture_and_velocity_recover_the_original_renderer_exactly():
     color = jnp.asarray([[0.2, 0.4, 0.6]])
-    counts = jnp.zeros((1, 12, 11, 2)).at[0, 6, 5, 0].set(1.0)
     base = PoissonConvPlacements(
         make_dictionary(),
         expected_count=1.0,
@@ -161,7 +165,11 @@ def test_zero_texture_and_velocity_recover_the_original_renderer_exactly():
         img_w=11,
         rngs=nnx.Rngs(0),
     )
-    ink = base.ink_field(counts)
+    # The count grid is not the image grid; `to_image_grid` pads it.
+    counts = jnp.zeros(
+        (1, *base.count_shape, 2)
+    ).at[0, 2, 2, 0].set(1.0)
+    ink = base.ink_field(base.to_image_grid(counts))
     depth = ink[..., 3:]
     tint = jnp.where(
         depth > 1e-6,
@@ -183,3 +191,57 @@ def test_zero_texture_and_velocity_recover_the_original_renderer_exactly():
     )
     assert np.array_equal(base_mean, expected)
     assert np.array_equal(actual, expected)
+
+
+def test_require_on_canvas_keeps_every_stamp_wholly_visible():
+    """A centre anywhere in the count field must render its whole frame.
+
+    `_stamp` crops, so a centre within half a kernel of an edge renders a
+    sliver, and slivers of different letters are interchangeable -- a generic
+    deformable ink primitive rather than a glyph. Ladder A3 found 21 of 30 top
+    peaks under 75% on-canvas.
+    """
+    placements = make_placements()
+    kernel_height, kernel_width = placements.ink_kernel.shape[:2]
+    rows, columns = placements.count_shape
+    assert (rows, columns) == (
+        placements.height - kernel_height + 1,
+        placements.width - kernel_width + 1,
+    )
+    top, left = placements.count_origin
+    for corner in ((0, 0), (0, columns - 1), (rows - 1, 0),
+                   (rows - 1, columns - 1)):
+        counts = jnp.zeros((1, rows, columns, 2)).at[
+            0, corner[0], corner[1], 0
+        ].set(1.0)
+        centre = (corner[0] + top, corner[1] + left)
+        # the whole frame has to sit inside the canvas
+        assert 0 <= centre[0] - top
+        assert centre[0] - top + kernel_height <= placements.height
+        assert 0 <= centre[1] - left
+        assert centre[1] - left + kernel_width <= placements.width
+        ink = placements.ink_field(placements.to_image_grid(counts))
+        assert np.isfinite(np.asarray(ink)).all()
+
+
+def test_require_on_canvas_can_be_switched_off():
+    unconstrained = TexturedDiffeomorphicPoissonConvPlacements(
+        make_dictionary(), expected_count=1.0, img_h=12, img_w=11,
+        cg_iters=50, rngs=nnx.Rngs(0), warp_coarse_height=3,
+        warp_coarse_width=3, warp_scale=0.0, require_on_canvas=False,
+    )
+    assert unconstrained.count_shape == (12, 11)
+    assert unconstrained.count_origin == (0, 0)
+    counts = jnp.zeros((1, 12, 11, 2))
+    # a no-op, so the old renderer is recovered exactly
+    np.testing.assert_array_equal(
+        np.asarray(unconstrained.to_image_grid(counts)), np.asarray(counts)
+    )
+
+
+def test_to_image_grid_rejects_an_image_shaped_field():
+    """The guide has to mirror `count_shape`; failing loudly beats padding it."""
+    placements = make_placements()
+    counts = jnp.zeros((1, placements.height, placements.width, 2))
+    with pytest.raises(ValueError, match="count_shape"):
+        placements.to_image_grid(counts)

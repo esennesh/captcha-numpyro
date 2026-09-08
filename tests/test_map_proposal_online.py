@@ -60,8 +60,10 @@ def test_map_proposal_runs_on_full_captcha_model():
     assert result.map_losses.shape == (2,)
     assert result.map_num_steps == 2
     assert result.reconstructions.shape == (3, 1, 9, 9, 3)
-    assert result.samples["a"].shape == (3, 1, 9, 9, 1)
-    assert result.weighted_counts.shape == (1, 9, 9, 1)
+    # `require_on_canvas` shrinks the count field to the centres whose whole
+    # (5, 5) frame fits on a 9 x 9 canvas, so 5 x 5 rather than 9 x 9.
+    assert result.samples["a"].shape == (3, 1, 5, 5, 1)
+    assert result.weighted_counts.shape == (1, 5, 5, 1)
     assert result.weighted_reconstruction.shape == (1, 9, 9, 3)
     assert set(result.samples) == {
         "a",

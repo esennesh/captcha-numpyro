@@ -144,7 +144,7 @@ def test_ink_count_follows_the_edge_alpha_threshold():
     model = make_model()
     values = latent_values(model, image)
     placements = model.keywords["placements"]
-    values["a"] = jnp.zeros(values["a"].shape).at[0, 4, 4, 0].set(5.0)
+    values["a"] = jnp.zeros(values["a"].shape).at[0, 2, 2, 0].set(5.0)
     values["warp_velocity"] = jnp.zeros_like(values["warp_velocity"])
 
     def composite():
@@ -154,7 +154,7 @@ def test_ink_count_follows_the_edge_alpha_threshold():
         return _ink_layer(
             placements.warp_ink(
                 placements.ink_field(
-                    values["a"],
+                    placements.to_image_grid(values["a"]),
                     placements.color_modulation(values["color"]),
                 )
             ),
@@ -257,10 +257,13 @@ def test_paper_field_removes_the_incentive_to_tile_the_canvas():
         }
         return float(log_density(model, (image,), {}, values)[0])
 
-    blank = jnp.zeros((1, 12, 12, 1), dtype=jnp.int32)
+    # The count grid is the set of centres whose 4 x 4 frame fits a 12 x 12
+    # canvas, so 9 x 9 rather than 12 x 12.
+    count_shape = build(False).keywords["placements"].count_shape
+    blank = jnp.zeros((1, *count_shape, 1), dtype=jnp.int32)
     tiled = blank
-    for y in range(1, 12, 4):
-        for x in range(1, 12, 4):
+    for y in range(0, count_shape[0], 4):
+        for x in range(0, count_shape[1], 4):
             tiled = tiled.at[0, y, x, 0].set(1)
 
     white = build(False)

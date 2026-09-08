@@ -132,13 +132,17 @@ def summarize(result, model, image, truth=None, blank_log_joint=None, top=6):
     names = glyph_names(model)
     counts = np.asarray(result.map_values["a"])
     order = np.argsort(counts.ravel())[::-1][:top]
+    # The count field is not the image grid under `require_on_canvas`, so shift
+    # peaks into image coordinates before reporting them.
+    top_offset, left_offset = model.keywords["placements"].count_origin
     peaks = []
     for rank in order:
         _, y, x, k = np.unravel_index(rank, counts.shape)
+        y, x = int(y) + top_offset, int(x) + left_offset
         peaks.append(
-            {"glyph": names[k], "y": int(y), "x": int(x),
+            {"glyph": names[k], "y": y, "x": x,
              "count": round(float(counts.ravel()[rank]), 4),
-             "visible": round(visible_fraction(model, int(y), int(x)), 3)}
+             "visible": round(visible_fraction(model, y, x), 3)}
         )
     observed = np.asarray(image[0])
     reconstruction = np.asarray(result.weighted_reconstruction)[0]
@@ -224,9 +228,7 @@ def blank_reference(inference, model, image, seed=0):
     by the reference and the fit it is compared against.
     """
     placements = model.keywords["placements"]
-    zeros = jnp.zeros(
-        (1, placements.height, placements.width, placements.num_features)
-    )
+    zeros = jnp.zeros((1, *placements.count_shape, placements.num_features))
     return map_log_joint(inference, inference.model, image, {"a": zeros}, seed)
 
 
@@ -419,8 +421,10 @@ def experiment_prior_recovery(arguments):
         ).get_trace(None)
         image = jnp.clip(prior_trace["obs"]["value"], 0.0, 1.0)
         true_counts = np.asarray(prior_trace["a"]["value"])
+        origin_y, origin_x = placements.count_origin
         placed = [
-            {"glyph": names[k], "y": int(y), "x": int(x),
+            {"glyph": names[k], "y": int(y) + origin_y,
+             "x": int(x) + origin_x,
              "count": int(true_counts[0, y, x, k])}
             for y, x, k in zip(*np.nonzero(true_counts[0])[:3])
         ] if true_counts.sum() else []

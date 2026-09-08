@@ -216,10 +216,12 @@ class PoissonConvPlacements(nnx.Module):
 
     def __init__(self, shape_dict: ShapeDictionary, expected_count: float=1.,
                  img_h: int=80, img_w: int=80, *,
+                 require_on_canvas: bool=True,
                  rngs: nnx.Rngs | None=None):
         del rngs
         self.expected_count = expected_count
         self.height = img_h
+        self.require_on_canvas = require_on_canvas
         self.shape_dict = shape_dict
         self.width = img_w
 
@@ -228,27 +230,94 @@ class PoissonConvPlacements(nnx.Module):
         return self.shape_dict.shapes.shape[0]
 
     @property
+    def count_origin(self) -> tuple[int, int]:
+        """Image coordinates of the count field's ``(0, 0)`` site.
+
+        ``(0, 0)`` unless ``require_on_canvas``, in which case the field starts
+        at the first centre whose glyph frame fits.
+        """
+        if not self.require_on_canvas:
+            return (0, 0)
+        height, width = self.ink_kernel.shape[:2]
+        return ((height - 1) // 2, (width - 1) // 2)
+
+    @property
+    def count_shape(self) -> tuple[int, int]:
+        """Spatial shape of the count field, which is not the image shape.
+
+        With ``require_on_canvas`` the field covers only those centres whose
+        whole ``(kh, kw)`` frame lands on the canvas. For an 80 x 80 image and
+        a 38 x 26 kernel that is 43 x 55 rather than 80 x 80 -- a 2.7-fold
+        reduction in count coordinates, and a *hard* constraint.
+
+        Why it is needed: ``_stamp`` crops, so a centre within half a kernel of
+        an edge renders only a sliver of its glyph, and slivers of different
+        letters are nearly interchangeable. Ladder A3 found 21 of 30 top peaks
+        under 75% on-canvas, many at exactly 50%, on the run with the highest
+        glyph evidence and the worst identity -- the model had discovered a
+        generic deformable ink primitive. A soft penalty does not close this:
+        the rate enters as ``a log(rate)``, so at the observed amplitude of
+        0.1 even a factor of 1e-12 costs only 2.8 nats against fragments worth
+        hundreds.
+
+        All twelve measured glyph centres in ``data/examples`` sit fully inside
+        (``x`` from 14 to 60 against a half-width of 12), so this constrains the
+        model rather than the data. It does weaken §1's equivariance claim from
+        exact to exact-within-the-interior, which is the intended trade.
+        """
+        if not self.require_on_canvas:
+            return (self.height, self.width)
+        height, width = self.ink_kernel.shape[:2]
+        return (self.height - height + 1, self.width - width + 1)
+
+    @property
     def num_sites(self) -> int:
-        return self.height * self.width * self.num_features
+        rows, columns = self.count_shape
+        return rows * columns * self.num_features
+
+    def to_image_grid(self, counts: Array) -> Array:
+        """Zero-pad a count field from :attr:`count_shape` to the image grid."""
+        if not self.require_on_canvas:
+            return counts
+        top, left = self.count_origin
+        rows, columns = self.count_shape
+        if counts.shape[-3:-1] != (rows, columns):
+            raise ValueError(
+                f"counts need spatial shape {(rows, columns)} to pad onto a "
+                f"{(self.height, self.width)} image, got {counts.shape[-3:-1]}. "
+                "A guide mirroring this site has to emit `count_shape`, not the "
+                "image shape."
+            )
+        pad = ((0, 0),) * (counts.ndim - 3) + (
+            (top, self.height - rows - top),
+            (left, self.width - columns - left),
+            (0, 0),
+        )
+        return jnp.pad(counts, pad)
 
     @property
     def ink_kernel(self) -> Array:
         return _ink_kernel(self.shape_dict.shapes)
 
     def sample_counts(self):
-        """Draw the integer activation field, shape ``(1, H, W, K)``.
+        """Draw the integer activation field, shape ``(1, *count_shape, K)``.
 
         ``expected_count`` only *initializes* the rate, which then learns
         freely. A scalar keeps the prior a homogeneous marked Poisson process
         and so exactly translation-invariant; ``(K,)`` would still be safe (it
         learns per-glyph frequency), but a per-site rate would destroy that
         invariance and with it the equivariance :func:`_stamp` provides.
+
+        The field is *not* on the image grid when ``require_on_canvas``; see
+        :attr:`count_shape`. Pass it through :meth:`to_image_grid` before
+        stamping.
         """
         log_rate = numpyro.param(
             "log_rate", jnp.log(self.expected_count / self.num_sites)
         )
-        rate = jnp.broadcast_to(jnp.exp(log_rate),
-                                (1, self.height, self.width, self.num_features))
+        rate = jnp.broadcast_to(
+            jnp.exp(log_rate), (1, *self.count_shape, self.num_features)
+        )
         return numpyro.sample("a", dist.Poisson(rate).to_event(3))
 
     def ink_field(self, counts, color_field: Array | None = None) -> Array:
@@ -269,7 +338,7 @@ class PoissonConvPlacements(nnx.Module):
     def __call__(self, color: Array | None = None, rngs=None):
         del color
         del rngs
-        return self.ink_field(self.sample_counts())
+        return self.ink_field(self.to_image_grid(self.sample_counts()))
 
 
 class TexturedDiffeomorphicPoissonConvPlacements(PoissonConvPlacements):
@@ -324,6 +393,7 @@ class TexturedDiffeomorphicPoissonConvPlacements(PoissonConvPlacements):
         img_w: int = 80,
         *,
         cg_iters: int = 300,
+        require_on_canvas: bool = True,
         rngs: nnx.Rngs | None = None,
         texture_bond_precision: float = 4.0,
         texture_element_precision: float = 1.0,
@@ -340,6 +410,7 @@ class TexturedDiffeomorphicPoissonConvPlacements(PoissonConvPlacements):
             expected_count,
             img_h,
             img_w,
+            require_on_canvas=require_on_canvas,
             rngs=rngs,
         )
         if warp_modes not in _WARP_CONDITIONERS:
@@ -365,7 +436,7 @@ class TexturedDiffeomorphicPoissonConvPlacements(PoissonConvPlacements):
                 "baseline color"
             )
         del rngs
-        counts = self.sample_counts()
+        counts = self.to_image_grid(self.sample_counts())
         modulation = self.color_modulation(color)
         return self.warp_ink(self.ink_field(counts, modulation))
 
