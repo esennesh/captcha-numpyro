@@ -10,6 +10,7 @@ import functools
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 import rootutils
 from flax import nnx
 from numpyro.handlers import seed, substitute, trace
@@ -100,7 +101,7 @@ def test_gmrf_likelihood_exposes_paper_and_precision_latents():
 
 
 def test_degrees_of_freedom_label_ink_against_paper():
-    """nu = 1 on bare paper and 2 under ink, so only paper gets the fat tail."""
+    """nu = 1 on bare paper and 2 under ink at the default floor and gain."""
     image = jnp.ones((1, 9, 9, 3))
     model = make_model()
     values = latent_values(model, image)
@@ -121,7 +122,7 @@ def test_composite_is_the_alpha_blend_of_ink_over_paper():
     paper = model.keywords["backgrounder"]
 
     def composite():
-        return composite_poisson_convsc(placements, paper)
+        return composite_poisson_convsc(placements, paper)[0]
 
     layer = substitute(seed(composite, jax.random.PRNGKey(2)), values)()
 
@@ -147,7 +148,7 @@ def test_ink_count_follows_the_edge_alpha_threshold():
     values["warp_velocity"] = jnp.zeros_like(values["warp_velocity"])
 
     def composite():
-        return composite_poisson_convsc(placements, None)
+        return composite_poisson_convsc(placements, None)[0]
 
     def ink_only():
         return _ink_layer(
@@ -270,3 +271,72 @@ def test_paper_field_removes_the_incentive_to_tile_the_canvas():
     fielded = build(True)
     paper_margin = score(fielded, blank, paper) - score(fielded, tiled, paper)
     assert paper_margin > white_margin + 50.0
+
+
+@pytest.mark.parametrize("floor", (1.0, 2.0, 4.0))
+def test_gamma_df_floor_shifts_both_endpoints(floor):
+    """Raising the floor tightens the Gamma on bare paper as well as on ink."""
+    image = jnp.ones((1, 9, 9, 3))
+    model = functools.partial(
+        poisson_convsc_model,
+        placements=make_model().keywords["placements"],
+        likelihood="gmrf",
+        gamma_df_floor=floor,
+    )
+    values = latent_values(model, image)
+    values["a"] = jnp.zeros_like(values["a"]).at[0, 4, 4, 0].set(3)
+    model_trace = trace(
+        substitute(seed(model, jax.random.PRNGKey(1)), values)
+    ).get_trace(image)
+    concentration = np.asarray(
+        model_trace["local_precision"]["fn"].base_dist.concentration
+    )
+    assert set(np.unique(concentration)) == {0.5 * floor, 0.5 * (floor + 1.0)}
+
+
+def test_coverage_coupling_is_continuous_where_the_count_steps():
+    """The coverage form varies smoothly across a glyph's anti-aliased edge."""
+    image = jnp.ones((1, 9, 9, 3))
+    placements = make_model().keywords["placements"]
+    counted = functools.partial(
+        poisson_convsc_model, placements=placements, likelihood="gmrf",
+        gamma_df_source="count")
+    covered = functools.partial(
+        poisson_convsc_model, placements=placements, likelihood="gmrf",
+        gamma_df_source="coverage")
+    values = latent_values(counted, image)
+    values["a"] = jnp.zeros_like(values["a"]).at[0, 4, 4, 0].set(1)
+    levels = {}
+    for name, model in (("count", counted), ("coverage", covered)):
+        model_trace = trace(
+            substitute(seed(model, jax.random.PRNGKey(2)), values)
+        ).get_trace(image)
+        levels[name] = np.unique(np.asarray(
+            model_trace["local_precision"]["fn"].base_dist.concentration))
+    # The thresholded form takes exactly two values; the continuous one takes
+    # more, because a partially covered pixel lands between them.
+    assert len(levels["count"]) == 2
+    assert len(levels["coverage"]) > 2
+    assert levels["coverage"].min() >= levels["count"].min() - 1e-6
+    assert levels["coverage"].max() <= levels["count"].max() + 1e-6
+
+
+def test_gamma_df_rejects_bad_settings():
+    from src.model.model import _gamma_degrees_of_freedom
+    image = jnp.ones((1, 9, 9, 3))
+    model = make_model()
+    placements = model.keywords["placements"]
+
+    def composite():
+        return composite_poisson_convsc(placements, None)
+
+    values = latent_values(
+        functools.partial(poisson_convsc_model, placements=placements,
+                          likelihood="gmrf"), image)
+    layer, glyph = substitute(seed(composite, jax.random.PRNGKey(3)), values)()
+    with pytest.raises(ValueError, match="gamma_df_floor"):
+        _gamma_degrees_of_freedom(layer, glyph, 0.0, 1.0, "count")
+    with pytest.raises(ValueError, match="gamma_df_gain"):
+        _gamma_degrees_of_freedom(layer, glyph, 1.0, -1.0, "count")
+    with pytest.raises(ValueError, match="gamma_df_source"):
+        _gamma_degrees_of_freedom(layer, glyph, 1.0, 1.0, "nope")

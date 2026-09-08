@@ -6,6 +6,8 @@ exponentiated with scaling and squaring; images are warped by sampling through
 the inverse displacement.
 """
 
+import math
+
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float
@@ -20,7 +22,9 @@ __all__ = [
     "coordinate_grid",
     "diffeomorphic_warp",
     "jacobian_determinant",
+    "fit_coarse_velocity",
     "resize_velocity",
+    "rotation_velocity",
     "scaling_and_squaring",
     "sparse_diffeomorphic_stamp",
     "translation_basis",
@@ -330,6 +334,88 @@ def resize_velocity(
             f"got {velocity.shape}"
         )
     return jax.image.resize(velocity, (*shape, 2), method=method)
+
+
+def rotation_velocity(
+    shape: tuple[int, int],
+    degrees: float,
+    *,
+    centre: tuple[float, float] | None = None,
+    sigma: float | None = None,
+    dtype=jnp.float32,
+) -> Float[Array, "H W 2"]:
+    r"""The velocity field whose flow rotates about ``centre`` by ``degrees``.
+
+    A rotation is the flow of the linear velocity ``v(p) = theta J (p - c)``
+    with ``J`` the ninety-degree rotation generator, so ``exp(v)`` turns the
+    image by ``theta`` regardless of how the exponential is computed.
+
+    ``sigma`` optionally fades the field out with a Gaussian bump of that
+    radius, which turns a global rotation into a *local* one about ``centre``.
+    That is the useful form here: the glyphs in ``data/examples`` are rotated
+    individually rather than together, so a per-glyph bump of about the glyph's
+    own half-size is the target to aim a warp at.
+    """
+    grid = coordinate_grid(shape, dtype=dtype)
+    height, width = shape
+    if centre is None:
+        centre = ((height - 1) / 2.0, (width - 1) / 2.0)
+    theta = jnp.asarray(math.radians(degrees), dtype=dtype)
+    offset_y = grid[..., 0] - centre[0]
+    offset_x = grid[..., 1] - centre[1]
+    velocity = jnp.stack((theta * offset_x, -theta * offset_y), axis=-1)
+    if sigma is None:
+        return velocity
+    bump = jnp.exp(-0.5 * (offset_y ** 2 + offset_x ** 2) / (sigma ** 2))
+    return bump[..., None] * velocity
+
+
+def fit_coarse_velocity(
+    target: Float[Array, "H W 2"],
+    coarse_shape: tuple[int, int],
+    conditioner,
+    covariance_solve,
+    *,
+    scale: float = 1.0,
+    window: Float[Array, "H W"] | None = None,
+) -> Float[Array, "h w 2"]:
+    r"""Least-squares fit a coarse velocity whose image field matches ``target``.
+
+    The map from the coarse lattice to the conditioned, windowed, resized image
+    velocity is linear, so materialize it once and solve. Only the interior is
+    fitted when a ``window`` is supplied, since the boundary is pinned to zero
+    and cannot match anything.
+
+    This is what turns "rotate this glyph by 25 degrees" into a value for the
+    ``warp_velocity`` site, which is what a warp-marginal sweep needs: pin the
+    warp at each of a few candidate poses and let the count field fit under
+    each, instead of asking one optimizer to find pose and placement together.
+
+    :param conditioner: :func:`translation_free_velocity` or
+        :func:`affine_free_velocity`.
+    :param covariance_solve: the coarse prior's ``solve_precision``.
+    """
+    shape = target.shape[:2]
+
+    def image_velocity(coarse):
+        return scale * conditioner(
+            coarse, covariance_solve, shape, window=window
+        )
+
+    jacobian = jax.jacobian(image_velocity)(
+        jnp.zeros((*coarse_shape, 2), dtype=target.dtype)
+    )
+    operator = jacobian.reshape(
+        shape[0] * shape[1] * 2, coarse_shape[0] * coarse_shape[1] * 2
+    )
+    flat = target.reshape(-1)
+    if window is not None:
+        keep = jnp.broadcast_to(
+            (window > 0.5)[..., None], (*shape, 2)
+        ).reshape(-1)
+        operator, flat = operator[keep], flat[keep]
+    solution, *_ = jnp.linalg.lstsq(operator, flat, rcond=None)
+    return solution.reshape((*coarse_shape, 2))
 
 
 def scaling_and_squaring(

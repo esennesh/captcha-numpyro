@@ -55,6 +55,27 @@ backgrounder:
   img_h: 80
   img_w: 80
 
+# Per-pixel Gamma degrees of freedom, nu_p = floor + gain * s_p, where s_p is
+# either the composited region count ("count", an integer, the form sections 3
+# and 4 of notebooks/partitioned_gmrf.ipynb use) or the glyph layer's straight
+# coverage ("coverage", continuous in [0, 1], differentiable in the counts where
+# the thresholded version is flat).
+#
+# The floor is the knob that matters. At 1.0 a pixel the renderer left blank
+# gets nu = 1, the most dispersed Gamma, so its precision can fall to 0.02 and a
+# missed glyph is nearly free. Measured on 0000_LJ: with the precisions free the
+# correct two glyphs are worth +804 nats over a blank canvas; with them pinned
+# at one, +5,129. The free precisions absorb 84% of the evidence for the glyphs,
+# which is why the fit settles for a smear. See section 26 of
+# notes/poisson-convsc-design.md, and scripts/experiments.py
+# degrees-of-freedom for the sweep.
+#
+# Left at the measured-bad default so that sweeps move away from a known
+# baseline rather than an unmeasured one.
+gamma_df_floor: 1.0
+gamma_df_gain: 1.0
+gamma_df_source: count
+
 # The observation GMRF, Q = element I + bond L, with lattice bonds cut wherever
 # the composite's region count changes -- so ink and paper do not smooth into
 # each other across a glyph outline. Section 3 of the partitioned_gmrf notebook

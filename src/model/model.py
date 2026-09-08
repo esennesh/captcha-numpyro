@@ -793,7 +793,7 @@ def _ink_layer(ink: Array, color: Array, ambient_depth: float = 1e-4) -> Layer:
 
 
 def composite_poisson_convsc(placements, backgrounder=None,
-                             ambient_depth: float=1e-4) -> Layer:
+                             ambient_depth: float=1e-4) -> tuple[Layer, Layer]:
     """Composite the ink layer *over* the paper layer and return one Layer.
 
     This is the two-field counterpart of :func:`generate_poisson_convsc`: the
@@ -808,6 +808,11 @@ def composite_poisson_convsc(placements, backgrounder=None,
     ``backgrounder=None`` falls back to fixed white paper, which reproduces the
     former mean. See :class:`PaperGmrfBackground` for why that fallback costs
     tens of thousands of nats on real captcha paper.
+
+    Returns ``(composite, glyph)``. The glyph layer is returned as well because
+    the composite's coverage is one everywhere, so the *ink* coverage is not
+    recoverable from it, and :func:`_gamma_degrees_of_freedom` needs it for the
+    ``"coverage"`` coupling.
     """
     color = numpyro.sample("color", dist.Beta(jnp.ones((3,)),
                                               jnp.ones((3,))).to_event(1))
@@ -817,7 +822,51 @@ def composite_poisson_convsc(placements, backgrounder=None,
     else:
         background = jnp.ones(glyph.image.shape[:-1] + (1,))
     background = jnp.broadcast_to(background, glyph.image.shape)
-    return glyph @ Layer.straight(background)
+    return glyph @ Layer.straight(background), glyph
+
+
+def _gamma_degrees_of_freedom(composite: Layer, glyph: Layer, floor: float,
+                              gain: float, source: str) -> Array:
+    r"""Per-pixel Gamma degrees of freedom, ``nu_p = floor + gain * s_p``.
+
+    ``source`` selects the statistic ``s_p`` the dispersion follows:
+
+    ``"count"``
+        the composited region count, an integer. This is the form sections 3
+        and 4 of ``notebooks/partitioned_gmrf.ipynb`` use, and with
+        ``floor = gain = 1`` it is exactly ``count + 1``.
+    ``"coverage"``
+        the *glyph* layer's straight-alpha coverage, continuous in ``[0, 1]``.
+        Same endpoints, but it does not step at
+        :data:`~src.distributions.layers.POTENTIAL_EDGE_ALPHA`, so a pixel the
+        renderer half covers gets half the extra degrees of freedom rather than
+        all or none. It is also differentiable in the counts, where the
+        thresholded version is flat.
+
+    ``floor`` is the knob that matters, and it is why this function exists.
+    ``nu_p = 1`` on bare paper makes the Gamma maximally dispersed, so a pixel
+    the renderer left blank can drop its precision to 0.02 and a missed glyph
+    costs almost nothing. Measured on ``0000_LJ``: with the precisions free the
+    correct two glyphs are worth +804 nats over a blank canvas, and with them
+    pinned at one, +5,129 -- the free precisions absorb 84% of the evidence for
+    the glyphs. Raising the floor tightens the Gamma on bare paper and should
+    hand that evidence back; see §26 of ``notes/poisson-convsc-design.md``.
+    """
+    if floor <= 0.0:
+        raise ValueError(f"gamma_df_floor must be positive, got {floor}")
+    if gain < 0.0:
+        raise ValueError(f"gamma_df_gain must be nonnegative, got {gain}")
+    dtype = composite.image.dtype
+    if source == "count":
+        statistic = composite.count.astype(dtype)
+    elif source == "coverage":
+        statistic = glyph.to_straight().coverage.astype(dtype)
+    else:
+        raise ValueError(
+            f"Unknown gamma_df_source {source!r}; expected 'count' or "
+            "'coverage'."
+        )
+    return floor + gain * statistic
 
 
 def poisson_convsc_model(images, placements: PoissonConvPlacements,
@@ -825,6 +874,9 @@ def poisson_convsc_model(images, placements: PoissonConvPlacements,
                          ambient_depth: float=1e-4,
                          cg_iters: int=300,
                          df_couples_to: str="opacity",
+                         gamma_df_floor: float=1.,
+                         gamma_df_gain: float=1.,
+                         gamma_df_source: str="count",
                          gmrf_bond_precision: float=100.,
                          gmrf_element_precision: float=50.,
                          learn_df: bool=False,
@@ -892,15 +944,18 @@ def poisson_convsc_model(images, placements: PoissonConvPlacements,
     batch_size = images.shape[0] if images is not None else 1
     with numpyro.plate("batch", batch_size):
         if likelihood == "gmrf":
-            composite = composite_poisson_convsc(
+            composite, glyph = composite_poisson_convsc(
                 placements, backgrounder, ambient_depth
             )
-            # nu = 1 on bare paper, 2 under ink. The Gamma is its own latent,
-            # so a pixel the renderer cannot explain is downweighted rather
-            # than dragging the paper field or the count field towards it.
-            degrees_of_freedom = composite.count.astype(
-                composite.image.dtype
-            ) + 1.
+            # The Gamma is its own latent, so a pixel the renderer cannot
+            # explain is downweighted rather than dragging the paper field or
+            # the count field towards it. `gamma_df_floor` controls how much
+            # that costs; at the default of 1 it costs almost nothing, and
+            # §26 measures the consequence.
+            degrees_of_freedom = _gamma_degrees_of_freedom(
+                composite, glyph, gamma_df_floor, gamma_df_gain,
+                gamma_df_source,
+            )
             local_precision = numpyro.sample(
                 "local_precision",
                 dist.Gamma(

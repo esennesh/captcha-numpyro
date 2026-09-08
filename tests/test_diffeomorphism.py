@@ -18,8 +18,10 @@ from src.model.diffeomorphism import (
     compose_displacements,
     coordinate_grid,
     diffeomorphic_warp,
+    fit_coarse_velocity,
     jacobian_determinant,
     resize_velocity,
+    rotation_velocity,
     scaling_and_squaring,
     sparse_diffeomorphic_stamp,
     translation_basis,
@@ -317,3 +319,99 @@ def test_sparse_stamp_superposes_independent_occurrences():
         for index in range(2)
     )
     assert np.allclose(together, separate, atol=1e-12)
+
+
+def test_rotation_velocity_exponentiates_to_that_rotation():
+    """exp(v) must turn the grid by the requested angle."""
+    shape = (48, 48)
+    degrees = 12.0
+    centre = ((shape[0] - 1) / 2.0, (shape[1] - 1) / 2.0)
+    velocity = rotation_velocity(shape, degrees, dtype=jnp.float64)
+    displacement = scaling_and_squaring(velocity, squaring_steps=9)
+    grid = coordinate_grid(shape, dtype=jnp.float64)
+    mapped = grid + displacement
+
+    angle = np.radians(degrees)
+    offset = grid - jnp.asarray(centre, dtype=jnp.float64)
+    # (y, x) with v_y = theta * dx, v_x = -theta * dy is the generator of this
+    # rotation; check the finished map against the closed form.
+    expected = jnp.stack((
+        centre[0] + np.cos(angle) * offset[..., 0] + np.sin(angle) * offset[..., 1],
+        centre[1] - np.sin(angle) * offset[..., 0] + np.cos(angle) * offset[..., 1],
+    ), axis=-1)
+    interior = (slice(8, -8), slice(8, -8))
+    np.testing.assert_allclose(
+        np.asarray(mapped[interior]), np.asarray(expected[interior]), atol=0.05
+    )
+
+
+def test_rotation_velocity_sigma_localizes_the_field():
+    shape = (60, 60)
+    centre = (20.0, 20.0)
+    local = rotation_velocity(shape, 20.0, centre=centre, sigma=6.0,
+                              dtype=jnp.float64)
+    near = float(jnp.linalg.norm(local[20, 26]))
+    far = float(jnp.linalg.norm(local[20, 55]))
+    assert near > 0.5
+    assert far < 1e-6 * max(near, 1.0)
+
+
+def test_fit_coarse_velocity_recovers_a_representable_field():
+    """A field already in the image of the map must be fitted exactly."""
+    from src.distributions import SecondOrderGaussianMrf
+    from src.model.diffeomorphism import translation_free_velocity
+
+    shape = (32, 32)
+    coarse = (4, 4)
+    prior = SecondOrderGaussianMrf(
+        jnp.zeros((*coarse, 2), dtype=jnp.float64),
+        0.1 * jnp.ones(coarse, dtype=jnp.float64),
+        jnp.asarray(0.4, dtype=jnp.float64),
+        cg_iters=200,
+    )
+    window = boundary_taper(shape, dtype=jnp.float64)
+    source = jax.random.normal(jax.random.PRNGKey(0), (*coarse, 2),
+                               dtype=jnp.float64)
+    target = 2.0 * translation_free_velocity(
+        source, prior.solve_precision, shape, window=window
+    )
+    fitted = fit_coarse_velocity(
+        target, coarse, translation_free_velocity, prior.solve_precision,
+        scale=2.0, window=window,
+    )
+    recovered = 2.0 * translation_free_velocity(
+        fitted, prior.solve_precision, shape, window=window
+    )
+    keep = np.asarray(window > 0.5)
+    residual = float(jnp.linalg.norm((recovered - target)[keep])
+                     / jnp.linalg.norm(target[keep]))
+    assert residual < 1e-6, residual
+
+
+def test_fit_coarse_velocity_approximates_a_local_rotation():
+    from src.distributions import SecondOrderGaussianMrf
+    from src.model.diffeomorphism import translation_free_velocity
+
+    shape = (48, 48)
+    coarse = (6, 6)
+    prior = SecondOrderGaussianMrf(
+        jnp.zeros((*coarse, 2), dtype=jnp.float64),
+        0.1 * jnp.ones(coarse, dtype=jnp.float64),
+        jnp.asarray(0.4, dtype=jnp.float64),
+        cg_iters=200,
+    )
+    window = boundary_taper(shape, dtype=jnp.float64)
+    target = rotation_velocity(shape, -20.0, centre=(24.0, 24.0), sigma=8.0,
+                               dtype=jnp.float64)
+    fitted = fit_coarse_velocity(
+        target, coarse, translation_free_velocity, prior.solve_precision,
+        scale=5.0, window=window,
+    )
+    recovered = 5.0 * translation_free_velocity(
+        fitted, prior.solve_precision, shape, window=window
+    )
+    keep = np.asarray(window > 0.5)
+    residual = float(jnp.linalg.norm((recovered - target)[keep])
+                     / jnp.linalg.norm(target[keep]))
+    # The coarse lattice represents a glyph-scale rotation to a few percent.
+    assert residual < 0.2, residual
