@@ -2354,7 +2354,7 @@ work:
    subclass. **This is the recommended route**, because it keeps the exact
    discrete particles the whole importance-sampling story depends on.
 3. **Vectorize the update upstream.** The right long-term fix, and it belongs
-   in the same issue as `notes/diag-sgd-count-relaxation-issue.md`. The
+   in the same issue as `notes/diag-sgd-zero-inflation-issue.md`. The
    obstacle is that the exact update needs `E_q[log gamma]` per category and
    the log target does not decompose over slots, because the render is a sum
    over all of them. Worth thinking about; not worth blocking on.
@@ -2749,7 +2749,7 @@ worth running now.
   The fix is one line and one new parameter, `clip(1 - k/zero_width, 0, 1)`, so
   the width over which a coefficient still counts as "not there" becomes
   explicit; width 1 is today's behaviour and a small width restores the fixed
-  charge. Recorded in `notes/diag-sgd-count-relaxation-issue.md`, as a *design*
+  charge. Recorded in `notes/diag-sgd-zero-inflation-issue.md`, as a *design*
   question about the density between the integers rather than as an
   inconsistency -- `_count_log_pmf` uses a hard `value == 0` test and disagrees
   by up to 12 nats off the integers, but it is only ever evaluated at integers,

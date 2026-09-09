@@ -49,10 +49,23 @@ the gradient ``NaN`` -- the result keeps its full dynamic range. Where both
 tails have underflowed the mass is negligible by construction and the log PMF
 is reported as ``log(tiny)``, about ``-87`` in float32, with zero gradient.
 
-This belongs upstream in the ``codex/map-proposal`` branch of
+This belonged upstream in the ``codex/map-proposal`` branch of
 https://github.com/esennesh/numpyro. :func:`patch_count_log_pmf` is a temporary
 shim: it probes for the defect rather than reading a version, so it becomes a
 no-op once upstream carries the floor, and it is idempotent.
+
+**Upstream carries it as of commit ``4ca6f62`` (checked 2026-09-09), so this
+module is now inert.** The floor moved into ``GammaCount.log_prob`` in
+``numpyro/distributions/discrete.py`` -- the same four tails maxed at
+``finfo.tiny`` before ``jnp.log``, plus the ``logdiffexp(x, x)`` case -- and the
+same commit *deleted* ``diag_sgd._gamma_count_log_pmf``, every ``_idx_spec``
+family having been rerouted through its own distribution's ``log_prob``. That
+deletion is why :func:`patch_count_log_pmf` reads the attribute with
+``getattr``: a bare access raises ``AttributeError`` against a current
+checkout, and this module is imported for effect by
+:mod:`src.inference.map_proposal_online`, so the failure would land at import
+time. The whole module can be retired once the pin no longer reaches a commit
+that predates the fix.
 """
 
 import jax
@@ -137,10 +150,26 @@ def patch_count_log_pmf() -> bool:
 
     Idempotent, and a no-op once upstream carries the floor itself.
     """
-    if getattr(diag_sgd._gamma_count_log_pmf, _PATCH_MARKER, False):
+    # Read the attribute defensively. The upstream fix landed on
+    # `codex/map-proposal` as a floor inside `GammaCount.log_prob`, and the
+    # same commit deleted `diag_sgd._gamma_count_log_pmf` entirely, so a bare
+    # attribute access raises `AttributeError` against a current checkout --
+    # at import time, since `map_proposal_online` calls this on import.
+    upstream = getattr(diag_sgd, "_gamma_count_log_pmf", None)
+    # Our own marker has to be checked before the probe: once the patch is in,
+    # the probe passes, and answering "not needed" would contradict the return
+    # contract on the second call.
+    if upstream is not None and getattr(upstream, _PATCH_MARKER, False):
         return True
     if upstream_is_floored():
         return False
+    if upstream is None:
+        raise RuntimeError(
+            "the Gamma-count log PMF still has a NaN gradient at an "
+            "underflowed tail, but `diag_sgd._gamma_count_log_pmf` is gone, so "
+            "this patch has nothing to replace. The upstream floor has moved; "
+            "see notes/diag-sgd-zero-inflation-issue.md."
+        )
     setattr(_floored_gamma_count_log_pmf, _PATCH_MARKER, True)
     diag_sgd._gamma_count_log_pmf = _floored_gamma_count_log_pmf
     return True
