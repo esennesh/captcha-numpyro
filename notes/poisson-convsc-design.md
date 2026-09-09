@@ -2259,8 +2259,19 @@ over untouched.
 What it buys is the normalization. The current field can stack several
 *different* glyphs on one site, and the second pod run did exactly that -- a
 site holding a count of 2. A simplex per slot means one location renders one
-glyph, which is what decision 2 asks for, and it is enforced by construction
-rather than by a prior.
+glyph, which is what decision 2 asks for.
+
+**Correction, 2026-09-09: "enforced by construction" is wrong unless the
+identity is one-hot.** A continuous simplex point does not enforce it. The
+relaxed count's price is nearly linear in the amplitude -- 11.77 nats per unit,
+varying 4% over `[0, 1]` -- so the price of a slot is 11.77 times its *total*
+amplitude either way, and a flat Dirichlet over identity reproduces the current
+prior exactly. Worse, `a[y,x] * w[y,x,k]` is scale-degenerate: only the product
+reaches the likelihood, so a faint mark is made by shrinking whichever factor is
+cheaper, which is always the count. The factorization is a reparameterization
+with an unchanged prior, not a constraint. What supplies the missing preference
+is a fixed price per occurrence; see §28 A5, and note that the obvious way to
+get one -- zero inflation -- is removed by the relaxation.
 
 ### Pose: discrete per slot keeps it a convolution
 
@@ -2709,6 +2720,58 @@ worth running now.
   *indifferent* to spreading where the relaxed Poisson actively *rewards* it by
   up to `gamma = 0.577` nats per unit of amplitude. Strictly better, but still
   no preference for concentration. `partitioned_gmrf` uses `beta = 25`. Cheap.
+- **A5. Zero-inflate the count, so an occurrence has a fixed price.**
+  *Measured 2026-09-09, and it does not work as written.* This is the
+  principled form of the redundancy A1 and A2 circle around: in the current
+  model one nonnegative number is both *how many* occurrences a `(slot, glyph)`
+  holds and *how opaque* they are, so a nearly-invisible mark is nearly free.
+  A zero-inflated count splits that -- a gate prices *whether* the site fires
+  and a base rate of order one prices *how much* -- so a faint occurrence and a
+  solid one both pay `-log(1 - gate)`. At the field's own scale, gate
+  `1 - 2/230400` with base rate 0.5 gives the same expected total of 1.000 and
+  the same price for one whole occurrence (12.85 nats against the plain
+  Poisson's 12.35), but charges 11.654 of it *once*, independent of amplitude.
+  The 1,682-coefficient smear would then cost about 19,600 nats against 26 for
+  two solid glyphs. It is a normalized generative density, so unlike A2 it
+  keeps the importance weights meaningful, and `ZeroInflatedProbs` is already
+  handled throughout `numpyro.contrib.diag_sgd`.
+
+  **The relaxation removes the spike.** `_idx_spec`'s stand-in for
+  `1[k == 0]` is `clip(1 - k, 0, 1)`, which spreads the gate's whole point mass
+  linearly across `(0, 1)`. Measured: the relaxed density there is `log(1 - a)`
+  to four decimals, so the marginal price is `1/(1 - a)` -- **1.00 nats per
+  unit near zero against the plain Poisson's 11.77**. Adding zero inflation
+  naively would make the smear about twelve times *cheaper*, not dearer. Above
+  `a = 1` the base family returns intact, shifted down by 11.654, so the entire
+  gate charge is a cliff immediately below 1 (derivative `-189458` at 1.0) --
+  backwards for a first-order method, which lives in `[0, 0.1]`.
+
+  The fix is one line and one new parameter, `clip(1 - k/zero_width, 0, 1)`, so
+  the width over which a coefficient still counts as "not there" becomes
+  explicit; width 1 is today's behaviour and a small width restores the fixed
+  charge. Recorded in `notes/diag-sgd-count-relaxation-issue.md`, as a *design*
+  question about the density between the integers rather than as an
+  inconsistency -- `_count_log_pmf` uses a hard `value == 0` test and disagrees
+  by up to 12 nats off the integers, but it is only ever evaluated at integers,
+  so the pmf and the extension agree wherever both are defined. I first
+  mis-called that an inconsistency.
+
+  **Confirms A1's arithmetic.** 1,682 coefficients holding 2.0 of total
+  amplitude score 1.2 nats *better* than two coefficients at 1.0, against A1's
+  predicted `gamma` = 0.577 nats per unit, so 1.15 for two units. The prior does
+  not merely tolerate the smear; it pays for it, by the amount A1 says.
+
+  **What it does not fix**: identity and position are separate redundancies. A
+  fixed per-occurrence charge attacks both -- one glyph over three adjacent
+  slots would cost three charges rather than one -- but §27's per-slot simplex
+  attacks neither on its own, because the relaxed count's price is nearly
+  linear in the amplitude, so a flat Dirichlet over identity reproduces the
+  current prior exactly. §27's claim that "a simplex per slot means one location
+  renders one glyph, enforced by construction" holds only for a genuinely
+  one-hot identity, not for a continuous simplex point. Nor does factoring
+  `a[y,x] * w[y,x,k]` help by itself: only the product reaches the likelihood,
+  so the optimizer shrinks whichever factor is cheaper, which is always the
+  count. **The leak is the relaxation, not the parameterization.**
 - **A2. A penalty concave in the amplitude.** `L_p` with `p < 1`, a log-sum
   penalty `sum log(1 + a/eps)`, SCAD or MCP. These genuinely prefer
   concentration. *Objection:* not normalized densities in general, so the model

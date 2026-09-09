@@ -139,6 +139,75 @@ objective. Flooring it changes that density in the far tail — by at most
 it is not obvious that the recurrence's floor and the density's floor should be
 the same number.
 
+## A third issue: the zero-inflation indicator's continuous extension removes the spike
+
+This one is a design decision rather than a numerical defect, and it is the
+same decision as the paragraph above -- what the density should be *between*
+the integers -- in a place where it costs 12 nats instead of 0.05.
+
+`_idx_spec`'s `ZeroInflatedProbs` branch needs a continuous stand-in for
+`1[k == 0]`, and uses
+
+```python
+bump = jnp.clip(1.0 - k, 0.0, 1.0)
+```
+
+which is exact on the integers, as the comment says. Off them it spreads the
+gate's entire point mass **linearly across the whole unit interval**. Since the
+gate carries essentially all the probability, the smeared spike then hides the
+base family completely on `(0, 1)`. Measured for
+`ZeroInflatedPoisson(gate=1 - 2/230400, rate=0.5)` under
+`SmoothedCount.log_prob`:
+
+| `a` | relaxed ZIP | smeared spike, `log(1 - a)` | base family + `log(1 - gate)` |
+|---|---|---|---|
+| 0.001 | -0.0010 | -0.0010 | -12.15 |
+| 0.1 | -0.1054 | -0.1054 | -12.17 |
+| 0.5 | -0.6931 | -0.6931 | -12.38 |
+| 0.9 | -2.3026 | -2.3026 | -12.74 |
+| 0.999 | -6.9051 | -6.9078 | -12.85 |
+| 1.0 | -12.8451 | -- | -12.85 |
+| 2.0 | -14.2314 | -- | -14.23 |
+
+So the relaxed density is the smeared spike on `(0, 1)`, to four decimals, and
+the base family shifted down by `log(1 - gate) = -11.654` from `a = 1` upward,
+to within 0.0025 nats. The spike is not lost; it is stretched into a ramp that
+covers the unit interval, and the slab survives unchanged behind a wall at 1.
+
+**Why that matters.** Zero inflation exists to separate *whether* a site fires
+from *how much* it carries, so that an occurrence costs the same whether its
+contribution is large or tiny. Under this extension it does the opposite. The
+marginal price is `1 / (1 - a)` nats per unit, so **1.00 nats per unit near
+zero**, against **11.77** for a plain Poisson at a matched expected count.
+Relaxing a zero-inflated count is therefore about twelve times *cheaper* per
+unit than relaxing the Poisson it was meant to sparsify, and the entire gate
+charge sits in a cliff immediately below `a = 1` -- the derivative of
+`SmoothedCount.log_prob` at `a = 1.0` is `-189458`. For a first-order method the
+shape is backwards: the region coefficients actually occupy is a gentle
+downhill slope that invites faint marks, and the barrier that should stop them
+is parked where nothing goes.
+
+**This is not an internal inconsistency, which I first thought it was.**
+`_count_log_pmf`'s branch for the same family uses a hard `jnp.where(value == 0,
+...)`, which disagrees with the bump by up to 12 nats off the integers -- but it
+is only ever *evaluated* at integers. `_count_anchor_binary` searches over
+integers, so `center_float` is integer-valued, and `_pmf_ratio_down` is
+documented as taking integer `value`. The pmf and the continuous extension
+agree wherever both are defined, which is what correctness requires.
+
+**Suggested resolution.** Make the width of the bump explicit rather than
+implicitly 1:
+
+```python
+bump = jnp.clip(1.0 - k / zero_width, 0.0, 1.0)
+```
+
+`zero_width = 1.0` reproduces today's behaviour exactly, and a small value
+recovers the fixed per-occurrence charge, at the price of a steeper density near
+zero. Whatever the default, the docstring should say that zero inflation confers
+no sparsity in the relaxed density at width 1, because a user reaching for
+`ZeroInflatedPoisson` is almost always reaching for exactly that sparsity.
+
 ## A second, independent defect: `max_count` truncates silently
 
 `_count_anchor_binary` searches `[0, max_count]`, so a count above that bound
