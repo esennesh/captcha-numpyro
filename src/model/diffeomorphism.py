@@ -24,6 +24,7 @@ __all__ = [
     "jacobian_determinant",
     "fit_coarse_velocity",
     "resize_velocity",
+    "rotate_patches",
     "rotation_velocity",
     "scaling_and_squaring",
     "sparse_diffeomorphic_stamp",
@@ -334,6 +335,61 @@ def resize_velocity(
             f"got {velocity.shape}"
         )
     return jax.image.resize(velocity, (*shape, 2), method=method)
+
+
+def rotate_patches(
+    patches: Float[Array, "*batch kh kw C"],
+    angles: Float[Array, "*batch"],
+) -> Float[Array, "*batch kh kw C"]:
+    r"""Rotate each patch about its own centre by its own angle, in radians.
+
+    Bilinear resampling of the source coordinates, so this is differentiable in
+    both the patch and the angle.
+
+    This is what makes a *continuous* per-slot pose affordable. A rotation is
+    linear in the patch, so it commutes with a sum over dictionary entries:
+
+    .. math::
+
+        \sum_k a_k R_\theta(K_k) = R_\theta\left(\sum_k a_k K_k\right),
+
+    which means one rotation per *slot* suffices rather than one per
+    (slot, glyph). Contract the counts against the dictionary first and there
+    are 2,365 rotations in an 80 x 80 render, not 85,140.
+    """
+    if patches.ndim < 3:
+        raise ValueError(
+            f"patches need trailing shape (kh, kw, C), got {patches.shape}"
+        )
+    height, width = patches.shape[-3:-1]
+    leading = jax.lax.broadcast_shapes(patches.shape[:-3], angles.shape)
+    total = max(1, math.prod(leading))
+    folded = jnp.broadcast_to(patches, leading + patches.shape[-3:]).reshape(
+        (total,) + patches.shape[-3:]
+    )
+    turns = jnp.broadcast_to(angles, leading).reshape((total,))
+
+    grid = coordinate_grid((height, width), dtype=patches.dtype)
+    centre = jnp.asarray(
+        [(height - 1) / 2.0, (width - 1) / 2.0], dtype=patches.dtype
+    )
+    offset = grid - centre
+
+    def rotate_one(patch, angle):
+        # Backward sampling: to move the CONTENT by +angle, read the source at
+        # the inverse rotation of each output pixel. The sign is chosen so that
+        # a positive angle turns a patch the same way `scipy.ndimage.rotate`
+        # does, which is the convention the matched-filter measurements in
+        # notes/diffeomorphic-glyphs.md use.
+        cosine, sine = jnp.cos(angle), jnp.sin(angle)
+        source = jnp.stack((
+            centre[0] + cosine * offset[..., 0] + sine * offset[..., 1],
+            centre[1] - sine * offset[..., 0] + cosine * offset[..., 1],
+        ), axis=-1)
+        return bilinear_sample(patch, source)
+
+    rotated = jax.vmap(rotate_one)(folded, turns)
+    return rotated.reshape(leading + rotated.shape[-3:])
 
 
 def rotation_velocity(

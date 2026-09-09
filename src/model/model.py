@@ -8,11 +8,7 @@ from flax import nnx
 from jaxtyping import Array
 from numpyro.contrib.module import nnx_module
 
-from src.data.dictionary import (
-    ShapeDictionary,
-    pose_augmented_dictionary,
-    von_mises_pose_weights,
-)
+from src.data.dictionary import ShapeDictionary
 from src.distributions import (
     CompleteGaussianMrf,
     LocallyScaledGaussianMrf,
@@ -28,6 +24,7 @@ from src.model.diffeomorphism import (
     affine_free_velocity,
     boundary_taper,
     diffeomorphic_warp,
+    rotate_patches,
     translation_free_velocity,
 )
 
@@ -515,39 +512,57 @@ class TexturedDiffeomorphicPoissonConvPlacements(PoissonConvPlacements):
         return warped.reshape(leading + ink_shape)
 
 
-class PoseAugmentedPlacements(TexturedDiffeomorphicPoissonConvPlacements):
-    r"""Discrete per-occurrence pose, carried by the dictionary and the rate.
+class SlotPosePlacements(TexturedDiffeomorphicPoissonConvPlacements):
+    r"""One continuous rotation per spatial slot, shared by whatever it stamps.
 
-    The dictionary is pre-rotated to one entry per (glyph, angle) pair, so a
-    per-occurrence pose is a choice of dictionary entry and the renderer stays a
-    single transposed convolution. The Poisson rate then carries the pose prior:
+    The count field keeps its ``(R, O, K)`` shape and gains a companion field of
+    angles,
 
     .. math::
 
-        \lambda(y,x,k,\alpha)
-        = \frac{\text{expected count}}{RCK}\, w(\alpha),\qquad
-        w(\alpha)\propto\exp(\kappa\cos\theta_\alpha),
+        \theta_{ro}\sim\operatorname{vonMises}(0,\kappa),\qquad
+        \kappa=\sigma^{-2},
 
-    with ``w`` summing to one over angles. Summing the rate over both glyph and
-    angle therefore reproduces the unaugmented total, so ``expected_count``
-    keeps its calibration and only the *distribution* over pose is new.
+    so pose belongs to the *location* and applies to every glyph centred there.
+    The optical depth is
 
-    **Why this pairs with an affine-free warp.** ``affine_free_velocity`` was
-    originally justified on the grounds that translation, rotation, scale and
-    shear are "redundant with glyph placement and pose latents", and §26 found
-    that premise false for this renderer because *there was no pose latent* --
-    conditioning the affine modes out simply deleted rotation from the model.
-    This class supplies the missing latent, which makes the premise true. Ladder
-    A2 is the reason to want it: on five upright images that A1 solves 10/10,
-    enabling the continuous warp dropped identity to 4/10 at no cost in log
-    joint, because 200 velocity coordinates can deform a wrong glyph into the
-    right shape. A categorical over 13 angles can turn a glyph and cannot turn
-    an ``X`` into an ``N``.
+    .. math::
 
-    The cost is the count field's width: ``K`` becomes ``K A``, so 43 x 55 x 468
-    is 1.1 million coordinates against 85,140. §27 notes that a *factorized*
-    identity-and-pose latent would need only 320,000, which is the follow-up;
-    this class buys the experiment without the slot refactor.
+        \tau(p)=\sum_{r,o} R_{\theta_{ro}}\!\left(
+            \sum_k a_{rok}K_k\right)(p-(r,o)),
+
+    which is affordable because a rotation is **linear in the patch** and so
+    commutes with the sum over ``k``: contract the counts against the dictionary
+    first and there is one rotation per slot rather than one per (slot, glyph).
+    An 80 x 80 render needs 2,365 rotations, not 85,140.
+
+    Why this rather than a pre-rotated dictionary of ``K A`` entries, which is
+    what an earlier version of this file did:
+
+    ==========================  ==============  ==================
+    \                           per-slot angle  (glyph, angle) pair
+    ==========================  ==============  ==================
+    latents                     **87,505**      1,106,820
+    render, one laptop core     **5 ms**        240 ms
+    pose                        **continuous**  13 atoms
+    pose needs a relaxation     **no**          yes
+    ==========================  ==============  ==================
+
+    The last row matters most. A continuous angle has a ``Circular`` support
+    that ``biject_to`` handles, so ``AutoMAPProposal`` treats it as an ordinary
+    continuous site with a transformed Normal proposal. There is no DSGD
+    relaxation for pose, no finite-discrete site, and none of §27's
+    two-hour exact-update problem.
+
+    Two things to know. The rotation acts in **optical-depth space**, on the
+    ink kernel's ``tau`` and ``tau * hue`` channels, rather than on the alpha
+    coverage mask; ``tau = -log(1 - alpha)`` is nonlinear, so this differs from
+    rotating alpha and then converting, by an anti-aliasing effect at glyph
+    edges. Depth space is where §2 already has counts adding, so it is the
+    model's own convention, and it is what makes the rotation commute with the
+    glyph sum. And a rotation cannot change a glyph's topology, so this cannot
+    turn an ``X`` into an ``N``; §26 records that the warp never did that either,
+    and that what it actually did was assemble a committee of fragments.
     """
 
     def __init__(
@@ -557,45 +572,108 @@ class PoseAugmentedPlacements(TexturedDiffeomorphicPoissonConvPlacements):
         img_h: int = 80,
         img_w: int = 80,
         *,
-        pose_angles=range(-30, 31, 5),
         pose_sigma_degrees: float = 10.0,
         **kwargs,
     ):
-        augmented, angles = pose_augmented_dictionary(shape_dict, pose_angles)
-        super().__init__(augmented, expected_count, img_h, img_w, **kwargs)
-        self.pose_angles = angles
+        super().__init__(shape_dict, expected_count, img_h, img_w, **kwargs)
+        if not self.require_on_canvas:
+            raise ValueError(
+                "SlotPosePlacements needs require_on_canvas=True: it scatters "
+                "each slot's patch at a fixed offset, which assumes every frame "
+                "lands on the canvas."
+            )
+        if pose_sigma_degrees <= 0.0:
+            raise ValueError(
+                f"pose_sigma_degrees must be positive, got {pose_sigma_degrees}"
+            )
         self.pose_sigma_degrees = pose_sigma_degrees
-        self.pose_weights = von_mises_pose_weights(angles, pose_sigma_degrees)
 
     @property
-    def num_poses(self) -> int:
-        return len(self.pose_angles)
+    def pose_concentration(self) -> float:
+        r"""``kappa = 1 / sigma^2`` in radians, so a von Mises of that width.
 
-    @property
-    def num_glyphs(self) -> int:
-        """Dictionary entries per pose, i.e. the unaugmented glyph count."""
-        return self.num_features // self.num_poses
-
-    def sample_counts(self):
-        """Draw the count field with a von Mises pose prior in its rate.
-
-        The rate is angle-major to match
-        :func:`~src.data.dictionary.pose_augmented_dictionary`'s entry order, and
-        ``log_rate`` remains a single learnable scalar so the *shape* of the pose
-        prior is fixed while its overall level still learns.
+        ``sigma = 10`` degrees matches the 9.81 degree standard deviation
+        measured over the twenty glyphs in ``data/examples``. It charges 0.50
+        nats at 10 degrees, 4.39 at 30 and 65.6 at 180, so a flip is expensive
+        without being forbidden. The prior is weak against a glyph signal of
+        order 800 nats and will not by itself prevent a spurious rotation; see
+        §27.
         """
-        log_rate = numpyro.param(
-            "log_rate",
-            jnp.log(self.expected_count / (
-                math.prod(self.count_shape) * self.num_glyphs
-            )),
+        return float(1.0 / math.radians(self.pose_sigma_degrees) ** 2)
+
+    def sample_pose(self) -> Array:
+        """Draw one angle per slot, shape ``(1, *count_shape)``."""
+        return numpyro.sample(
+            "pose",
+            dist.VonMises(
+                jnp.zeros(self.count_shape, dtype=self.ink_kernel.dtype),
+                jnp.asarray(self.pose_concentration,
+                            dtype=self.ink_kernel.dtype),
+            ).to_event(2),
         )
-        weights = jnp.repeat(self.pose_weights, self.num_glyphs)
-        rate = jnp.exp(log_rate) * weights
-        rate = jnp.broadcast_to(
-            rate, (1, *self.count_shape, self.num_features)
+
+    def pose_ink_field(self, counts: Array, pose: Array,
+                       color_field: Array | None = None) -> Array:
+        """Contract, rotate per slot, and scatter-add into an ink field.
+
+        Replaces :meth:`PoissonConvPlacements.ink_field` for this class. The
+        counts stay on :attr:`count_shape`; the result is on the image grid, so
+        there is no :meth:`to_image_grid` call in this path.
+        """
+        kernel = (
+            self.ink_kernel
+            if color_field is None
+            else _ink_kernel(self.shape_dict.shapes, color_field)
         )
-        return numpyro.sample("a", dist.Poisson(rate).to_event(3))
+        leading = jax.lax.broadcast_shapes(
+            counts.shape[:-3], pose.shape[:-2], kernel.shape[:-4]
+        )
+        total = max(1, math.prod(leading))
+        counts = jnp.broadcast_to(
+            counts, leading + counts.shape[-3:]
+        ).reshape((total,) + counts.shape[-3:])
+        pose = jnp.broadcast_to(pose, leading + pose.shape[-2:]).reshape(
+            (total,) + pose.shape[-2:]
+        )
+        kernel = jnp.broadcast_to(
+            kernel, leading + kernel.shape[-4:]
+        ).reshape((total,) + kernel.shape[-4:])
+        stamped = jax.vmap(self._stamp_one_pose)(counts, pose, kernel)
+        return stamped.reshape(leading + stamped.shape[-3:])
+
+    def _stamp_one_pose(self, counts: Array, pose: Array,
+                        kernel: Array) -> Array:
+        kernel_height, kernel_width, channels = kernel.shape[:3]
+        rows, columns = counts.shape[:2]
+        # (K, kh, kw, C), then one ink patch per slot
+        patches = jnp.moveaxis(kernel, -1, 0)
+        slots = jnp.einsum("rok,khwc->rohwc", counts, patches)
+        rotated = rotate_patches(slots, pose)
+        # `count_origin` cancels the stamp's own half-kernel offset, so slot
+        # (r, o) lays its frame down with its top-left corner exactly at (r, o).
+        row_index = (
+            jnp.arange(rows)[:, None, None, None]
+            + jnp.arange(kernel_height)[None, None, :, None]
+        )
+        column_index = (
+            jnp.arange(columns)[None, :, None, None]
+            + jnp.arange(kernel_width)[None, None, None, :]
+        )
+        canvas = jnp.zeros(
+            (self.height, self.width, channels), dtype=kernel.dtype
+        )
+        return jnp.clip(
+            canvas.at[row_index, column_index].add(rotated), 0.0, None
+        )
+
+    def __call__(self, color: Array | None = None, rngs=None):
+        if color is None:
+            raise ValueError("SlotPosePlacements needs an RGB baseline color")
+        del rngs
+        counts = self.sample_counts()
+        pose = self.sample_pose()
+        modulation = self.color_modulation(color)
+        return self.warp_ink(self.pose_ink_field(counts, pose, modulation))
 
 
 class PaperGmrfBackground(nnx.Module):

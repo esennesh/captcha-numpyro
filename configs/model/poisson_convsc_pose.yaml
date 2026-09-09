@@ -18,31 +18,37 @@
 # right shape. A categorical over 13 angles can turn a glyph and cannot turn an
 # X into an N.
 #
-# COST. The count field's feature axis becomes K x A = 36 x 13 = 468, so with
-# the on-canvas constraint it holds 43 x 55 x 468 = 1,106,820 coordinates
-# against 85,140. Section 27 notes a factorized identity-and-pose latent would
-# need only 320,000; that is the slot refactor, and this config buys the
-# experiment without it.
+# HOW. Pose is one continuous angle per spatial slot, shared by whatever glyphs
+# are centred there. That is affordable because a rotation is linear in the
+# patch and so commutes with the sum over dictionary entries: contract the
+# counts against the dictionary first and an 80 x 80 render needs one rotation
+# per slot -- 2,365 -- rather than one per (slot, glyph).
+#
+# It replaces an earlier pre-rotated dictionary of K x A entries, on every axis:
+#
+#                            per-slot angle   (glyph, angle) pair
+#   latents                        87,505               1,106,820
+#   render, one laptop core           5 ms                  240 ms
+#   pose                        continuous                13 atoms
+#   needs a relaxation                  no                     yes
+#
+# The last row matters most. A Circular support is one `biject_to` handles, so
+# AutoMAPProposal treats pose as an ordinary continuous site with a transformed
+# Normal proposal: no DSGD relaxation, no finite-discrete site, and none of
+# section 27's two-hour exact-update problem.
 
 defaults:
   - poisson_convsc_gmrf
   - _self_
 
 placements:
-  _target_: src.model.model.PoseAugmentedPlacements
+  _target_: src.model.model.SlotPosePlacements
 
-  # Thirteen atoms from -30 to +30 degrees. The measured rotations over the
-  # twenty glyphs in data/examples have a standard deviation of 9.81 degrees
-  # about zero and a maximum magnitude of 25, so this support covers the data
-  # with a little margin.
-  pose_angles: [-30, -25, -20, -15, -10, -5, 0, 5, 10, 15, 20, 25, 30]
-
-  # sigma = 10 matches that 9.81, and it is the largest width at which the prior
-  # and the atom set still agree with each other: at 15 degrees a full von Mises
-  # wants 4.8% of its mass outside plus-or-minus 30 degrees. The resulting
-  # weights run 0.199 upright to 0.0024 at the ends, so the prior is weak -- 4.4
-  # nats at 30 degrees against a glyph signal of order 800 -- and will not by
-  # itself stop a spurious rotation. Pose has to be disciplined by the
+  # sigma = 10 degrees matches the 9.81 degree standard deviation measured over
+  # the twenty glyphs in data/examples. It charges 0.50 nats at 10 degrees, 4.39
+  # at 30 and 65.6 at 180, so a flip is expensive without being forbidden. The
+  # prior is weak against a glyph signal of order 800 nats and will not by
+  # itself prevent a spurious rotation -- pose has to be disciplined by the
   # likelihood and by how few slots are occupied. See section 27.
   pose_sigma_degrees: 10.0
 
@@ -50,10 +56,10 @@ placements:
   warp_modes: affine
 
   # 5.0 -> 1.5, the value that predated section 26. The amplitude was raised to
-  # 5.0 only so that the warp could afford the rotations the model had no other
-  # way to express; with pose explicit, the warp is left to supply genuinely
-  # non-rigid residual and does not need the reach. Worth trying at 5.0 as a
-  # one-flag variation --  ++model.placements.warp_scale=5.0 -- to see whether
-  # the extra freedom starts eating identity again even with the affine modes
+  # 5.0 only so the warp could afford rotations the model had no other way to
+  # express; with pose explicit the warp is left to supply genuinely non-rigid
+  # residual and does not need the reach. Worth trying at 5.0 as a one-flag
+  # variation -- ++model.placements.warp_scale=5.0 -- to see whether the extra
+  # freedom starts assembling committees again even with the affine modes
   # conditioned out.
   warp_scale: 1.5

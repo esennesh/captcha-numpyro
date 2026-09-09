@@ -2348,95 +2348,75 @@ work:
    the log target does not decompose over slots, because the render is a sum
    over all of them. Worth thinking about; not worth blocking on.
 
-### The discrete pose beats the warp at its own job, measured
+### One continuous rotation per slot beats both the warp and a discrete pose
 
-`configs/model/poisson_convsc_pose` builds the first step: the dictionary is
-pre-rotated to one entry per (glyph, angle) pair, so pose is a choice of
-dictionary entry and the renderer stays one transposed convolution, and the
-Poisson rate carries the von Mises prior. `expected_count` keeps its
-calibration, because the rate is the old per-(site, glyph) value split across
-angles by weights that sum to one.
+`configs/model/poisson_convsc_pose` gives each spatial slot a single continuous
+angle, shared by whatever glyphs are centred there:
 
-Placing the correct glyph at the correct site in each pose block, with the
-affine-free warp at zero, and scoring the log joint against a blank canvas:
+```
+theta[r,o] ~ vonMises(0, kappa),   kappa = sigma^-2,   sigma = 10 degrees
+tau(p)     = sum_{r,o} R_theta[r,o]( sum_k a[r,o,k] K_k )(p - (r,o))
+```
 
-| pose | `0000_LJ` (+25 by matched filter) | `0000_N6` (upright) |
+The objection to a continuous per-slot pose was that a convolution shares one
+kernel across locations. That is true and it does not matter, because a
+**rotation is linear in the patch** and therefore commutes with the sum over
+dictionary entries:
+
+```
+sum_k a_k R_theta(K_k) = R_theta( sum_k a_k K_k )
+```
+
+verified to 1e-5. So contract the counts against the dictionary first and an
+80 x 80 render needs one rotation per *slot* -- 2,365 -- rather than one per
+(slot, glyph). This replaced a pre-rotated dictionary of `K A` entries, and
+improves on it in every dimension:
+
+| | per-slot angle | (glyph, angle) pair |
 |---|---|---|
-| -30 | -2,555 | +445 |
-| -15 | -759 | +2,173 |
-| -5 | +829 | **+3,419** |
-| **0** | +1,852 | +3,352 |
-| +15 | +5,996 | +1,960 |
-| +20 | +7,131 | +1,390 |
-| **+25** | **+7,533** | +975 |
-| +30 | +6,850 | +659 |
+| latents | **87,505** | 1,106,820 |
+| render, one laptop core | **5 ms** | 240 ms |
+| pose | **continuous** | 13 atoms |
+| pose needs a relaxation | **no** | yes |
 
-Both curves are smooth and unimodal, `0000_LJ` peaks at exactly the +25 degrees
-the matched filter measured, and `0000_N6` is flat between -5 and +5 -- its
-best is -5 at +3,419 against +0 at +3,352, a 67-nat difference inside the
-measurement's own 5-degree quantization. So the convention agrees with the
-matched filter and an upright glyph is not handed a spurious rotation.
+The last row is the one that changes the most. A `Circular` support is one
+`biject_to` handles, so `AutoMAPProposal` treats pose as an ordinary continuous
+site with a transformed Normal proposal: no DSGD relaxation, no finite-discrete
+site, and none of §27's two-hour exact-update problem.
 
-**The comparison with the warp is the point.** On `0000_LJ` the correct pose is
-worth **+5,681 nats** over upright, and the von Mises charges
-`log(0.199 / 0.0092) = 3.08` nats per glyph for it, 6.2 for the pair. The warp
-route to the same rotation was worth +3,223 nats at a prior cost of 42 --
-translation-free at `warp_scale = 5.0` -- and **-2,660** under the affine-free
-conditioning this config restores. So the discrete pose is both a larger gain
-and a thirtyfold cheaper one, and unlike the warp it cannot deform an ``X`` into
-an ``N`` on the way.
+**It recovers the angle, and plain gradient descent finds it.** Placing the
+correct glyphs at the correct slots with the affine-free warp at zero, sweeping
+one shared angle:
 
-That is the argument for the pair: with pose explicit the warp is left to
-supply genuinely non-rigid residual, which is the only thing §26 ever showed it
-was needed for, and the affine-free conditioning that §26 called a mistake
-becomes correct because the premise it rested on -- that the affine modes are
-redundant with a pose latent -- is now true.
+| | `0000_LJ` (+25 by matched filter) | `0000_N6` (upright) |
+|---|---|---|
+| best angle | **+25** | -5 |
+| gain at the best angle | **+5,376** | +57 |
+| Adam from zero finds | **+22.1, +25.8** | +1.0, -4.2 |
+| its gain | +5,365 | +267 |
 
-### What this build is, precisely, and what it does not guarantee
+`0000_LJ` peaks at exactly the +25 degrees the matched filter measured, and
+Adam started at zero lands within three degrees of it -- something a categorical
+pose could only reach by enumeration. `0000_N6` stays within five degrees of
+upright and gains 57 nats for it, so an upright glyph is not handed a spurious
+rotation. The rotation sign was checked against `scipy.ndimage.rotate`, which
+the matched-filter measurements use, to an agreement of 1.0000.
 
-It is **not** a von Mises latent and **not** a categorical one. There is no
-pose random variable at all. It is a **marked Poisson process**: 468
-independent Poisson coordinates per site, one per (glyph, angle) pair, whose
-*rates* are modulated by the discretized von Mises. Conditional on exactly one
-stamp at a site the pose distribution is that von Mises, but unconditionally
-pose is a property of whichever coordinate fired rather than a variable with a
-distribution.
+Two numbers to read carefully.
 
-The consequence is that nothing forbids several poses, or several glyphs,
-firing at one site -- which §27's simplex would forbid by construction. So
-"a discrete pose *cannot* deform an X into an N" overstates it. The correct
-statement is that it cannot do so cheaply. Measured on `0000_LJ` against a
-blank canvas of 10,141, with the warp at zero:
+The gain is **+5,376** where the pre-rotated dictionary gave +5,681 for the same
+deformation, a 5% shortfall. That is the price of rotating in **optical-depth
+space** rather than on the alpha coverage mask: `tau = -log(1 - alpha)` is
+nonlinear, so rotating tau and rotating alpha differ by an anti-aliasing effect
+at glyph edges. Depth space is where §2 already has counts adding, and it is
+what makes the rotation commute with the glyph sum, so it is the right trade --
+but it is a real 5%.
 
-| configuration | vs blank |
-|---|---|
-| correct glyphs, pose +25, one stamp each | +7,533 |
-| correct glyphs, poses +20 **and** +25 stacked | **+7,556** |
-| correct glyphs, five poses stacked | +6,016 |
-| correct glyphs, pose 0 | +1,852 |
-| five *different* glyphs at pose +25 | **-2,598** |
-| wrong glyphs (X, Y) across five poses | **-5,577** |
-| wrong glyphs (X, Y) across all thirteen poses | **-13,508** |
-
-Superposing wrong glyphs is thousands of nats *worse than placing no ink at
-all*, and 13,110 nats worse than the correct single stamps. The reason is not
-the count prior, which charges only 11.58 nats per unit at pose 0 and 14.66 at
-+25; it is that stacking piles opaque ink at one place, `tau` saturates, and the
-render over-inks. Compare ladder A2, where the continuous warp absorbed glyph
-identity at *no* cost in log joint. So the substance holds, as a measured
-barrier rather than an impossibility.
-
-One real hedging incentive survives: two *adjacent* correct poses stacked score
-+7,556 against +7,533 for committing to one, so the model mildly prefers to
-blend +20 with +25. Twenty-three nats against seven thousand is a wobble rather
-than a pathology, and the relaxed target does not amplify it -- five poses at
-0.2 each score +7,414, slightly worse than one full stamp. If the guarantee is
-wanted rather than the cost, that is §27's simplex, and it needs the slot
-refactor and the guide work.
-
-Cost: the feature axis becomes `K A = 468`, so the count field holds
-`43 x 55 x 468 = 1,106,820` coordinates against 85,140. §27's factorized
-identity-and-pose latent would need 320,000; that is the slot refactor.
+And the *base* is 13,943 rather than the 11,993 the pre-rotated build reported
+for the same counts at pose 0. The difference is 1,944 nats and it is a
+constant: the pose field contributes `2,365 x log p(0) = 2,365 x 0.822` from its
+own von Mises normalizer at every slot, occupied or not. Only *differences* in
+log joint are comparable across the two builds.
 
 ### Implementation order
 
