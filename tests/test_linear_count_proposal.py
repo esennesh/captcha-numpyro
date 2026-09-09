@@ -21,6 +21,7 @@ from src.data.dictionary import ShapeDictionary
 from src.inference.linear_count_proposal import (
     LinearCountMAPProposal,
     count_block_adam,
+    pose_step_size,
 )
 from src.inference.map_proposal_online import (
     MAPProposalCaptchaInference,
@@ -159,3 +160,39 @@ def test_step_sizes_must_be_positive():
         count_block_adam(count_step_size=0.0)
     with pytest.raises(ValueError):
         count_block_adam(step_size=-1.0)
+
+
+def test_named_step_sizes_override_the_default():
+    """`pose` needs its own scale: one unconstrained unit is 90 degrees."""
+    optimizer = count_block_adam(
+        count_step_size=1e-3, step_size=0.05, step_sizes={"pose": 0.02}
+    )
+    parameters = {"a": jnp.ones((2,)), "pose": jnp.zeros((2,)),
+                  "color": jnp.ones((2,))}
+    state = optimizer.init(parameters)
+    updates, _ = optax.with_extra_args_support(optimizer).update(
+        {name: jnp.ones_like(value) for name, value in parameters.items()},
+        state, parameters,
+    )
+    np.testing.assert_allclose(float(updates["a"][0]), -1e-3, rtol=1e-4)
+    np.testing.assert_allclose(float(updates["pose"][0]), -0.02, rtol=1e-4)
+    np.testing.assert_allclose(float(updates["color"][0]), -0.05, rtol=1e-4)
+
+
+def test_pose_step_size_converts_degrees_through_the_circular_jacobian():
+    """biject_to(circular) has derivative pi/2 at zero, so a unit is 90 deg."""
+    import math
+
+    np.testing.assert_allclose(
+        pose_step_size(1.8), math.radians(1.8) / (math.pi / 2.0), rtol=1e-9
+    )
+    np.testing.assert_allclose(pose_step_size(90.0), 1.0, rtol=1e-9)
+    # the config's plain 0.02 has to agree with the helper it replaced
+    np.testing.assert_allclose(pose_step_size(1.8), 0.02, rtol=2e-3)
+    with pytest.raises(ValueError, match="degrees"):
+        pose_step_size(0.0)
+
+
+def test_named_step_sizes_must_be_positive():
+    with pytest.raises(ValueError, match="positive"):
+        count_block_adam(step_sizes={"pose": 0.0})

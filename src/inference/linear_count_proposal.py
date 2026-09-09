@@ -39,13 +39,14 @@ one off. That is the same mechanism the notebook's support threshold exploits,
 without the hard pruning step.
 """
 
-from typing import Sequence
+import math
+from typing import Mapping, Sequence
 
 import optax
 from numpyro.contrib.map_proposal import AutoMAPProposal
 from numpyro.distributions.transforms import IdentityTransform
 
-__all__ = ["LinearCountMAPProposal", "count_block_adam"]
+__all__ = ["LinearCountMAPProposal", "count_block_adam", "pose_step_size"]
 
 
 class LinearCountMAPProposal(AutoMAPProposal):
@@ -78,8 +79,16 @@ def count_block_adam(
     count_step_size: float = 1e-3,
     step_size: float = 1e-2,
     count_sites: Sequence[str] = ("a",),
+    step_sizes: Mapping[str, float] | None = None,
 ) -> optax.GradientTransformation:
     """Adam with a separate, projected step size for the count block.
+
+    ``step_sizes`` gives any other site its own step, which matters wherever a
+    site's unconstrained parameterization is not to scale. ``pose`` is the
+    example: ``biject_to(circular)`` is a squashed sigmoid whose derivative at
+    zero is ``pi / 2``, so one unit of the unconstrained parameter is 90 degrees
+    and the default 0.05 would move pose 4.5 degrees per step -- almost half the
+    width of its own prior. See :func:`pose_step_size`.
 
     ``count_sites`` names the sites :class:`LinearCountMAPProposal` keeps in
     linear space. They are matched by site name because the optimizer is built
@@ -90,23 +99,48 @@ def count_block_adam(
     which reach a useful count amplitude in about 40 steps rather than the 219
     the logarithmic parameterization needs.
     """
+    step_sizes = dict(step_sizes or {})
     if count_step_size <= 0 or step_size <= 0:
         raise ValueError("step sizes need to be positive")
+    if any(value <= 0 for value in step_sizes.values()):
+        raise ValueError("step sizes need to be positive")
     names = frozenset(count_sites)
+    named = {name: f"site:{name}" for name in step_sizes}
 
     def labels(parameters):
         return {
-            name: ("counts" if name in names else "other") for name in parameters
+            name: ("counts" if name in names else named.get(name, "other"))
+            for name in parameters
         }
 
-    return optax.multi_transform(
-        {
-            # `keep_params_nonnegative` clips the update so that `p + u >= 0`,
-            # and optax requires it last in the chain.
-            "counts": optax.chain(
-                optax.adam(count_step_size), optax.keep_params_nonnegative()
-            ),
-            "other": optax.adam(step_size),
-        },
-        labels,
+    transforms = {
+        # `keep_params_nonnegative` clips the update so that `p + u >= 0`, and
+        # optax requires it last in the chain.
+        "counts": optax.chain(
+            optax.adam(count_step_size), optax.keep_params_nonnegative()
+        ),
+        "other": optax.adam(step_size),
+    }
+    transforms.update(
+        {named[name]: optax.adam(value) for name, value in step_sizes.items()}
     )
+    return optax.multi_transform(transforms, labels)
+
+
+def pose_step_size(degrees: float = 1.8) -> float:
+    r"""Unconstrained step that moves a circular pose about ``degrees``.
+
+    ``biject_to(constraints.circular)`` is ``Sigmoid`` composed with an affine
+    map onto ``(-pi, pi)``, so its derivative at zero is ``pi / 2``: one unit of
+    the unconstrained parameter is 90 degrees of pose. The distortion away from
+    zero is mild over the range this model uses -- the derivative at 25 degrees
+    is 0.978 of its value at zero, a 2% change -- so a single step size is
+    adequate and only its scale needs setting.
+
+    1.8 degrees is about a fifth of the pose prior's own 10-degree width and
+    finer than the 5-degree grid the matched-filter measurements resolve, so a
+    fit will settle inside the measurement's own uncertainty.
+    """
+    if degrees <= 0.0:
+        raise ValueError(f"degrees must be positive, got {degrees}")
+    return float(math.radians(degrees) / (math.pi / 2.0))

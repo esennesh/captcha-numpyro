@@ -69,3 +69,28 @@ map_optimizer:
   count_step_size: 1.0e-3
   step_size: 5.0e-2
   count_sites: [a]
+  # `pose`, where the model has one, needs its own scale. numpyro warns that
+  # "continuous inference poorly handles circular sample site 'pose'", and it is
+  # right about the reason: biject_to(circular) is Sigmoid composed with an
+  # affine map onto (-pi, pi), so its derivative at zero is pi/2 and ONE UNIT OF
+  # THE UNCONSTRAINED PARAMETER IS 90 DEGREES. At the shared 5e-2 a step would
+  # move pose 4.5 degrees, almost half its own prior's width.
+  #
+  # The distortion itself is mild over the range this model uses -- the
+  # derivative at 25 degrees is 0.978 of its value at zero, a 2% change -- so
+  # only the scale needs fixing, not the parameterization. pose_step_size(1.8)
+  # gives 1.8 degrees per step: a fifth of the prior's width, finer than the
+  # 5-degree grid the matched filter resolves, and 14 steps from upright to 25.
+  #
+  # numpyro's suggested CircularReparam would make the geometry exactly linear
+  # and remove the cut at +-pi, but it costs two things measured on 2026-09-08:
+  # the model becomes UNTRACEABLE, because ImproperUniform has no `.sample`, so
+  # prior-predictive draws and `experiments.py prior-recovery` stop working; and
+  # `init_to_sample` silently degrades to init_to_uniform on the unwrapped site,
+  # which starts pose uniform over +-115 degrees instead of near zero. Not worth
+  # it while the posterior sits inside +-30 degrees and the cut at +-180 already
+  # costs 65.6 nats of von Mises prior.
+  # 0.02 unconstrained = radians(1.8) / (pi/2). A plain number rather than a
+  # `_target_` call, so this config never depends on a helper being present.
+  step_sizes:
+    pose: 0.02
