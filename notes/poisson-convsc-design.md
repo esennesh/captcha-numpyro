@@ -2365,6 +2365,48 @@ was needed for, and the affine-free conditioning that §26 called a mistake
 becomes correct because the premise it rested on -- that the affine modes are
 redundant with a pose latent -- is now true.
 
+### What this build is, precisely, and what it does not guarantee
+
+It is **not** a von Mises latent and **not** a categorical one. There is no
+pose random variable at all. It is a **marked Poisson process**: 468
+independent Poisson coordinates per site, one per (glyph, angle) pair, whose
+*rates* are modulated by the discretized von Mises. Conditional on exactly one
+stamp at a site the pose distribution is that von Mises, but unconditionally
+pose is a property of whichever coordinate fired rather than a variable with a
+distribution.
+
+The consequence is that nothing forbids several poses, or several glyphs,
+firing at one site -- which §27's simplex would forbid by construction. So
+"a discrete pose *cannot* deform an X into an N" overstates it. The correct
+statement is that it cannot do so cheaply. Measured on `0000_LJ` against a
+blank canvas of 10,141, with the warp at zero:
+
+| configuration | vs blank |
+|---|---|
+| correct glyphs, pose +25, one stamp each | +7,533 |
+| correct glyphs, poses +20 **and** +25 stacked | **+7,556** |
+| correct glyphs, five poses stacked | +6,016 |
+| correct glyphs, pose 0 | +1,852 |
+| five *different* glyphs at pose +25 | **-2,598** |
+| wrong glyphs (X, Y) across five poses | **-5,577** |
+| wrong glyphs (X, Y) across all thirteen poses | **-13,508** |
+
+Superposing wrong glyphs is thousands of nats *worse than placing no ink at
+all*, and 13,110 nats worse than the correct single stamps. The reason is not
+the count prior, which charges only 11.58 nats per unit at pose 0 and 14.66 at
++25; it is that stacking piles opaque ink at one place, `tau` saturates, and the
+render over-inks. Compare ladder A2, where the continuous warp absorbed glyph
+identity at *no* cost in log joint. So the substance holds, as a measured
+barrier rather than an impossibility.
+
+One real hedging incentive survives: two *adjacent* correct poses stacked score
++7,556 against +7,533 for committing to one, so the model mildly prefers to
+blend +20 with +25. Twenty-three nats against seven thousand is a wobble rather
+than a pathology, and the relaxed target does not amplify it -- five poses at
+0.2 each score +7,414, slightly worse than one full stamp. If the guarantee is
+wanted rather than the cost, that is §27's simplex, and it needs the slot
+refactor and the guide work.
+
 Cost: the feature axis becomes `K A = 468`, so the count field holds
 `43 x 55 x 468 = 1,106,820` coordinates against 85,140. §27's factorized
 identity-and-pose latent would need 320,000; that is the slot refactor.
