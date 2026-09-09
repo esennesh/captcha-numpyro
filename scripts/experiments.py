@@ -46,6 +46,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import rootutils
+import yaml
 from numpyro import handlers
 from omegaconf import OmegaConf
 from PIL import Image
@@ -76,6 +77,26 @@ def load_image(path, shape):
 
 MODEL_CONFIG = "model/poisson_convsc_gmrf"
 
+# Filled from `--set key=value` before any subcommand runs. `compose` folds
+# these in underneath the per-subcommand overrides, so a dedicated flag such as
+# `--warp-scale` still wins over a `--set placements.warp_scale`.
+BASE_OVERRIDES: dict = {}
+
+
+def parse_setting(text):
+    """``placements.require_on_canvas=false`` -> the key and a typed value.
+
+    Values go through the YAML scalar parser, which is the one hydra itself
+    uses, so ``false``, ``False``, ``1.5``, ``8`` and ``coverage`` all arrive as
+    the type the config expects rather than as strings.
+    """
+    key, separator, value = text.partition("=")
+    if not separator or not key:
+        raise argparse.ArgumentTypeError(
+            f"--set needs key=value, got {text!r}"
+        )
+    return key, yaml.safe_load(value)
+
 
 def compose(model_overrides=None, online_name="online/map_proposal_linear",
             model_name=None):
@@ -91,7 +112,7 @@ def compose(model_overrides=None, online_name="online/map_proposal_linear",
     model_config.model.placements.shape_dict.path = str(
         PROJECT_ROOT / "data/captcha_sandbox/dictionary"
     )
-    for key, value in (model_overrides or {}).items():
+    for key, value in {**BASE_OVERRIDES, **(model_overrides or {})}.items():
         node, _, leaf = key.rpartition(".")
         target = model_config.model
         for part in node.split(".") if node else []:
@@ -490,6 +511,14 @@ def parse_args():
     )
     parser.add_argument("--output", default=None, type=Path)
     parser.add_argument(
+        "--set", dest="settings", default=[], action="append", type=parse_setting,
+        metavar="KEY=VALUE",
+        help="override a model config key, e.g. "
+             "--set placements.require_on_canvas=false. Keys are relative to "
+             "the `model` node, dotted for nesting, and every subcommand "
+             "honours them.",
+    )
+    parser.add_argument(
         "--no-reference", action="store_true",
         help="skip the pinned-at-zero count fit that glyph_evidence needs, "
              "halving the runtime",
@@ -541,4 +570,7 @@ def parse_args():
 if __name__ == "__main__":
     arguments = parse_args()
     globals()["MODEL_CONFIG"] = arguments.model_config
+    BASE_OVERRIDES.update(dict(arguments.settings or []))
+    if BASE_OVERRIDES:
+        print("model overrides: %s" % BASE_OVERRIDES, flush=True)
     arguments.function(arguments)

@@ -148,7 +148,93 @@ def test_the_model_runs_and_pose_carries_a_gradient():
 
 
 def test_bad_settings_are_rejected():
-    with pytest.raises(ValueError, match="require_on_canvas"):
-        make_placements(require_on_canvas=False)
     with pytest.raises(ValueError, match="pose_sigma_degrees"):
         make_placements(pose_sigma_degrees=0.0)
+
+
+def test_the_free_grid_reproduces_the_constrained_one_in_the_interior():
+    """Dropping `require_on_canvas` must not move any glyph that already fit.
+
+    The two grids differ by `count_origin`, so a slot at ``(r, o)`` under the
+    constraint is the slot at ``(r + oy, o + ox)`` without it, and both are the
+    same glyph centre. This is the check that the padded scatter is a strict
+    generalization rather than a shift.
+    """
+    tight = make_placements()
+    free = make_placements(require_on_canvas=False)
+    assert free.count_shape == (SIDE, SIDE)
+    assert free.count_origin == (0, 0)
+    origin_y, origin_x = tight.count_origin
+
+    rows, columns = tight.count_shape
+    slot = (rows // 2, columns // 2)
+    angle = jnp.radians(31.0)
+
+    counts = jnp.zeros((rows, columns, 2)).at[slot[0], slot[1], 0].set(0.7)
+    pose = jnp.zeros((rows, columns)).at[slot].set(angle)
+    constrained = tight.pose_ink_field(counts, pose)
+
+    centre = (slot[0] + origin_y, slot[1] + origin_x)
+    counts = jnp.zeros((SIDE, SIDE, 2)).at[centre[0], centre[1], 0].set(0.7)
+    pose = jnp.zeros((SIDE, SIDE)).at[centre].set(angle)
+    unconstrained = free.pose_ink_field(counts, pose)
+
+    np.testing.assert_allclose(
+        np.asarray(constrained), np.asarray(unconstrained), atol=1e-6
+    )
+
+
+def test_the_free_grid_crops_an_edge_glyph_instead_of_wrapping_it():
+    """A frame hanging off the canvas renders a sliver, not a torus.
+
+    Getting this wrong is silent: a negative index wraps a glyph to the
+    opposite edge, and JAX's out-of-bounds scatter drops it entirely. The
+    padded canvas does neither.
+    """
+    free = make_placements(require_on_canvas=False)
+    kernel_height, kernel_width = free.ink_kernel.shape[:2]
+    interior = free.pose_ink_field(
+        jnp.zeros((SIDE, SIDE, 2)).at[SIDE // 2, SIDE // 2, 0].set(1.0),
+        jnp.zeros((SIDE, SIDE)),
+    )
+    whole = float(jnp.sum(interior[..., 3]))
+
+    # A centre one pixel inside the left edge keeps only the right half of a
+    # bar whose ink is on its own centre column, so it renders nothing at all;
+    # a centre at the top edge keeps the lower half of the bar.
+    top = free.pose_ink_field(
+        jnp.zeros((SIDE, SIDE, 2)).at[0, SIDE // 2, 0].set(1.0),
+        jnp.zeros((SIDE, SIDE)),
+    )
+    part = float(jnp.sum(top[..., 3]))
+    assert 0.0 < part < whole
+    # nothing wrapped to the far edge
+    assert float(jnp.sum(top[-(kernel_height // 2):, ..., 3])) == 0.0
+
+    left = free.pose_ink_field(
+        jnp.zeros((SIDE, SIDE, 2)).at[SIDE // 2, 0, 1].set(1.0),
+        jnp.zeros((SIDE, SIDE)),
+    )
+    assert 0.0 <= float(jnp.sum(left[..., 3])) < whole
+    assert float(jnp.sum(left[:, -(kernel_width // 2):, 3])) == 0.0
+
+
+def test_the_free_grid_still_traces_and_carries_gradients():
+    placements = make_placements(require_on_canvas=False)
+    model = functools.partial(poisson_convsc_model, placements=placements,
+                              likelihood="gmrf")
+    image = jnp.full((1, SIDE, SIDE, 3), 0.95).at[:, 8:15, 12, :].set(0.2)
+    model_trace = trace(seed(model, jax.random.PRNGKey(0))).get_trace(
+        image, plot_mean=True
+    )
+    assert model_trace["a"]["value"].shape == (1, SIDE, SIDE, 2)
+    assert model_trace["pose"]["value"].shape == (1, SIDE, SIDE)
+    values = {name: site["value"] for name, site in model_trace.items()
+              if site["type"] == "sample" and not site["is_observed"]}
+    relaxed = dict(values, a=values["a"].astype(jnp.float32) + 0.3)
+    gradients = jax.grad(
+        lambda v: log_density(model, (image,), {}, v)[0]
+    )(relaxed)
+    for name, gradient in gradients.items():
+        assert np.isfinite(np.asarray(gradient)).all(), name
+    assert np.abs(np.asarray(gradients["pose"])).max() > 0.0

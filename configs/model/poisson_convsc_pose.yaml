@@ -55,11 +55,21 @@ placements:
   # Back to affine-free, which is the whole point of the pair above.
   warp_modes: affine
 
+  # C3 off. Ladder S2 measured it: on the five rotated images the constraint
+  # excluded three of the twenty true glyph slots, and lifting it takes identity
+  # from 3/10 to 6/10 with the three recoveries being exactly those slots --
+  # A@(39,76), Z@(40,74), S@(44,75) -- for +1,294 nats of glyph evidence in
+  # total. Half-visible rim stamps return, so A3's fragments were not a warp
+  # artifact, but they now coexist with correct glyphs rather than replacing
+  # them and they cover real ink. `0000_LJ`, whose two glyphs were both inside
+  # the bound, is the only image that loses (-535 nats). See section 26.
+  require_on_canvas: false
+
   # 5.0 -> 1.5, the value that predated section 26. The amplitude was raised to
   # 5.0 only so the warp could afford rotations the model had no other way to
   # express; with pose explicit the warp is left to supply genuinely non-rigid
   # residual and does not need the reach. Worth trying at 5.0 as a one-flag
-  # variation -- ++model.placements.warp_scale=5.0 -- to see whether the extra
+  # variation -- --set placements.warp_scale=5.0 -- to see whether the extra
   # freedom starts assembling committees again even with the affine modes
   # conditioned out.
   warp_scale: 1.5

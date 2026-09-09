@@ -272,11 +272,26 @@ class PoissonConvPlacements(nnx.Module):
 
         The data therefore does contain partially visible glyphs, and the
         margin is tight: the data reaches 58% visible where the fragments A3
-        exploited sat at 50%. Eight percentage points is not much room for a
-        hard threshold, so the open question is whether the constraint is still
-        needed at all now that pose is explicit and the warp is affine-free --
-        A3's fragments may have been a warp artifact. ``require_on_canvas=False``
-        runs that test.
+        exploited sat at 50%.
+
+        **Ladder S2 settled it: turn this off.** With
+        ``require_on_canvas=False`` on the same five rotated images, identity
+        goes from 3/10 to 6/10 and the three recoveries are exactly the three
+        slots excluded above -- ``A@(39,76)`` at rank 3, ``Z@(40,74)`` at rank 0
+        and ``S@(44,75)`` at rank 1. Total glyph evidence rises 5,243 to 6,537.
+        The constraint was not a conservative safeguard; it was deleting the
+        answer.
+
+        Half-visible rim stamps *do* come back, so A3's fragments were not a
+        warp artifact -- that hypothesis was wrong. They are no longer the
+        pathology they were in A3, though: they coexist with correct glyphs
+        instead of replacing them, and they cover real ink, up to 230 of 546
+        pixels below ``paper - 0.15`` and reaching the image's global minimum,
+        because the rim is where these images actually put glyphs. Identifying
+        a glyph from half its evidence is a separate problem from restricting
+        where centres may sit. ``0000_LJ`` is the one image that loses (-535
+        nats), and it is the one whose glyphs were both inside the bound
+        already. See §26.
 
         It also weakens §1's equivariance claim from exact to
         exact-within-the-interior.
@@ -591,12 +606,6 @@ class SlotPosePlacements(TexturedDiffeomorphicPoissonConvPlacements):
         **kwargs,
     ):
         super().__init__(shape_dict, expected_count, img_h, img_w, **kwargs)
-        if not self.require_on_canvas:
-            raise ValueError(
-                "SlotPosePlacements needs require_on_canvas=True: it scatters "
-                "each slot's patch at a fixed offset, which assumes every frame "
-                "lands on the canvas."
-            )
         if pose_sigma_degrees <= 0.0:
             raise ValueError(
                 f"pose_sigma_degrees must be positive, got {pose_sigma_degrees}"
@@ -664,21 +673,33 @@ class SlotPosePlacements(TexturedDiffeomorphicPoissonConvPlacements):
         patches = jnp.moveaxis(kernel, -1, 0)
         slots = jnp.einsum("rok,khwc->rohwc", counts, patches)
         rotated = rotate_patches(slots, pose)
-        # `count_origin` cancels the stamp's own half-kernel offset, so slot
-        # (r, o) lays its frame down with its top-left corner exactly at (r, o).
+        # Slot (r, o) is a glyph *centre* at `(r, o) + count_origin`, so its
+        # frame's top-left corner sits half a kernel above and left of that.
+        # Scatter into a canvas padded by half a kernel on every side and crop
+        # afterwards: a frame that hangs off the image then lands in the margin
+        # rather than wrapping around (what a negative index would do) or
+        # vanishing (what JAX's out-of-bounds scatter would do). Adding
+        # `count_origin` and then cropping `half` cancels under
+        # `require_on_canvas`, where `count_origin == half`, so that path is
+        # unchanged.
+        origin_y, origin_x = self.count_origin
+        half_y, half_x = (kernel_height - 1) // 2, (kernel_width - 1) // 2
         row_index = (
-            jnp.arange(rows)[:, None, None, None]
+            jnp.arange(rows)[:, None, None, None] + origin_y
             + jnp.arange(kernel_height)[None, None, :, None]
         )
         column_index = (
-            jnp.arange(columns)[None, :, None, None]
+            jnp.arange(columns)[None, :, None, None] + origin_x
             + jnp.arange(kernel_width)[None, None, None, :]
         )
         canvas = jnp.zeros(
-            (self.height, self.width, channels), dtype=kernel.dtype
+            (self.height + kernel_height, self.width + kernel_width, channels),
+            dtype=kernel.dtype,
         )
+        stamped = canvas.at[row_index, column_index].add(rotated)
         return jnp.clip(
-            canvas.at[row_index, column_index].add(rotated), 0.0, None
+            stamped[half_y:half_y + self.height, half_x:half_x + self.width],
+            0.0, None,
         )
 
     def __call__(self, color: Array | None = None, rngs=None):

@@ -2479,7 +2479,131 @@ A3's fragments sat at 50%. So the first question is whether the constraint is
 still earning its keep now that pose is explicit and the warp is affine-free:
 A3's fragments may have been a warp artifact, in which case
 `require_on_canvas=False` on this same run would keep `peak_visible_area` near
-one and the bound can simply go. That test is free.
+one and the bound can simply go.
+
+### The C3 test was not runnable, and a replicate instead measured the noise
+
+Two things blocked it, both of my own making, and both are now fixed.
+
+`scripts/experiments.py` was pure `argparse` with no hydra passthrough, so the
+`++model.placements.require_on_canvas=False` I proposed was not a flag it could
+accept. It now takes `--set key=value`, repeatable, applied under every
+subcommand's own overrides, with values parsed by the YAML scalar reader so
+`false`, `8` and `coverage` arrive as the type the config wants:
+
+```
+uv run python scripts/experiments.py --model-config model/poisson_convsc_pose \
+  --set placements.require_on_canvas=false \
+  --output logs/pose-rotated-nocanvas.json examples --group rotated
+```
+
+`SlotPosePlacements` then *rejected* the setting outright, with a `ValueError`
+I had written into it: `_stamp_one_pose` scatters slot `(r, o)`'s frame with its
+top-left corner at exactly `(r, o)`, which is only in bounds because C3 makes
+`count_origin` cancel the half-kernel offset. Off the constrained grid that
+index runs from `-18` to `98` on an 80-pixel axis, and neither out-of-range
+behaviour is acceptable: a negative index **wraps** a glyph to the opposite
+edge, and JAX's out-of-bounds scatter **drops** it silently.
+
+The fix is to scatter into a canvas padded by half a kernel on each side, add
+`count_origin` to the index, and crop the pad away afterwards. A frame hanging
+off the image lands in the margin and the crop discards exactly the part that
+is off-canvas -- which is the cropping `_stamp` already does in the
+convolutional path. Adding `count_origin` and cropping `half` cancel under C3,
+where they are the same number, so that path is unchanged; a test asserts the
+two grids render one glyph identically to 1e-6, and another asserts an edge
+glyph is cropped rather than wrapped.
+
+**The run that came back was therefore a replicate of S1, not the test**, which
+is worth recording because it dates the noise floor. `exact_zeros` is 84,491 to
+84,871 in both, against the 85,140 sites of the constrained grid, so C3 was
+still on. Over the five rotated images, at identical settings and seed:
+
+| quantity | spread between the two runs |
+|---|---|
+| `glyph_evidence` | 0.3 to 15.7 nats (max 1.4%) |
+| `log_joint` | 0.3 to 16.2 nats |
+| `map_steps` | 0 to 180 |
+| `coefficients` | 1 to 13 (max 5.9%) |
+| `identity_recall` | unchanged on all five |
+| `truth_rank` | `[0, 67]`->`[0, 85]`, `[49, 21]`->`[40, 17]`, `[14, 362]`->`[14, 439]` |
+
+So an evidence difference under about 20 nats is noise, as is a `truth_rank`
+change of a fifth in the tail. Every comparison in section 26 that turns on
+hundreds or thousands of nats survives this; none of them rest on a margin that
+small. The GPU's non-deterministic reductions are the obvious source, since the
+seed and the configuration were identical.
+
+### Ladder S2: C3 off. It costs three glyphs and it was not buying what I thought
+
+The run with `--set placements.require_on_canvas=false`, same five rotated
+images, same seed, everything else identical:
+
+| image | glyph evidence | identity | mean visible area of the top six |
+|---|---|---|---|
+| | C3 on -> off | C3 on -> off | C3 on -> off |
+| `0000_LJ` | 1485.6 -> **950.4** | 2 -> 2 | 1.00 -> 0.92 |
+| `0001_JA` | 1095.2 -> **1601.7** | 1 -> **2** | 1.00 -> 0.63 |
+| `0002_QS` | 1186.3 -> **1639.1** | 0 -> **1** | 1.00 -> 0.81 |
+| `0003_7Z` | 577.3 -> **983.3** | 0 -> **1** | 1.00 -> 0.76 |
+| `0004_7D` | 898.3 -> **1362.0** | 0 -> 0 | 1.00 -> 0.59 |
+| total | 5242.7 -> **6536.5** | **3/10 -> 6/10** | |
+
+**First, which numbers are comparable.** `log_joint` rose by 2,785 to 3,726
+nats, and none of that is fit. `blank_log_joint` -- the same model with the
+counts pinned at zero -- rose by exactly 3320.1 nats on every one of the five
+images. That is the pose prior: the free grid has 6,400 slots against C3's
+2,365, a von Mises at `sigma = 10` degrees has log density `+0.8228` nats at its
+own mode, and `4035 x 0.8228 = 3320.1`. Predicted and measured agree to a tenth
+of a nat on all five. So a continuous site's prior mass makes `log_joint`
+incomparable across grid sizes, and `glyph_evidence` -- which differences that
+term away -- is the only score that may be read across this pair. This is what
+the blank reference is for.
+
+**Identity doubles, and the three recoveries are exactly C3's three excluded
+slots.** `A@(39,76)` at rank 3, `Z@(40,74)` at rank 0, `S@(44,75)` at rank 1.
+The bound was not a conservative safeguard; it was deleting the answer.
+
+**My "warp artifact" hypothesis was wrong.** Half-visible rim stamps come
+straight back with the warp conditioned affine-free and pose explicit, so the
+50%-visibility degeneracy is not something the warp was causing. Mean visible
+area over the top six peaks falls from 1.00 to 0.59-0.92, and about half the
+listed peaks sit in column 79 or column 0 at exactly 50% visible.
+
+**But they are not the A3 pathology, on two counts.** In A3 the fragments *were*
+the answer -- 21 of 30 top peaks under 75% visible, on the run with the highest
+evidence and the worst identity. Here they coexist with correct glyphs while
+identity is the best it has ever been. And they cover real ink: the frame of
+`0001_JA`'s `1@(50,79)` holds 176 of 546 pixels below `paper - 0.15`,
+`0004_7D`'s `1@(42,79)` holds 230, and both reach their image's global minimum.
+The rim of these images is where the data actually puts glyphs -- `0001_JA`'s
+`A` at `x = 76`, `0004_7D`'s `D` at 77 -- so a stamp there is covering
+something, and a `1` is simply the cheapest primitive that renders a bare
+stroke when half its frame is cropped away.
+
+**The one regression is `0000_LJ`**: -535 nats, `truth_rank` `[1, 0]` ->
+`[1, 2]`, with a rim `1@(38,79)` taking the top peak. Its rim frame holds only
+74 of 546 dark pixels, the least of the five, so that stamp is the least
+justified of them -- and `0000_LJ` is the one image whose glyphs were both
+inside C3 already, which is why it had nothing to gain and something to lose.
+`0002_QS`'s `L@(40,0)`, at 24 of 546, is the other unjustified one, and it is
+also the smallest count in any peak list at 0.040.
+
+**The matched filter's 6/10 is not a ceiling.** The model and the filter now
+both score 6/10 but disagree about *which* six: on `0002_QS` the filter gets
+`Q@(40,50)` and calls the other slot `B@(41,66)`, while the model misses `Q`
+(rank 176, putting `0@(38,49)` there) and gets `S@(44,75)` at rank 1. The union
+of the two methods is 7/10. What neither reaches is the `7` in both
+seven-images, where both substitute `1`, and `0004_7D`'s `D`.
+
+**A soft version of C3 is already ruled out.** Weighting the count rate by
+visible fraction is the obvious "charge full price per unit of rendered ink"
+fix, and it cannot work here for the reason recorded in `count_shape`: the rate
+enters the prior as `a log(rate)`, so at the observed amplitude of 0.1 a factor
+of 0.5 costs `0.1 x log 2 = 0.07` nats against fragments worth hundreds.
+
+So C3 should go, and the rim behaviour is a separate question about identifying
+a glyph from half its evidence rather than about where centres are allowed.
 
 ### Implementation order
 
