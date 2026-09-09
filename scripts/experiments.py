@@ -172,6 +172,20 @@ def summarize(result, model, image, truth=None, blank_log_joint=None, top=6):
         record["glyph_evidence"] = round(record["log_joint"] - blank_log_joint, 1)
     if truth is not None:
         record["truth"] = "".join(truth)
+        # Where does the truth's own class actually rank? Top-k membership
+        # conflates "the model has no idea" with "the model knows but ranks
+        # fragments of other classes above it", and ladder A2 turned out to be
+        # the second: with the warp on, three to five distinct classes appear in
+        # the top six and the true class is present but outranked and displaced.
+        ranking = np.argsort(counts.ravel())[::-1]
+        classes = np.asarray(names)[
+            np.unravel_index(ranking, counts.shape)[3]
+        ]
+        record["truth_rank"] = [
+            int(np.flatnonzero(classes == character)[0])
+            if (classes == character).any() else None
+            for character in dict.fromkeys(truth)
+        ]
         # Multiset match, so a repeated character can score twice: `0001_OO`
         # holds two `O`s, and two `O` peaks is a full recovery rather than a
         # half one. Each peak may satisfy at most one truth character.
@@ -295,9 +309,9 @@ def experiment_examples(arguments):
             for p in record["peaks"]), flush=True)
     print("\n=== summary ===")
     print_rows(records, ["image", "glyph_evidence", "identity_recall",
-                         "identity_total", "truth", "peak_visible_area",
-                         "count_total", "count_max", "coefficients", "rmse",
-                         "map_steps", "map_converged"])
+                         "identity_total", "truth", "truth_rank",
+                         "peak_visible_area", "count_total", "coefficients",
+                         "rmse", "map_steps", "map_converged"])
     write(records, arguments.output)
 
 

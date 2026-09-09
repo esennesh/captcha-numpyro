@@ -2158,21 +2158,48 @@ as A1 with the warp *enabled*; A3 is the five rotated ones.
 | A2, upright, warp | **4/10** | +1,490 to +2,557 | 1/30 | 0.98 |
 | A3, rotated, warp | **3/10** | +349 to +1,594 | **21/30** | **0.66** |
 
-**A2: the warp absorbs identity, and it is nearly free.** On the same images
-that A1 solves 10/10, enabling the warp drops identity to 4/10 while the log
-joint barely moves -- some images gain evidence, some lose it. The positions
-stay right and the *labels* go wrong: `X@(44,58)` for a true `N@(45,56)`,
-`I@(44,53)` for a true `V@(46,53)`, `J@(47,55)` for a true `N`. With 200
-continuous velocity coordinates the model can deform a wrong glyph into the
-right shape, so glyph identity is not identified, and the warp wins the
-competition for the ink. Three of the five runs also hit the 1,500-step cap
+**A2: the warp lets a committee of wrong glyphs cover the ink.** On the same
+images that A1 solves 10/10, enabling the warp drops identity to 4/10 while the
+log joint barely moves. Three of the five runs also hit the 1,500-step cap
 without converging, against none in A1.
 
-This is the joint-identification claim of §26 demonstrated directly rather than
-inferred, and it is the argument for §27's **discrete** pose. A per-slot
-categorical over 13 angles can turn a glyph; it cannot deform an `X` into an
-`N`. Replacing 200 continuous coordinates with one categorical per slot removes
-exactly the freedom that is eating identity.
+An earlier version of this section said the warp "deforms a wrong glyph into
+the right shape". **That is impossible and the claim was wrong.** A
+diffeomorphism is a homeomorphism, so it preserves topology: an `X` has a
+degree-four branch point and an `N` is a simple arc, and removing the `X`'s
+centre leaves four components where removing any interior point of an arc
+leaves two. Nothing continuous carries one onto the other.
+
+What the run actually does is composite. Comparing the top six coefficients:
+
+| | distinct classes in the top six | total amplitude | coefficients |
+|---|---|---|---|
+| A1, warp off | 1 to 3 | 0.60 to 0.94 | 466 to 1,084 |
+| A2, warp on | **3 to 5** | **1.02 to 2.42** | 494 to 1,052 |
+
+With the warp off the peaks are clusters of *one* class at *one* place --
+`O@(38,60)`, `O@(37,60)`; `J@(32,53)`, `J@(32,52)`, `J@(33,53)` -- so the model
+commits. With the warp on, `0003_LN` puts five distinct classes in its top six,
+`7@(39,36)`, `J@(47,55)`, `L@(47,63)`, `1@(51,42)`, `I@(47,60)`, and the total
+amplitude roughly doubles over a similar number of coefficients. So the warp
+does not *substitute* one glyph for another; it **adds**, recruiting about twice
+the ink from several classes at several slots and bending each fragment into
+position. You cannot deform an `X` into an `N`, but you can add a `1` and a `7`
+and part of an `X` and get something `N`-shaped.
+
+Two consequences follow, and neither is what the earlier version claimed.
+
+A per-slot simplex does **not** address this, because the fragments sit on
+*different slots*. What is missing is sparsity pressure: nothing forces the
+model to commit to one class per glyph. So §28's group A is **re-motivated in
+the presence of the warp** -- the step-size fix that made it unnecessary was
+measured with the warp off.
+
+And the case for an explicit pose latent is not that it forbids deformation,
+which never happened, but that it lets a *correct* glyph reach the shape the
+data has, so the correct glyph can win outright instead of losing to a
+committee. On `0000_LJ` the correct pose is worth +5,681 nats over upright,
+which is the margin a committee would have to beat.
 
 **A3: edge-cropped stamps act as a generic ink primitive.** 21 of A3's 30 top
 peaks have less than three quarters of their glyph frame on the canvas, and
