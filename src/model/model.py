@@ -261,10 +261,25 @@ class PoissonConvPlacements(nnx.Module):
         0.1 even a factor of 1e-12 costs only 2.8 nats against fragments worth
         hundreds.
 
-        All twelve measured glyph centres in ``data/examples`` sit fully inside
-        (``x`` from 14 to 60 against a half-width of 12), so this constrains the
-        model rather than the data. It does weaken §1's equivariance claim from
-        exact to exact-within-the-interior, which is the intended trade.
+        **The justification for this was wrong and it costs real glyph slots.**
+        It was checked against twelve centres -- the five upright examples plus
+        ``0000_LJ`` -- whose ``x`` runs 14 to 60 against a half-width of 12. The
+        other four rotated examples were never checked, and they hold glyphs at
+        ``x`` of 74, 76 and 77, whose frames are only 69%, 62% and 58% on the
+        canvas. So this constraint excludes **3 of the 20 measured glyph slots**:
+        ``0001_JA``'s ``A@(40,76)``, ``0003_7Z``'s ``Z@(42,74)`` and
+        ``0004_7D``'s ``L@(41,77)``. Ladder S1 misses exactly those positions.
+
+        The data therefore does contain partially visible glyphs, and the
+        margin is tight: the data reaches 58% visible where the fragments A3
+        exploited sat at 50%. Eight percentage points is not much room for a
+        hard threshold, so the open question is whether the constraint is still
+        needed at all now that pose is explicit and the warp is affine-free --
+        A3's fragments may have been a warp artifact. ``require_on_canvas=False``
+        runs that test.
+
+        It also weakens §1's equivariance claim from exact to
+        exact-within-the-interior.
         """
         if not self.require_on_canvas:
             return (self.height, self.width)

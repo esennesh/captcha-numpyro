@@ -2216,10 +2216,10 @@ in that run. `scripts/experiments.py` now reports `peak_visible_area` next to
 the evidence for exactly this reason; treat a low value as a warning that the
 evidence was bought with fragments.
 
-All twelve measured glyph centres in `data/examples` sit fully inside the
-canvas -- `x` from 14 to 60 against a half-width of 12 -- so requiring a stamp
-to fit is a structural constraint on the model rather than an
-observation-derived restriction of the kind §12 removed. It is item C3 of §28.
+Requiring a stamp to fit is a structural constraint on the model rather than an
+observation-derived restriction of the kind §12 removed, and it is item C3 of
+§28. **The bound I chose for it was wrong**; see "C3 excludes three true glyph
+slots" below.
 
 ---
 
@@ -2417,6 +2417,69 @@ for the same counts at pose 0. The difference is 1,944 nats and it is a
 constant: the pose field contributes `2,365 x log p(0) = 2,365 x 0.822` from its
 own von Mises normalizer at every slot, occupied or not. Only *differences* in
 log joint are comparable across the two builds.
+
+### Ladder S1, and C3 excludes three true glyph slots
+
+2026-09-08, rotated set, per-slot pose with the affine-free warp.
+
+| image | evidence | identity | `truth_rank` | visible | counts | RMSE |
+|---|---|---|---|---|---|---|
+| `0000_LJ` | +1,486 | **2/2** | **[1, 0]** | 1.0 | 0.97 | 0.123 |
+| `0001_JA` | +1,094 | 1/2 | [0, **67**] | 1.0 | 0.88 | 0.158 |
+| `0002_QS` | +1,176 | 0/2 | [6, **151**] | 1.0 | 1.17 | 0.128 |
+| `0003_7Z` | +581 | 0/2 | [**49**, 21] | 1.0 | 0.30 | 0.095 |
+| `0004_7D` | +883 | 0/2 | [14, **362**] | 1.0 | 0.59 | 0.134 |
+
+Three things to read here, and only one of them is about inference.
+
+**The committee is gone and C3 works.** `peak_visible_area` is 1.0 on every
+image, against A3's 0.66, so no fragment painting. `0000_LJ` is solved: two
+distinct classes in its top six, `truth_rank [1, 0]`, and peaks one to two
+pixels from the matched filter's. Against A3's +349 and 1/2 on the same image
+this is a real gain, but **the evidence numbers are not comparable across the
+two runs** -- A3 bought part of its evidence with the 50%-visible fragments C3
+now forbids, which is exactly the gameability `peak_visible_area` was added to
+expose. A drop in evidence with a rise in visible area is honesty, not
+regression.
+
+**The right baseline is the matched filter, and it scores 6 out of 10 here,
+not 10.** The filter is the adjoint of the generative stamp, and on the rotated
+set it substitutes `1` for `7` on both seven-images and `1` for `D`:
+
+| image | truth | matched filter | filter | model | model |
+|---|---|---|---|---|---|
+| `0000_LJ` | LJ | `L@(41,24)`, `J@(45,59)` | 2/2 | `J@(44,57)`, `L@(41,23)` | **2/2** |
+| `0001_JA` | JA | `J@(44,18)`, `A@(40,76)` | 2/2 | `J@(37,65)`, `J@(42,17)` | 1/2 |
+| `0002_QS` | QS | `Q@(40,50)`, `B@(41,66)` | 1/2 | `C@(41,66)`, `O@(37,49)` | 0/2 |
+| `0003_7Z` | 7Z | `Z@(42,74)`, `1@(41,31)` | 1/2 | `J@(44,65)`, `1@(39,31)` | 0/2 |
+| `0004_7D` | 7D | `L@(41,77)`, `1@(41,31)` | 0/2 | `1@(39,30)`, `1@(38,66)` | 0/2 |
+| | | | **6/10** | | **3/10** |
+
+The model reproduces the filter's *localization* closely, including its
+mistakes -- it puts `C@(41,66)` on the filter's own `B@(41,66)` slot, and
+`1@(39,31)` on its `1@(41,31)`. So the simpler-glyph substitution is not an
+inference artifact; it is what correlating this dictionary against this data
+does.
+
+**Two of the three glyphs the model loses are slots C3 forbade.** C3 admits
+centres with ``x`` in [12, 66], and the filter puts `0001_JA`'s `A` at 76,
+`0003_7Z`'s `Z` at 74 and `0004_7D`'s `L` at 77 -- frames only 62%, 69% and 58%
+on the canvas. Those are three of the twenty measured slots, all on the rotated
+set, and they are exactly the positions S1 misses. The docstring's claim that
+every measured centre sits fully inside was checked on the upright five plus
+`0000_LJ` and never on the other four.
+
+So after accounting for the filter's ceiling and C3's exclusion, the genuine
+identity gap is **one glyph**: `0002_QS`'s `Q`, where the position was
+available, the filter got it, and the model put an `O` and a `C` there with `Q`
+ranking sixth.
+
+The margin C3 needs is uncomfortably tight -- the data reaches 58% visible and
+A3's fragments sat at 50%. So the first question is whether the constraint is
+still earning its keep now that pose is explicit and the warp is affine-free:
+A3's fragments may have been a warp artifact, in which case
+`require_on_canvas=False` on this same run would keep `peak_visible_area` near
+one and the bound can simply go. That test is free.
 
 ### Implementation order
 
