@@ -234,19 +234,28 @@ predict the boundary of a short smoke run, because a narrow window reaches the
 underflow later, but it only postponed the failure, and the pod run hit it as
 soon as the concentration climbed.
 
-`src/inference/count_relaxation.py` keeps the tails in linear space long enough
-to floor them at the smallest positive *normal* float before taking a
-logarithm, so `logdiffexp` never receives an infinity. Flooring at the smallest
-normal rather than at exact zero is deliberate: the reciprocal of a denormal is
-already $\infty$, and `1/x` appears in the derivative of `log`. The price is a
-discrepancy of at most 0.011 nats, confined to log densities below about $-79$,
-i.e. probabilities near $10^{-35}$. After the repair every combination up to
-concentration 500 and $W=32$ has a finite gradient.
+The repair keeps the tails in linear space long enough to floor them at the
+smallest positive *normal* float before taking a logarithm, so `logdiffexp`
+never receives an infinity. Flooring at the smallest normal rather than at exact
+zero is deliberate: the reciprocal of a denormal is already $\infty$, and `1/x`
+appears in the derivative of `log`. The price is a discrepancy of at most 0.011
+nats, confined to log densities below about $-79$, i.e. probabilities near
+$10^{-35}$. After the repair every combination up to concentration 500 and
+$W=32$ has a finite gradient.
 
-`patch_count_log_pmf` probes for the defect rather than reading a version, so
-it becomes a no-op the moment the
-[fork](https://github.com/esennesh/numpyro/tree/codex/map-proposal) carries the
-floor itself, which is where it belongs.
+**Fixed upstream, 2026-09-09.** We carried this as a monkey-patch in
+`src/inference/count_relaxation.py`, which probed for the defect rather than
+reading a version so that it would become a no-op once the
+[fork](https://github.com/esennesh/numpyro/tree/codex/map-proposal) carried the
+floor itself. It now does, at commit `4ca6f62`, and in a better place: the floor
+is inside `GammaCount.log_prob` in `numpyro/distributions/discrete.py`, and the
+same commit deleted `diag_sgd._gamma_count_log_pmf` and rerouted every
+`_idx_spec` family through its own distribution's `log_prob`, so there is one
+definition per family instead of two. Re-measured against it: the reproduction
+that returned NaN now returns a gradient of 7.3825, and all 18 cells of the
+(concentration, width) grid above are finite. The shim and its tests were
+removed. The branch was force-pushed in the process, so the commit this note
+originally cited, `8a11fcaf`, is no longer an ancestor of its head.
 
 Enabling float64 does **not** fix this, only postpone it: at rate $10^{-3}$ a
 concentration of 7.4 is already past the float32 boundary and 54.6 is past the

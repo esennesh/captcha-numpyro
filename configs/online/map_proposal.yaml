@@ -21,8 +21,9 @@ dsgd_kwargs:
   # incomplete-gamma tail that has underflowed to zero, and although the value
   # it returns is right, the derivative is NaN. The proposal phase then hands
   # `eval_and_stable_update` a NaN gradient, every update is discarded, and the
-  # only visible symptom is a loss history of NaN. That is repaired in
-  # src/inference/count_relaxation.py and belongs upstream.
+  # only visible symptom is a loss history of NaN. Fixed upstream in numpyro
+  # commit 4ca6f62, which floors the four incomplete-gamma tails at finfo.tiny
+  # inside `GammaCount.log_prob`; we carried a local shim until 2026-09-09.
   #
   # What actually drove it was the *fitted* GammaCount concentration, not the
   # rate and not the width. It starts at one and the proposal objective pushes

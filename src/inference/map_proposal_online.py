@@ -39,14 +39,6 @@ from numpyro.contrib.map_proposal import AutoMAPProposal
 from numpyro.infer.initialization import init_to_sample
 from numpyro.infer.util import get_importance_trace
 
-from src.inference.count_relaxation import patch_count_log_pmf
-
-# Repair the Gamma-count log PMF before any relaxed count is differentiated.
-# Without it the proposal phase silently reports NaN losses and never moves;
-# see :mod:`src.inference.count_relaxation`. A no-op once upstream carries the
-# fix.
-patch_count_log_pmf()
-
 # The DSGD relaxation of a count site has support ``(0, inf)``, so its
 # unconstrained representation is a logarithm and no positive count can be
 # initialized at zero. This floor is the smallest count the initializer will
