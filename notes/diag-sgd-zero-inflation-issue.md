@@ -1,18 +1,5 @@
 # `diag_sgd`: the zero-inflation continuation removes the sparsity zero inflation is for
 
-*Draft issue for `esennesh/numpyro`, branch `codex/map-proposal`, commit
-`4ca6f62`. Not filed yet.*
-
-*Supersedes an earlier draft about `_gamma_count_log_pmf`'s NaN gradient at an
-underflowed Gamma-count tail. That defect is **fixed** on this commit: the four
-incomplete-gamma tails are now floored at `finfo.tiny` before `jnp.log` inside
-`GammaCount.log_prob`, `_gamma_count_log_pmf` is gone from `diag_sgd`, and every
-`_idx_spec` family delegates to its distribution's own `log_prob`, so there is
-one definition per family rather than two. Re-measured: the old reproduction
-returns a gradient of 7.3825 where it returned NaN, and all 18 cells of the old
-(concentration, width) failure grid are finite. Two items from that draft
-survive in weakened form and are recorded at the end.*
-
 ## Summary
 
 `_idx_spec`'s `ZeroInflatedProbs` branch continues `1[k == 0]` to non-integer
