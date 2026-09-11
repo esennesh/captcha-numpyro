@@ -2665,6 +2665,50 @@ be separated from the stopping noise until a fixed budget has been run on
 both. If it survives, `--no-reference` isolates the one structural difference
 between the two paths, which is that the script fits a blank reference first.
 
+### Removing early stopping exposed an overshoot it had been hiding
+
+*2026-09-10, same day.* The fixed budget works mechanically -- all five
+images take 1500 steps -- and the results are worse, because the trajectory
+has an interior optimum and Adam walks away from it. Blank references agree
+to a tenth of a nat between the two runs, so this is a clean comparison:
+
+| image | steps | log joint | steps | log joint | change |
+|---|---|---|---|---|---|
+| `0000_LJ` | 640 | 39009.8 | 1500 | 38309.6 | **-700.2** |
+| `0001_JA` | 660 | 39862.5 | 1500 | 39779.8 | -82.7 |
+| `0002_QS` | 640 | 39817.9 | 1500 | 38276.6 | **-1541.3** |
+| `0003_7Z` | 1500 | 40400.9 | 1500 | 40351.5 | -49.4 |
+| `0004_7D` | 880 | 40013.4 | 1500 | 40126.9 | +113.5 |
+
+More optimization, a worse objective. The optimizer returns its **last**
+iterate rather than its best, and Adam at a fixed step size does not converge
+to a point -- with 230,400 coordinates each moving about `count_step_size` per
+step regardless of how small the gradient has become, the count field inflates.
+`0000_LJ` shows it plainly: peak amplitudes double, 0.111 to 0.204, and
+`count_total` goes 1.86 to 3.82 against a prior expectation of 4.
+
+So early stopping had been cutting the run near the optimum **by accident**.
+Removing it did not cause the overshoot, it revealed it, and the previous
+diagnosis -- that the criterion fired on noise -- is still right and still
+worth fixing. Both things were true at once.
+
+**`0000_LJ` at 1500 steps is the sharpest disagreement in the project between
+identification and evidence.** `truth_rank [0, 1]`, the top four peaks are the
+two true glyphs, `peak_visible_area` 1.0 -- the best identification recorded
+here -- with `glyph_evidence` of **-149.3**, meaning the model scores the fit
+as worse than placing no glyphs at all. Whatever the objective is rewarding
+near its optimum, it is not what we are trying to recover.
+
+`scripts/experiments.py` now records `log_joint_best`, `map_loss_argmin`,
+`map_loss_first` and a 30-point `map_loss_curve`, so the shape of the
+trajectory can be read instead of inferred, and the summary table spends the
+now-meaningless `map_converged` column on them. Note that only the best *loss*
+is recoverable, not the parameters at it: the optimizer keeps no best-iterate
+state, so acting on an argmin means re-running with `map_max_steps` set there,
+or giving the step size a decay schedule so Adam converges. Which of those is
+right depends on whether the curve turns gently or sharply, and that is not
+yet measured.
+
 ### Implementation order
 
 1. `SlotPoissonConvPlacements`: amplitude, glyph simplex, pose simplex, one

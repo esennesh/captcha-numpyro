@@ -171,8 +171,23 @@ def summarize(result, model, image, truth=None, blank_log_joint=None, top=6):
         )
     observed = np.asarray(image[0])
     reconstruction = np.asarray(result.weighted_reconstruction)[0]
+    losses = np.asarray(result.map_losses)
     record = {
         "log_joint": round(-float(result.map_losses[-1]), 1),
+        # The optimizer returns its LAST iterate, not its best, and Adam at a
+        # fixed step size does not converge to a point -- it wanders. On the
+        # C3-off grid the trajectory has an interior optimum and walks away
+        # from it: `0000_LJ` reached 39009.8 by step 640 and ended at 38309.6
+        # at 1500. Early stopping used to cut the run near the optimum by
+        # accident, so removing it exposed the overshoot rather than causing
+        # it. Record the shape of the curve so a budget or a step-size
+        # schedule can be chosen by inspection.
+        "log_joint_best": round(-float(np.min(losses)), 1),
+        "map_loss_argmin": int(np.argmin(losses)),
+        "map_loss_first": round(float(losses[0]), 1),
+        "map_loss_curve": [
+            round(float(v), 1) for v in losses[:: max(1, len(losses) // 30)]
+        ],
         "map_steps": int(result.map_num_steps),
         "map_converged": bool(result.map_converged),
         "losses_finite": bool(np.isfinite(result.map_losses).all()
@@ -359,10 +374,15 @@ def experiment_examples(arguments):
             "%s@(%d,%d)=%.3f" % (p["glyph"], p["y"], p["x"], p["count"])
             for p in record["peaks"]), flush=True)
     print("\n=== summary ===")
+    # `map_converged` is False by construction now that early stopping is off,
+    # so its column is spent on the overshoot instead: `log_joint_best` against
+    # `log_joint` says how much the last iterate gave back, and
+    # `map_loss_argmin` says where the trajectory actually turned.
     print_rows(records, ["image", "glyph_evidence", "identity_recall",
                          "identity_total", "truth", "truth_rank",
                          "peak_visible_area", "count_total", "coefficients",
-                         "rmse", "map_steps", "map_converged"])
+                         "rmse", "log_joint", "log_joint_best",
+                         "map_loss_argmin", "map_steps"])
     write(records, arguments.output)
 
 
