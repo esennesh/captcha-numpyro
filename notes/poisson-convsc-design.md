@@ -2616,6 +2616,55 @@ of 0.5 costs `0.1 x log 2 = 0.07` nats against fragments worth hundreds.
 So C3 should go, and the rim behaviour is a separate question about identifying
 a glyph from half its evidence rather than about where centres are allowed.
 
+### The measurement was not precise enough to support what I read into it
+
+*2026-09-10.* Early stopping was firing on noise, and every single-run
+comparison on the C3-off grid is inside its spread. Four runs of `0000_LJ`,
+each reporting `converged=True`:
+
+| run | steps | log joint | coefficients |
+|---|---|---|---|
+| plain Poisson, script | 540 | 39407.7 | 1127 |
+| zero-inflated, notebook, fresh kernel | 340 | 39212.7 | 1363 |
+| zero-inflated, notebook, earlier | 580 | 39372.1 | 1384 |
+| zero-inflated, script | 640 | 39009.8 | 1000 |
+
+The two zero-inflated runs stop at 580 and 640 steps and land **362 nats
+apart, the longer one scoring worse**. That is impossible along one
+trajectory, so the trajectories diverge -- GPU reductions are not
+deterministic -- and early stopping then samples them at an arbitrary point
+between 340 and 640 of a 1500-step budget.
+
+`map_tolerance` is *relative* and this loss has magnitude 39,000, so
+`1.0e-5` meant "stop when twenty steps gain under 0.4 nats", and
+`termination_patience: 5` made that a 100-step plateau. On a trajectory with
+hundreds of nats still to give, that fires on noise.
+
+**What this invalidates.** The zero-inflation comparison recorded above as
+"four of five sparser" rests on differences of -127 to +750 coefficients and
+-399 to +11 nats per image, all inside a +-380 coefficient, +-362 nat spread
+on a *single* configuration. The direction may still be right; it is not
+established. The replicate noise floor quoted earlier in this section (0.3 to
+15.7 nats) came from two C3-**on** runs, which used 1000 to 1500 steps and
+mostly ran to the cap; carrying it over to the C3-off grid, with 2.7 times
+the coordinates and erratic early stopping, was wrong.
+
+**The fix**, in `configs/online/map_proposal.yaml`: `termination_check_interval
+= 2000` exceeds `map_max_steps`, so the optimizer takes the whole budget in
+one `lax.scan` chunk and the stall test never runs a second interval.
+`map_converged` is now False by construction and carries no information --
+read the step count, which is always the cap. It costs nothing measurable:
+runtime is flat in step count because compilation dominates (`0003_7Z` ran
+1440 steps in 183 s, `0000_LJ` ran 540 in 218 s), and one 1500-step scan
+compiles the same as a 20-step one.
+
+**Still open**: the notebook and `scripts/experiments.py` disagree beyond this
+on the same config and seed -- the notebook's three runs span 1363 to 1434
+coefficients, about 5%, while the script sits at 1000, 27% away. That cannot
+be separated from the stopping noise until a fixed budget has been run on
+both. If it survives, `--no-reference` isolates the one structural difference
+between the two paths, which is that the script fits a blank reference first.
+
 ### Implementation order
 
 1. `SlotPoissonConvPlacements`: amplitude, glyph simplex, pose simplex, one

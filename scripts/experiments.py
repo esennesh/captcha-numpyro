@@ -222,8 +222,38 @@ def summarize(result, model, image, truth=None, blank_log_joint=None, top=6):
         particle = int(np.argmax(np.asarray(result.normalized_weights)))
         logit = np.asarray(result.samples["paper_logit"][particle, 0])
         record["paper"] = [round(float(v), 3) for v in 1.0 / (1.0 + np.exp(-logit))]
+        # `paper` is the global logit alone. The rendered background is that
+        # logit plus the coarse `paper_field`, which has a marginal standard
+        # deviation of 2 in logit space and can carry a tint of its own, so the
+        # scalar on its own cannot say whether the background came out right.
+        # Record what the model actually paints.
+        background = model.keywords.get("backgrounder")
+        if background is not None and "paper_field" in result.samples:
+            field = np.asarray(
+                jax.nn.sigmoid(
+                    logit
+                    + np.asarray(
+                        background.resize_field(
+                            result.samples["paper_field"][particle, 0]
+                        )
+                    )
+                )
+            )
+            record["paper_rendered"] = [
+                round(float(v), 3) for v in field.reshape(-1, field.shape[-1]).mean(0)
+            ]
+        # The paper in these examples is flat, so its median, 90th percentile
+        # and modal colour agree to three decimals on all ten images; the
+        # median is therefore the true paper and not merely a robust summary.
         record["paper_truth"] = [
             round(float(v), 3) for v in np.median(observed.reshape(-1, 3), axis=0)
+        ]
+        record["paper_error"] = [
+            round(float(a - b), 3)
+            for a, b in zip(
+                record.get("paper_rendered", record["paper"]),
+                record["paper_truth"],
+            )
         ]
     return record
 

@@ -83,10 +83,41 @@ proposal_optimizer:
   step_size: 0.01
 proposal_tolerance: 1.0e-3
 
-# Must not exceed the max-step counts, or the convergence test never runs a
-# second interval and `converged` is False by construction. The notebook used
-# to leave this at the class default of 50 with max_steps = 20, so both
-# convergence flags it printed were guaranteed to be False and carried no
-# information.
-termination_check_interval: 20
+# EARLY STOPPING IS DELIBERATELY DISABLED: 2000 exceeds `map_max_steps`, so
+# the optimizer takes the whole budget in one `lax.scan` chunk, the stall test
+# never runs a second interval, and `map_converged` is False by construction
+# and carries no information. Read the step count instead -- it is now always
+# the cap. This covers the dispersion phase too, whose 500 steps were already
+# running to the cap with `converged=False` in every run on record, so nothing
+# changes there.
+#
+# WHY. At 1.0e-5 the tolerance is *relative*, and this loss has magnitude
+# ~39,000, so the rule was "stop when twenty steps gain under 0.4 nats"; with
+# a patience of 5 that is a 100-step plateau. On a trajectory with hundreds of
+# nats still to give, that fires on noise. Measured on `0000_LJ`, four runs
+# that each reported `converged=True`:
+#
+#   run                                   steps   log joint   coefficients
+#   plain Poisson, script                   540     39407.7           1127
+#   zero-inflated, notebook, fresh kernel   340     39212.7           1363
+#   zero-inflated, notebook, earlier        580     39372.1           1384
+#   zero-inflated, script                   640     39009.8           1000
+#
+# The two zero-inflated runs stop at 580 and 640 steps and land 362 nats
+# apart, the LONGER one scoring worse -- impossible along one trajectory, so
+# the trajectories diverge (GPU reductions are not deterministic) and early
+# stopping then samples them at an arbitrary point. The resulting spread,
+# +-362 nats and +-380 coefficients on one configuration, is larger than every
+# model effect measured from single runs in section 26, which is how a
+# zero-inflation comparison came to be over-read on 2026-09-10.
+#
+# COST: nothing measurable. Runtime is flat in step count because compilation
+# dominates -- `0003_7Z` ran 1440 steps in 183 s while `0000_LJ` ran 540 in
+# 218 s -- and one 1500-step scan compiles the same as a 20-step one while
+# saving 74 round-trips to Python.
+#
+# To restore early stopping, set this below `map_max_steps` again; 20 was the
+# previous value. Do that only with a tolerance chosen against the loss's
+# actual magnitude, not against 1.
+termination_check_interval: 2000
 termination_patience: 5
