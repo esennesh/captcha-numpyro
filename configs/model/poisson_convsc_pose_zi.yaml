@@ -1,0 +1,57 @@
+# `poisson_convsc_pose`, with the count field zero-inflated so that an
+# occurrence and its opacity are priced separately.
+#
+# WHY. In every other config one nonnegative number at each `(slot, glyph)` is
+# both *how many* occurrences sit there and *how opaque* they are, and the
+# relaxed Poisson prior is very nearly linear in it -- 11.77 nats per unit,
+# varying 4% over [0, 1]. So the prior charges for the total amplitude and does
+# not care how that total is spread. Measured on the fits themselves: 1,682
+# coefficients holding a total of 2.0 score 1.2 nats BETTER than two
+# coefficients at 1.0. The prior pays for the diffuse solution.
+#
+# That is what buries the true glyph in `truth_rank`. On the rotated set the
+# `Q` of 0002_QS ranks 176th while the model hedges `0@(38,49)`, `0@(37,49)`
+# and `C@(39,49)` across one slot, and one recovered `L` occupies three
+# adjacent slots at once. Both are free under a prior blind to spreading.
+#
+# Zero inflation separates the two prices: a gate decides whether a site fires,
+# `count_base_rate` sets what it carries once it has, and a faint occurrence
+# pays the same to exist as a solid one. With numpyro's log-sum continuation of
+# the zero-inflation indicator -- landed on the fork at e413f91, with
+# `zero_width` tied by `SmoothedCount` to the relaxation temperature -- the same
+# comparison at the eta = 0.1 these configs use reverses to 80.8 nats in favour
+# of two committed glyphs, and the penalty is concave, so opacity stays cheap
+# once a site commits.
+#
+#   zero_width   smear vs two glyphs   barrier at a = 0.001
+#   1.0                +11.4            18.5 nats/unit
+#   0.3                +32.6            29.1
+#   0.1 (eta)          +80.8            53.0
+#   0.03              +211.8           117.2
+#   0.01              +500.3           253.0   -- too steep
+#
+# The second column is the constraint: a true glyph has to climb off zero, and
+# the likelihood supplies +51 to +174 nats per unit at a matched stamp (section
+# 28 B2). eta = 0.1 lands inside the window without tuning.
+#
+# WHAT IT WILL NOT FIX. Single-glyph substitution -- `1` for `7` on both
+# seven-images, `1` for `D` -- is one occurrence explaining part of the ink. A
+# `1` and a `7` pay the same single charge, so the prior is neutral between
+# them and the likelihood decides. That belongs to section 28 D.
+#
+# This config differs from `poisson_convsc_pose` in ONE key, so the pair is a
+# clean A/B.
+
+defaults:
+  - poisson_convsc_pose
+  - _self_
+
+placements:
+  count_zero_inflated: true
+
+  # An occurrence is one whole glyph. Fixed rather than learned: the gate and
+  # the rate are redundant in the expected total, which is
+  # num_sites * (1 - gate) * count_base_rate, so letting both float would
+  # reintroduce at the parameter level the very occurrence/opacity confusion
+  # the construction exists to remove. Only the gate learns.
+  count_base_rate: 1.0

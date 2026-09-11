@@ -2721,7 +2721,43 @@ worth running now.
   up to `gamma = 0.577` nats per unit of amplitude. Strictly better, but still
   no preference for concentration. `partitioned_gmrf` uses `beta = 25`. Cheap.
 - **A5. Zero-inflate the count, so an occurrence has a fixed price.**
-  *Measured 2026-09-09, and it does not work as written.* This is the
+  **BUILT 2026-09-10**, as `count_zero_inflated` on
+  :class:`PoissonConvPlacements` and the config
+  `model/poisson_convsc_pose_zi`, which differs from `poisson_convsc_pose` in
+  that one key. The obstacle below was removed upstream: the fork carries a
+  `zero_width` parameter as of `e413f91`, and its continuation is a *log-sum*
+  penalty `C log(1 + z/w) / log(1 + 1/w)` rather than the linear ramp, tied by
+  `SmoothedCount` to the relaxation temperature as `min(eta, 1)`. That is
+  section 28 A2's log-sum penalty delivered as a normalized density, which
+  answers A2's own objection -- the importance weights keep their meaning.
+  Re-measured at the `eta = 0.1` these configs use:
+
+  | `zero_width` | smear vs two glyphs | barrier at `a = 0.001` |
+  |---|---|---|
+  | plain Poisson | **+1.2** (smear preferred) | 11.8 nats/unit |
+  | 1.0 | -11.4 | 18.5 |
+  | 0.3 | -32.6 | 29.1 |
+  | **0.1**, the default at our `eta` | **-80.8** | **53.0** |
+  | 0.03 | -211.8 | 117.2 |
+  | 0.01 | -500.3 | 253.0, too steep |
+
+  Negative means the two committed glyphs win. The profile change alone flips
+  the sign at every width; the width sets the margin. The second column is the
+  constraint I could not price before: a true glyph has to climb off zero
+  against the +51 to +174 nats per unit the likelihood supplies at a matched
+  stamp (B2), so a barrier above that pins every coefficient at zero however
+  good the evidence. `eta = 0.1` lands inside the window without tuning.
+
+  The gate is a scalar, so the field stays homogeneous and the prior stays
+  exactly translation-invariant. `count_base_rate` is fixed at 1.0 rather than
+  learned -- it and the gate are redundant in the expected total, which is
+  `num_sites * (1 - gate) * count_base_rate`, so letting both float would
+  reintroduce at the parameter level the occurrence/opacity confusion the
+  construction exists to remove. Both priors are calibrated to the same
+  expected total of 4 over the field, so a comparison between them is about
+  shape and not scale; a test asserts it.
+
+  *Original entry, 2026-09-09, kept for the reasoning:* This is the
   principled form of the redundancy A1 and A2 circle around: in the current
   model one nonnegative number is both *how many* occurrences a `(slot, glyph)`
   holds and *how opaque* they are, so a nearly-invisible mark is nearly free.

@@ -217,9 +217,17 @@ class PoissonConvPlacements(nnx.Module):
 
     def __init__(self, shape_dict: ShapeDictionary, expected_count: float=1.,
                  img_h: int=80, img_w: int=80, *,
+                 count_base_rate: float=1.0,
+                 count_zero_inflated: bool=False,
                  require_on_canvas: bool=True,
                  rngs: nnx.Rngs | None=None):
         del rngs
+        if count_base_rate <= 0.0:
+            raise ValueError(
+                f"count_base_rate must be positive, got {count_base_rate}"
+            )
+        self.count_base_rate = count_base_rate
+        self.count_zero_inflated = count_zero_inflated
         self.expected_count = expected_count
         self.height = img_h
         self.require_on_canvas = require_on_canvas
@@ -342,14 +350,108 @@ class PoissonConvPlacements(nnx.Module):
         The field is *not* on the image grid when ``require_on_canvas``; see
         :attr:`count_shape`. Pass it through :meth:`to_image_grid` before
         stamping.
+
+        **``count_zero_inflated`` splits the price of an occurrence from the
+        price of its opacity.** Under the plain Poisson one nonnegative number
+        is both *how many* occurrences a ``(slot, glyph)`` holds and *how
+        opaque* they are, and the relaxed prior is very nearly linear in it --
+        11.77 nats per unit, varying 4% over ``[0, 1]``. So the prior charges
+        for the total amplitude and is indifferent to how that total is spread
+        over coordinates. Measured on the field this model actually fits: 1,682
+        coefficients holding a total of 2.0 score **1.2 nats better** than two
+        coefficients at 1.0. The prior does not merely tolerate a diffuse
+        solution, it pays for one, which is §28 A1's arithmetic from the other
+        side.
+
+        Zero inflation puts the two prices in different places. The gate prices
+        *whether* a site fires and ``count_base_rate`` prices *how much* it
+        carries once it has, so a faint occurrence and a solid one both pay to
+        exist. With numpyro's log-sum continuation of the zero-inflation
+        indicator (``zero_width``, tied by ``SmoothedCount`` to the relaxation
+        temperature), the same comparison at ``eta = 0.1`` reverses to **80.8
+        nats in favour of the two committed glyphs**, and the penalty is
+        concave, so opacity stays cheap once a site has committed. Wider
+        settings give less discrimination and narrower ones more:
+
+        ======  ====================  ==========================
+        width   smear vs two glyphs   barrier at ``a = 0.001``
+        ======  ====================  ==========================
+        1.0     +11.4                 18.5 nats/unit
+        0.3     +32.6                 29.1
+        **0.1** **+80.8**             **53.0**
+        0.03    +211.8                117.2
+        0.01    +500.3                253.0 -- too steep
+        ======  ====================  ==========================
+
+        The second column is the constraint: a true glyph has to climb off
+        zero, and the likelihood supplies +51 to +174 nats per unit at a
+        matched stamp (§28 B2), so a barrier above that traps every coefficient
+        at zero. ``eta = 0.1`` lands inside the window by default.
+
+        ``count_base_rate`` is a fixed hyperparameter rather than a learned
+        one, and only the gate learns. The two are redundant in the expected
+        total -- it is ``num_sites * (1 - gate) * count_base_rate`` -- so
+        letting both float would reintroduce at the parameter level exactly the
+        occurrence/opacity confusion the construction exists to remove. A rate
+        of one says an occurrence is one whole glyph.
+
+        The gate is a scalar, so the field stays a homogeneous process and the
+        prior stays exactly translation-invariant, as above.
         """
-        log_rate = numpyro.param(
-            "log_rate", jnp.log(self.expected_count / self.num_sites)
+        if not self.count_zero_inflated:
+            log_rate = numpyro.param(
+                "log_rate", jnp.log(self.expected_count / self.num_sites)
+            )
+            rate = jnp.broadcast_to(
+                jnp.exp(log_rate), (1, *self.count_shape, self.num_features)
+            )
+            return numpyro.sample("a", dist.Poisson(rate).to_event(3))
+
+        shape = (1, *self.count_shape, self.num_features)
+        gate_logits = numpyro.param("count_gate_logits", self.initial_gate_logits)
+        base = dist.Poisson(
+            jnp.broadcast_to(
+                jnp.asarray(self.count_base_rate, dtype=jnp.result_type(float)),
+                shape,
+            )
         )
-        rate = jnp.broadcast_to(
-            jnp.exp(log_rate), (1, *self.count_shape, self.num_features)
+        return numpyro.sample(
+            "a",
+            dist.ZeroInflatedLogits(
+                base, jnp.broadcast_to(gate_logits, shape)
+            ).to_event(3),
         )
-        return numpyro.sample("a", dist.Poisson(rate).to_event(3))
+
+    @property
+    def initial_gate_logits(self) -> float:
+        r"""Log-odds of a site being empty, set to match :attr:`expected_count`.
+
+        A ``ZeroInflatedPoisson`` has mean ``(1 - gate) * rate``, so matching
+        the plain Poisson's expected total over the field needs a firing
+        probability of
+
+        .. math::
+
+            p = rac{	exttt{expected_count}}
+                     {	exttt{num_sites}	imes	exttt{count_base_rate}},
+
+        and the parameter is ``logit(1 - p)``. At the settings this model uses
+        -- one expected glyph over 230,400 coordinates at a base rate of one --
+        that is ``p = 4.3e-6`` and a logit of ``+12.3``, which is
+        well-conditioned; the gate itself is ``1 - 4.3e-6`` and would lose
+        precision if it were the parameter. Like ``log_rate``, this only
+        *initializes*: the gate then learns freely.
+        """
+        firing = self.expected_count / (self.num_sites * self.count_base_rate)
+        if not 0.0 < firing < 1.0:
+            raise ValueError(
+                f"expected_count {self.expected_count} needs a firing "
+                f"probability of {firing:.3g} at count_base_rate "
+                f"{self.count_base_rate} over {self.num_sites} sites; it has "
+                "to lie in (0, 1). Raise count_base_rate or lower "
+                "expected_count."
+            )
+        return float(math.log1p(-firing) - math.log(firing))
 
     def ink_field(self, counts, color_field: Array | None = None) -> Array:
         """Stamp the counts into an ``(..., H, W, 4)`` ink field.
@@ -424,6 +526,8 @@ class TexturedDiffeomorphicPoissonConvPlacements(PoissonConvPlacements):
         img_w: int = 80,
         *,
         cg_iters: int = 300,
+        count_base_rate: float = 1.0,
+        count_zero_inflated: bool = False,
         require_on_canvas: bool = True,
         rngs: nnx.Rngs | None = None,
         texture_bond_precision: float = 4.0,
@@ -441,6 +545,8 @@ class TexturedDiffeomorphicPoissonConvPlacements(PoissonConvPlacements):
             expected_count,
             img_h,
             img_w,
+            count_base_rate=count_base_rate,
+            count_zero_inflated=count_zero_inflated,
             require_on_canvas=require_on_canvas,
             rngs=rngs,
         )
