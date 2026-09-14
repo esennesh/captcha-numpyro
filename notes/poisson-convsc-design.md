@@ -2709,6 +2709,52 @@ or giving the step size a decay schedule so Adam converges. Which of those is
 right depends on whether the curve turns gently or sharply, and that is not
 yet measured.
 
+### Ladder S3: zero inflation does not pay off, and the budget did
+
+*2026-09-14.* Both configs run at a fixed 1500-step budget, `map_loss_curve`
+recorded. Blank references differ by exactly 1.6 nats across the pair, so
+`glyph_evidence` is comparable. Read at the **best** iterate, since
+`0000_LJ`'s zero-inflated run ends on a diverged point and its last-iterate
+counts are meaningless:
+
+| image | plain | zero-inflated | |
+|---|---|---|---|
+| `0000_LJ` | **1685.7** | 1582.2 | -103.5 |
+| `0001_JA` | **1734.8** | 1712.6 | -22.2 |
+| `0002_QS` | **1993.2** | 1926.3 | -66.9 |
+| `0003_7Z` | **984.4** | 970.6 | -13.8 |
+| `0004_7D` | **1370.3** | 1340.7 | -29.6 |
+| total | **7768.4** | 7532.4 | **-236.0** |
+
+Worse on all five, and no sparser: 4,631 coefficients against 4,575 over all
+five, or -3.3% over the four where the endpoint means anything -- inside the
+run-to-run spread, since `0002_QS` gave 1221, 1977 and 1239 across three runs
+of one config. Identity is 6/10 either way.
+
+It also *amplifies* the optimizer instability rather than being its only cause.
+The plain config overshoots too, by 104, 23, 0, 6 and 12 nats; zero inflation
+turns `0000_LJ` into 1,421. Consistent with its barrier being 49 nats per unit
+near zero against the plain prior's 10.4 -- a stiffer problem blows up harder.
+
+**So the premise was right and the fix does not work.** The prior really does
+pay 1.2 nats for a smear, measured; pricing occurrences separately does not
+recover it. Section 28 A5 stays as the record of why it was worth trying.
+
+**The win was the step budget, not the model.** Plain at a fixed 1500 steps is
+the best result recorded here: `0000_LJ` at 1685.7 against 1485.6 (C3-on) and
+950.4 (the early-stopped C3-off run), and 7768.4 in total against that run's
+6536.5. **+1,232 nats from the budget change alone**, more than any model
+change this week, and it surfaced out of chasing a notebook/script discrepancy
+I first misattributed to a stale Jupyter kernel.
+
+The remaining identity ceiling is unchanged at 6/10 by everything tried here.
+The four misses are `7` -> `1` twice, `D` and `Q`: all single-glyph
+substitutions, where one occurrence explains part of the ink and the prior is
+neutral between the candidates. That is section 28 D -- the likelihood
+forgiving unexplained ink -- and not the count prior. Ladder S2's conclusion
+stands: of the three things burying a true glyph, the count prior can price
+spatial spread and identity hedging, and cannot touch substitution.
+
 ### Implementation order
 
 1. `SlotPoissonConvPlacements`: amplitude, glyph simplex, pose simplex, one

@@ -290,6 +290,7 @@ def map_log_joint(inference, target, image, condition=None, seed=0):
         dsgd_kwargs=inference.dsgd_kwargs,
         init_dispersion=inference.init_dispersion,
         init_loc_fn=inference.init_loc_fn,
+        map_keep_best=inference.map_keep_best,
         map_max_steps=inference.map_max_steps,
         map_optimizer=inference.map_optimizer,
         map_tolerance=inference.map_tolerance,

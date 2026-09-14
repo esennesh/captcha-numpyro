@@ -166,6 +166,7 @@ class MAPProposalCaptchaInference:
         guide_class=AutoMAPProposal,
         init_dispersion: float = 0.1,
         init_loc_fn=init_to_count_mean,
+        map_keep_best: bool = False,
         map_max_steps: int = 1000,
         map_optimizer=None,
         map_tolerance: float = 1e-5,
@@ -186,6 +187,12 @@ class MAPProposalCaptchaInference:
         self.guide_class = guide_class
         self.init_dispersion = init_dispersion
         self.init_loc_fn = init_loc_fn
+        # The MAP trajectory does not reliably end at its own minimum: on the
+        # 80x80 grid `0000_LJ` reached -40041.1 at step 632 and ended at
+        # -38619.7, having spent 850 of 1500 steps outside the basin it had
+        # already found. With this set, the fit returns the iterate that
+        # achieved the lowest loss instead of the last one. See section 26.
+        self.map_keep_best = map_keep_best
         self.map_max_steps = map_max_steps
         self.map_optimizer = map_optimizer
         self.map_tolerance = map_tolerance
@@ -207,6 +214,7 @@ class MAPProposalCaptchaInference:
             dsgd_kwargs=self.dsgd_kwargs,
             init_dispersion=self.init_dispersion,
             init_loc_fn=self.init_loc_fn,
+            map_keep_best=self.map_keep_best,
             map_max_steps=self.map_max_steps,
             map_optimizer=self.map_optimizer,
             map_tolerance=self.map_tolerance,

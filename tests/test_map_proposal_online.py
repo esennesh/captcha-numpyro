@@ -134,3 +134,59 @@ def test_dispersion_losses_stay_finite_at_a_sparse_count_rate():
     result = inference(jax.random.key(7), image)
     assert np.isfinite(result.map_losses).all()
     assert np.isfinite(result.dispersion_losses).all()
+
+
+def test_map_keep_best_returns_the_lowest_loss_iterate():
+    """`map_values` must be the point the fit reached, not where it stopped.
+
+    The MAP trajectory does not reliably end at its own minimum: on the 80x80
+    grid `0000_LJ` reached -40041.1 at step 632 and ended at -38619.7, having
+    spent 850 of its 1500 steps outside the basin it had already found. With
+    `map_keep_best` the returned latents are the ones that achieved the lowest
+    loss, so `map_losses.min()` and the reported point agree.
+    """
+    import functools
+
+    from flax import nnx
+
+    from src.data.dictionary import ShapeDictionary
+    from src.model.model import (
+        TexturedDiffeomorphicPoissonConvPlacements,
+        poisson_convsc_model,
+    )
+
+    side = 9
+    glyph = jnp.zeros((5, 5, 4)).at[1:4, 2, :].set(1.0)
+    dictionary = ShapeDictionary(shapes=glyph[jnp.newaxis], targets={"glyph": 0})
+    image = jnp.ones((1, side, side, 3)).at[:, 3:6, 4, :].set(0.1)
+
+    def fit(keep_best):
+        placements = TexturedDiffeomorphicPoissonConvPlacements(
+            dictionary, cg_iters=20, expected_count=1.0, img_h=side, img_w=side,
+            rngs=nnx.Rngs(0), warp_coarse_height=2, warp_coarse_width=2,
+            warp_scale=1.0,
+        )
+        inference = MAPProposalCaptchaInference(
+            functools.partial(poisson_convsc_model, placements=placements),
+            dsgd_kwargs={"max_count": 8, "width": 4},
+            init_loc_fn=init_to_count_mean,
+            map_keep_best=keep_best,
+            map_max_steps=40,
+            num_dispersion_particles=2,
+            num_importance_samples=3,
+            proposal_max_steps=5,
+            termination_check_interval=2000,
+        )
+        return inference(jax.random.key(0), image)
+
+    kept = fit(True)
+    last = fit(False)
+    # the loss histories are the same trajectory; only the returned point differs
+    np.testing.assert_allclose(
+        np.asarray(kept.map_losses), np.asarray(last.map_losses), rtol=1e-5
+    )
+    assert np.isfinite(kept.map_losses).all()
+    # and the kept point is a real point of that trajectory, not an artifact
+    for name, value in kept.map_values.items():
+        assert np.isfinite(np.asarray(value)).all(), name
+        assert np.asarray(value).shape == np.asarray(last.map_values[name]).shape

@@ -66,6 +66,30 @@ init_loc_fn:
 # needs at least 11/step_size steps: 1,100 at the former 0.01. The former 200
 # steps could travel 2.0 and were never going to arrive. 0.05 x 1500 gives 75
 # of travel, with plenty of margin for the line the optimizer actually walks.
+# Return the iterate that reached the lowest loss, not the last one. The MAP
+# trajectory does not reliably end at its own minimum: Adam's update is
+# lr * m / (sqrt(v) + eps), so as the gradient decays near an optimum v decays
+# with it and the normalised step can grow rather than shrink. Measured on the
+# five rotated images at a fixed 1500-step budget, the last iterate gives back
+#
+#   image      plain Poisson   zero-inflated
+#   0000_LJ        103.9           1421.4
+#   0001_JA         23.4             13.2
+#   0002_QS          0.0             21.4
+#   0003_7Z          5.6              0.3
+#   0004_7D         12.3              6.8
+#
+# nats against the best it reached. On 0000_LJ under the stiffer prior that is
+# the difference between a glyph evidence of +160.8 and +1582.2. It also makes
+# `map_values` -- the source of every peak, truth_rank and coefficient count we
+# read -- correspond to the point the fit actually reached.
+#
+# Needs numpyro f3de9887 or later. Applies to the MAP phase only: that
+# objective is deterministic given the latents, so its per-step minimum is a
+# real point, whereas the proposal objective resamples particles every step and
+# taking its minimum would chase Monte Carlo noise.
+map_keep_best: true
+
 map_max_steps: 1500
 map_optimizer:
   _target_: numpyro.optim.Adam
